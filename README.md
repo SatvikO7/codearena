@@ -8,10 +8,16 @@ The interesting part of this project is not the CRUD. It is everything around it
 asynchronous job processing, sandboxed execution of untrusted code, queue reliability,
 idempotency and concurrency control.
 
-> **Project status: Phase 1 of 16 complete.** The infrastructure, the build and the
-> service skeleton are in place and verified. Authentication, problems, submissions and
-> the judge itself are the phases that follow. This README describes what exists today;
-> it is updated at the end of every phase. Nothing below is aspirational.
+> **Project status: Phase 1 of 16 — code complete, verification partial.**
+> Authentication, problems, submissions and the judge itself are the phases that follow.
+> This README describes what exists today; it is updated at the end of every phase.
+> Nothing below is aspirational.
+>
+> Verified on the development machine: both Maven modules compile under Java 21, the
+> unit suite passes, and the frontend type-checks, builds and lints clean.
+> **Not yet verified: `docker compose up` and the Testcontainers integration suite**,
+> because the machine used for Phase 1 has Docker installed but pending a reboot. Both
+> are run and this note removed before Phase 1 is declared done.
 
 ---
 
@@ -193,7 +199,7 @@ arrive in Phases 2, 6 and 9 and will be documented as they land.
 
 | Phase | Scope | Status |
 |---|---|---|
-| 1 | Repository, build, Docker stack, service skeletons | **Complete** |
+| 1 | Repository, build, Docker stack, service skeletons | Code complete, Docker verification pending |
 | 2 | Users, roles, JWT access and refresh tokens | Next |
 | 3 | Problems, tags, test cases, search and pagination | Planned |
 | 4 | Submission API and state machine | Planned |
