@@ -1,0 +1,150 @@
+# =============================================================================
+# CodeArena - full local development stack.
+#
+#   cp .env.example .env   &&   docker compose up --build
+#
+# Networks are split deliberately:
+#   * `edge`     - only the frontend and the backend sit here; it is what the host
+#                  reaches through published ports.
+#   * `internal` - PostgreSQL and Redis. Marked `internal: true`, so nothing attached
+#                  to it can reach the internet and nothing outside can reach it.
+# The worker joins `internal` only: it needs the database and the queue, and has no
+# reason to be reachable from the host except for its health endpoint.
+# =============================================================================
+
+name: codearena
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-codearena}
+      POSTGRES_USER: ${POSTGRES_USER:-codearena}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      # Deterministic collation so ORDER BY behaves identically on every machine.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      # Published for local inspection with psql. Bound to loopback so the database
+      # is never exposed on the machine's network interfaces.
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-codearena} -d ${POSTGRES_DB:-codearena}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - internal
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # `appendonly yes` keeps queued submissions durable across a Redis restart.
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
+    volumes:
+      - redis-data:/data
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    networks:
+      - internal
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      SPRING_PROFILES_ACTIVE: ${SPRING_PROFILES_ACTIVE:-docker}
+      DATABASE_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-codearena}
+      DATABASE_USERNAME: ${POSTGRES_USER:-codearena}
+      DATABASE_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set in .env}
+      CORS_ALLOWED_ORIGINS: http://localhost:${FRONTEND_PORT:-5173}
+    ports:
+      - "${BACKEND_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/actuator/health/readiness"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+    networks:
+      - edge
+      - internal
+
+  worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      # The backend owns the Flyway migrations, so the worker waits for the schema.
+      backend:
+        condition: service_healthy
+    environment:
+      SPRING_PROFILES_ACTIVE: ${SPRING_PROFILES_ACTIVE:-docker}
+      DATABASE_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-codearena}
+      DATABASE_USERNAME: ${POSTGRES_USER:-codearena}
+      DATABASE_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
+    # No published ports: the worker serves no traffic. Its health endpoint is
+    # reached over the compose network by the healthcheck below.
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8081/actuator/health/readiness"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+    networks:
+      - internal
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8080}
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "${FRONTEND_PORT:-5173}:80"
+    networks:
+      - edge
+
+volumes:
+  postgres-data:
+  redis-data:
+
+networks:
+  edge:
+  internal:
+    # Cuts this network off from the host's external network. Combined with the
+    # per-container limits applied to execution sandboxes, it means a compromised
+    # component cannot phone home.
+    internal: true

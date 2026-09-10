@@ -1,0 +1,95 @@
+# =============================================================================
+# CodeArena API server
+#
+# Every value that differs between environments is read from an environment
+# variable with a local-development default. No secret is ever committed here.
+# =============================================================================
+spring:
+  application:
+    name: codearena-backend
+
+  datasource:
+    url: ${DATABASE_URL:jdbc:postgresql://localhost:5432/codearena}
+    username: ${DATABASE_USERNAME:codearena}
+    password: ${DATABASE_PASSWORD:codearena}
+    hikari:
+      pool-name: codearena-api-pool
+      maximum-pool-size: ${DB_POOL_SIZE:10}
+      connection-timeout: 10000
+
+  jpa:
+    open-in-view: false          # avoid lazy loading in the view layer / long-lived sessions
+    hibernate:
+      ddl-auto: validate         # the schema is owned by Flyway, never by Hibernate
+    properties:
+      hibernate:
+        jdbc:
+          batch_size: 25
+        order_inserts: true
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: false
+
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      timeout: 3s
+
+server:
+  port: ${BACKEND_PORT:8080}
+  error:
+    include-stacktrace: never    # stack traces are logged, never returned
+    include-message: never
+  shutdown: graceful
+
+management:
+  endpoints:
+    web:
+      exposure:
+        # Only health and info are exposed. Actuator is further restricted to
+        # administrators once Spring Security is introduced in Phase 2.
+        include: health,info
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true
+  health:
+    redis:
+      enabled: true
+    db:
+      enabled: true
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+  api-docs:
+    path: /v3/api-docs
+
+codearena:
+  version: @project.version@
+  cors:
+    allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:5173}
+
+logging:
+  level:
+    com.codearena: ${LOG_LEVEL_APP:INFO}
+    org.springframework: INFO
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n"
+
+---
+# Profile used when the service runs inside docker compose.
+spring:
+  config:
+    activate:
+      on-profile: docker
+  datasource:
+    url: ${DATABASE_URL:jdbc:postgresql://postgres:5432/codearena}
+  data:
+    redis:
+      host: ${REDIS_HOST:redis}

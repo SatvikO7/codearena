@@ -1,0 +1,75 @@
+# =============================================================================
+# CodeArena judge worker
+#
+# The worker owns no schema: PostgreSQL migrations are applied exclusively by the
+# API server, so that several worker replicas can never race to migrate.
+# =============================================================================
+spring:
+  application:
+    name: codearena-worker
+
+  datasource:
+    url: ${DATABASE_URL:jdbc:postgresql://localhost:5432/codearena}
+    username: ${DATABASE_USERNAME:codearena}
+    password: ${DATABASE_PASSWORD:codearena}
+    hikari:
+      pool-name: codearena-worker-pool
+      # A worker only needs a connection while recording progress and results, so its
+      # pool is sized from judging concurrency rather than from request concurrency.
+      maximum-pool-size: ${DB_POOL_SIZE:5}
+      connection-timeout: 10000
+
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      timeout: 3s
+
+  lifecycle:
+    # Give an in-flight submission time to finish and its container time to be removed
+    # before the JVM exits.
+    timeout-per-shutdown-phase: 30s
+
+server:
+  port: ${WORKER_PORT:8081}
+  shutdown: graceful
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true
+
+codearena:
+  worker:
+    # Defaults to the container hostname, which docker compose makes unique per replica.
+    id: ${WORKER_ID:${HOSTNAME:worker-local}}
+    concurrency: ${WORKER_CONCURRENCY:2}
+
+logging:
+  level:
+    com.codearena: ${LOG_LEVEL_APP:INFO}
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n"
+
+---
+spring:
+  config:
+    activate:
+      on-profile: docker
+  datasource:
+    url: ${DATABASE_URL:jdbc:postgresql://postgres:5432/codearena}
+  data:
+    redis:
+      host: ${REDIS_HOST:redis}

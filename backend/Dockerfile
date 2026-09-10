@@ -1,0 +1,35 @@
+# =============================================================================
+# CodeArena API server
+#
+# Multi-stage: the JDK and the Maven cache stay in the build stage so the runtime
+# image ships only a JRE and the application jar.
+# =============================================================================
+FROM maven:3.9-eclipse-temurin-21 AS build
+WORKDIR /build
+
+# Copy poms first so dependency resolution is cached independently of source changes.
+COPY pom.xml ./
+COPY backend/pom.xml backend/
+COPY worker/pom.xml worker/
+RUN mvn -B -pl backend -am dependency:go-offline
+
+COPY backend/src backend/src
+RUN mvn -B -pl backend -am clean package -DskipTests
+
+# -----------------------------------------------------------------------------
+FROM eclipse-temurin:21-jre-alpine AS runtime
+WORKDIR /app
+
+# Never run as root.
+RUN addgroup -S codearena && adduser -S -G codearena codearena
+
+COPY --from=build /build/backend/target/codearena-backend-*.jar app.jar
+RUN chown -R codearena:codearena /app
+USER codearena
+
+EXPOSE 8080
+
+# Container-aware heap sizing; the hard limit comes from the compose/task memory cap.
+ENV JAVA_OPTS="-XX:MaxRAMPercentage=75 -XX:+ExitOnOutOfMemoryError"
+
+ENTRYPOINT ["sh", "-c", "exec java $JAVA_OPTS -jar /app/app.jar"]

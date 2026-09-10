@@ -1,0 +1,54 @@
+# ---- Secrets ----
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+*.p12
+secrets/
+
+# ---- Java / Maven ----
+target/
+*.class
+*.jar
+# Negations must follow the pattern they override; the Maven wrapper is committed
+# so the project builds without a local Maven installation.
+!.mvn/wrapper/maven-wrapper.jar
+.mvn/timing.properties
+hs_err_pid*
+replay_pid*
+
+# ---- Node / frontend ----
+node_modules/
+dist/
+dist-ssr/
+.vite/
+*.local
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ---- IDE / editor metadata ----
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+!.vscode/extensions.json
+.settings/
+.project
+.classpath
+*.swp
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- Runtime / build artifacts ----
+logs/
+*.log
+coverage/
+.tmp/
+tmp/
+judge-workspace/
