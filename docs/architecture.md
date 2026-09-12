@@ -115,7 +115,42 @@ Two consequences worth naming:
 Sessions are why the API server stays horizontally scalable: any instance can serve any
 request because none of them hold session state locally.
 
-## Current state (Phase 2 — complete and verified)
+## Problem catalogue
+
+Problems are an aggregate: a `Problem` owns its examples, its test cases and its tags, and
+they are replaced wholesale on edit and deleted with it. Modelling it that way — rather
+than as three independently-managed repositories — means an edit cannot leave a problem
+holding examples that belonged to a previous version of itself.
+
+The security boundary of this phase is the split between **examples** and **test cases**.
+They are separate tables mapped to separate response types, so the user-facing
+`ProblemDetailResponse` has no field capable of carrying an answer key. A single table with
+a `visibility` flag would have worked too, but then every user-facing query would need a
+predicate, and one forgotten predicate ships the answers.
+
+Status is not a writable property. It changes only through `publish`, `unpublish`,
+`archive` and `restore` on the entity, each of which consults `ProblemStatus` for whether
+the move is legal, and `publish` additionally refuses an incomplete problem. Since
+`ProblemRequest` has no status field, there is no payload a client can send that reaches
+the catalogue without passing those checks.
+
+```mermaid
+flowchart LR
+    Admin["Administrator"] -->|"POST /api/admin/problems"| AdminApi["AdminProblemController<br/>ADMIN required twice"]
+    AdminApi --> AdminSvc["ProblemAdminService"]
+    AdminSvc --> Aggregate["Problem aggregate<br/>examples · test cases · tags"]
+
+    User["Authenticated user"] -->|"GET /api/problems"| PublicApi["ProblemController"]
+    PublicApi --> Catalogue["ProblemCatalogService<br/>status fixed to PUBLISHED"]
+    Catalogue --> Aggregate
+
+    Aggregate --> DB[("PostgreSQL")]
+
+    Catalogue -.->|"never reads"| TestCases["problem_test_cases"]
+    AdminSvc --> TestCases
+```
+
+## Current state (Phase 3 — complete and verified)
 
 Implemented:
 
@@ -138,14 +173,27 @@ Added in Phase 2:
   responses for 401 and 403
 - Frontend auth context, protected routes, and login/register/profile pages
 
-Verified by execution, not assumed: `./mvnw clean verify` passes (32 unit, 28 integration
-against real PostgreSQL and Redis); all five compose services reach `healthy` with zero
-restarts; Flyway records `V1` and `V2` as applied; logout is proven to invalidate the
-session server-side by replaying the captured cookie; login gives identical answers for a
-wrong password and an unknown account; and containers on the internal network have no
-route off it.
+Added in Phase 3:
 
-Planned, in phase order: problems and test cases (3),
+- `problems`, `problem_examples`, `problem_test_cases` and `problem_tags` (`V3`), with
+  a UUID public id, a unique slug, check constraints mirroring every enum, and composite
+  indexes over the catalogue's actual access path
+- Admin authoring and lifecycle endpoints; public catalogue and detail endpoints
+- Database-level pagination, filtering and search with a closed sort vocabulary
+- Frontend catalogue, problem detail, and the admin authoring and management screens
+
+Verified by execution, not assumed: `./mvnw clean verify` passes (98 unit, 59 integration
+against real PostgreSQL and Redis); all five compose services reach `healthy` with zero
+restarts; Flyway records `V1`, `V2` and `V3` as applied; a draft answers 404 rather than
+403 to a normal user; the raw catalogue response is asserted to contain neither a hidden
+test case's input nor its expected output; a `status` field added to an update payload is
+ignored; and every admin mutation returns 403 to a USER and 401 to an anonymous caller.
+
+**Not implemented, and not claimed:** nothing in this repository executes code. Test cases
+are stored as authoring data only. Submissions, the queue, the sandbox and the judge are
+Phases 4 to 7.
+
+Planned, in phase order:
 submission API and state machine (4), Redis queue and worker loop (5), Docker execution
 engine (6), judging and verdicts (7), real-time status (8), caching and rate limiting
 (9), contests and leaderboards (10).

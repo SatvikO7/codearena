@@ -1,6 +1,7 @@
 package com.codearena.common;
 
 import com.codearena.auth.AuthenticationFailedException;
+import com.codearena.problem.Problem;
 import jakarta.servlet.http.HttpServletRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -11,6 +12,7 @@ import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 import java.util.List;
@@ -65,6 +67,26 @@ public class GlobalExceptionHandler {
                 List.of(new ApiErrorResponse.FieldViolation(ex.getField(), ex.getMessage()))));
     }
 
+    /** A problem, or other resource, that does not exist or must not be acknowledged. */
+    @ExceptionHandler(ResourceNotFoundException.class)
+    public ResponseEntity<ApiErrorResponse> handleNotFound(
+            ResourceNotFoundException ex, HttpServletRequest request) {
+        return ResponseEntity.status(HttpStatus.NOT_FOUND).body(ApiErrorResponse.of(
+                404, ex.getErrorCode(), ex.getMessage(), request.getRequestURI()));
+    }
+
+    /**
+     * An attempt to move a problem somewhere the lifecycle forbids, such as publishing an
+     * already-archived problem. A distinct code so a client can tell it apart from a
+     * plain validation failure.
+     */
+    @ExceptionHandler(Problem.InvalidStatusTransitionException.class)
+    public ResponseEntity<ApiErrorResponse> handleInvalidTransition(
+            Problem.InvalidStatusTransitionException ex, HttpServletRequest request) {
+        return ResponseEntity.badRequest().body(ApiErrorResponse.of(
+                400, "INVALID_STATUS_TRANSITION", ex.getMessage(), request.getRequestURI()));
+    }
+
     @ExceptionHandler(MethodArgumentNotValidException.class)
     public ResponseEntity<ApiErrorResponse> handleValidation(
             MethodArgumentNotValidException ex, HttpServletRequest request) {
@@ -73,6 +95,30 @@ public class GlobalExceptionHandler {
                 .toList();
         return ResponseEntity.badRequest().body(
                 ApiErrorResponse.validation("Request validation failed", request.getRequestURI(), violations));
+    }
+
+    /**
+     * A query parameter that could not be converted, most often an unrecognised enum
+     * value such as {@code ?difficulty=IMPOSSIBLE}. Without this it would reach the
+     * catch-all and be reported as a 500, blaming the server for the client's typo.
+     *
+     * <p>The message names the permitted values for enums, since that is the whole
+     * question the caller is asking, but never echoes the rejected value back into the
+     * response.
+     */
+    @ExceptionHandler(MethodArgumentTypeMismatchException.class)
+    public ResponseEntity<ApiErrorResponse> handleTypeMismatch(
+            MethodArgumentTypeMismatchException ex, HttpServletRequest request) {
+
+        Class<?> required = ex.getRequiredType();
+        String detail = required != null && required.isEnum()
+                ? "Valid values: " + String.join(", ",
+                        java.util.Arrays.stream(required.getEnumConstants()).map(String::valueOf).toList())
+                : "Expected type: " + (required == null ? "unknown" : required.getSimpleName());
+
+        return ResponseEntity.badRequest().body(ApiErrorResponse.validation(
+                "Request validation failed", request.getRequestURI(),
+                List.of(new ApiErrorResponse.FieldViolation(ex.getName(), detail))));
     }
 
     @ExceptionHandler(HttpMessageNotReadableException.class)

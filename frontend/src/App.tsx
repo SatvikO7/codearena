@@ -6,6 +6,10 @@ import { HomePage } from './pages/HomePage';
 import { LoginPage } from './pages/LoginPage';
 import { RegisterPage } from './pages/RegisterPage';
 import { ProfilePage } from './pages/ProfilePage';
+import { ProblemsPage } from './pages/ProblemsPage';
+import { ProblemDetailPage } from './pages/ProblemDetailPage';
+import { AdminProblemsPage } from './pages/admin/AdminProblemsPage';
+import { AdminProblemFormPage } from './pages/admin/AdminProblemFormPage';
 import { NotFoundPage } from './pages/NotFoundPage';
 
 export default function App() {
@@ -22,6 +26,15 @@ export default function App() {
             {/* Requires a session. The server enforces this independently. */}
             <Route element={<ProtectedRoute />}>
               <Route path="profile" element={<ProfilePage />} />
+              <Route path="problems" element={<ProblemsPage />} />
+              <Route path="problems/:slug" element={<ProblemDetailPage />} />
+            </Route>
+
+            {/* Requires ADMIN. Again a convenience: every admin endpoint re-checks. */}
+            <Route element={<ProtectedRoute requireRole="ADMIN" />}>
+              <Route path="admin/problems" element={<AdminProblemsPage />} />
+              <Route path="admin/problems/new" element={<AdminProblemFormPage />} />
+              <Route path="admin/problems/:problemId" element={<AdminProblemFormPage />} />
             </Route>
 
             <Route path="*" element={<NotFoundPage />} />

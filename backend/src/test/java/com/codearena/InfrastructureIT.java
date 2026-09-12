@@ -37,7 +37,7 @@ class InfrastructureIT extends AbstractIntegrationTest {
                 "SELECT version FROM flyway_schema_history WHERE success = true ORDER BY installed_rank",
                 String.class);
 
-        assertThat(applied).containsExactly("1", "2");
+        assertThat(applied).containsExactly("1", "2", "3");
 
         // V1 installs citext. V2 ended up not using it (see the note in that migration),
         // but V1 is already applied everywhere and migrations are immutable, so the
@@ -77,6 +77,40 @@ class InfrastructureIT extends AbstractIntegrationTest {
         assertThat(definitions).anySatisfy(definition -> assertThat(definition)
                 .contains("UNIQUE").contains("uq_users_email_lower")
                 .contains("lower(").contains("email"));
+    }
+
+    /** The problem schema's guarantees live in the database, not only in application code. */
+    @Test
+    void problemsTableCarriesTheExpectedConstraints() {
+        List<String> constraints = jdbcTemplate.queryForList(
+                "SELECT conname FROM pg_constraint WHERE conrelid = 'problems'::regclass", String.class);
+
+        assertThat(constraints).contains(
+                "uq_problems_slug", "uq_problems_public_id",
+                "ck_problems_status", "ck_problems_difficulty", "ck_problems_slug_format",
+                "fk_problems_created_by");
+    }
+
+    /**
+     * Examples and test cases must vanish with their problem, and a position must be
+     * unique per problem so ordering is total rather than whatever the database returns.
+     */
+    @Test
+    void problemChildTablesCascadeAndOrderDeterministically() {
+        List<String> exampleConstraints = jdbcTemplate.queryForList(
+                "SELECT conname FROM pg_constraint WHERE conrelid = 'problem_examples'::regclass", String.class);
+        List<String> testCaseConstraints = jdbcTemplate.queryForList(
+                "SELECT conname FROM pg_constraint WHERE conrelid = 'problem_test_cases'::regclass", String.class);
+
+        assertThat(exampleConstraints).contains("uq_problem_examples_position", "fk_problem_examples_problem");
+        assertThat(testCaseConstraints).contains("uq_problem_test_cases_position", "fk_problem_test_cases_problem");
+
+        String deleteRule = jdbcTemplate.queryForObject(
+                """
+                SELECT confdeltype FROM pg_constraint
+                WHERE conname = 'fk_problem_test_cases_problem'
+                """, String.class);
+        assertThat(deleteRule).as("'c' is ON DELETE CASCADE").isEqualTo("c");
     }
 
     @Test

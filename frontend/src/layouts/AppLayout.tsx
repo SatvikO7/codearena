@@ -7,11 +7,17 @@ import { useAuth } from '../hooks/useAuth';
  */
 const NAV_ITEMS: { to: string; label: string; end?: boolean }[] = [
   { to: '/', label: 'Home', end: true },
+  { to: '/problems', label: 'Problems' },
+];
+
+/** Shown only to administrators, and only as a shortcut: the server authorises regardless. */
+const ADMIN_NAV_ITEMS: { to: string; label: string }[] = [
+  { to: '/admin/problems', label: 'Manage problems' },
 ];
 
 /** Shared chrome: masthead, primary navigation, account controls and the routed page. */
 export function AppLayout() {
-  const { status, user, logout } = useAuth();
+  const { status, user, isAdmin, logout } = useAuth();
   const navigate = useNavigate();
 
   async function handleLogout() {
@@ -39,6 +45,17 @@ export function AppLayout() {
                 </NavLink>
               </li>
             ))}
+            {isAdmin &&
+              ADMIN_NAV_ITEMS.map((item) => (
+                <li key={item.to}>
+                  <NavLink
+                    to={item.to}
+                    className={({ isActive }) => (isActive ? 'nav-link is-active' : 'nav-link')}
+                  >
+                    {item.label}
+                  </NavLink>
+                </li>
+              ))}
           </ul>
         </nav>
 

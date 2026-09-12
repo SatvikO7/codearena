@@ -343,3 +343,112 @@ session is gone from Redis rather than merely forgotten by the client.
 **Trade-off.** Slower than `MockMvc`, and the client is about eighty lines of test support
 code to maintain. Worth it: these tests fail when the mechanism is broken, which is the only
 property that matters in an authentication suite.
+
+---
+
+## ADR-014 — Examples and test cases as relational tables, not JSONB
+
+**Problem.** A problem owns an ordered list of worked examples and an ordered list of judge
+test cases. Both are replaced wholesale on edit and never queried independently. That is
+close to a textbook case for a JSONB column.
+
+**Options.** A `jsonb` column per collection; separate tables; a single table with a
+`kind` discriminator.
+
+**Chosen.** Two separate tables, `problem_examples` and `problem_test_cases`.
+
+**Why.** JSONB was genuinely tempting and would have meant fewer joins. Two things decided
+against it. First, the brief asks for database constraints as a second validation layer,
+and JSONB cannot express "input is not null and at most 100 000 characters" without
+contorted assertions over JSON paths — the constraint would exist only in application code,
+which is exactly what the second layer is meant to survive. Second, the judge in Phase 7
+will read test cases filtered by visibility and ordered by position. That is a query, and
+queries belong on columns with indexes rather than inside a serialised blob.
+
+Keeping them as **two** tables rather than one with a discriminator is the security
+argument. A single table means every user-facing query needs a `WHERE kind = 'EXAMPLE'`
+predicate, and the day somebody forgets one, answer keys ship to solvers. Separate types
+cannot be confused: `ProblemDetailResponse` has no field that could hold a test case.
+
+**Trade-off.** Two extra tables and a join to render a problem. The detail query uses an
+entity graph so it is one round trip, not N+1.
+
+---
+
+## ADR-015 — UUID for mutation, slug for public URLs
+
+**Problem.** A problem needs a stable identifier for the API and a readable one for URLs.
+
+**Chosen.** Both, with distinct jobs. The UUID `public_id` is the canonical identifier: it
+appears as `id` in every response, addresses every admin endpoint, and is what submissions
+will reference in Phase 4. The slug addresses the public detail endpoint,
+`GET /api/problems/{slug}`.
+
+**Why.** A slug is editable by definition — an author fixes a typo in a title and wants the
+URL to match — so hanging foreign keys or admin bookmarks off it would mean a rename breaks
+them. A UUID never changes. But a UUID in a shared link is unreadable, and the catalogue URL
+is the one users paste to each other, so that one gets the slug.
+
+Sequential ids are never exposed at all. `/api/problems/1` would leak how many problems
+exist and invite enumeration; the internal `BIGSERIAL` stays internal, where it keeps
+foreign keys and indexes compact.
+
+**Trade-off.** Two lookup paths to maintain, and the rule has to be remembered. It is
+written down here and in the controller javadoc, and the slug is deliberately *not* changed
+by an ordinary content update — only by supplying one explicitly.
+
+---
+
+## ADR-016 — Attribution columns and structured logs, not an audit table yet
+
+**Problem.** Problem mutations must be traceable to an administrator.
+
+**Options.** A dedicated `audit_log` table; attribution columns on the entity plus
+structured logging; both.
+
+**Chosen.** `created_by` and `updated_by` foreign keys to `users`, plus a structured log
+line per mutation naming the actor, the action, the problem and the resulting status.
+
+**Why.** This answers the question actually being asked — "who last changed this problem,
+and when" — from the row itself, with a foreign key that cannot drift. The brief explicitly
+permits documenting why the existing approach suffices rather than building the table.
+
+An `audit_log` table earns its place when there are several mutating domains to correlate
+and a need to see *history* rather than current attribution: who published this and then
+unpublished it an hour later, or which administrator disabled that account. Problems are the
+first such domain. Building the table now would mean designing its schema around a single
+writer and guessing at the rest, which is how audit tables end up with a `metadata` JSON
+column that nobody can query.
+
+**Trade-off, stated plainly.** Today the system records the *current* author and editor,
+not a history. An administrator who publishes and then unpublishes leaves only the log line
+behind, and logs rotate. This is a real limitation, not a feature, and the table lands with
+the admin surface in a later phase.
+
+**Not logged:** test case inputs and expected outputs. `ProblemTestCase.toString()`
+deliberately omits both so an answer key cannot reach a log file, and a test asserts it.
+
+---
+
+## ADR-017 — Search patterns are built in Java, not in the query
+
+**Problem.** The catalogue supports an optional case-insensitive substring search. The
+obvious JPQL is `LOWER(p.title) LIKE LOWER(CONCAT('%', :search, '%'))`.
+
+**What went wrong.** That form failed against PostgreSQL on *every* listing request,
+including those with no search term at all: `ERROR: function lower(bytea) does not exist`.
+When a parameter is null, PostgreSQL cannot infer its type from a function argument
+position, falls back to `bytea`, and the statement fails before the `:search IS NULL` guard
+can spare it. The guard is evaluated at runtime; the type check happens at parse time.
+
+**Chosen.** The service turns the term into a complete LIKE pattern —
+lower-cased, wildcard-wrapped, with `%`, `_` and the escape character themselves escaped —
+and the query compares against a bare parameter with an explicit `ESCAPE '!'` clause.
+
+**Why.** No function is applied to the parameter, so there is nothing for PostgreSQL to
+mis-infer. It also lower-cases the term once instead of once per row, and escaping the
+user's own wildcards means a search for `100%` matches the literal text rather than
+everything in the catalogue.
+
+**Trade-off.** The pattern syntax now lives in Java rather than being visible in the query.
+The helper is four lines and commented; the alternative was a query that did not run.

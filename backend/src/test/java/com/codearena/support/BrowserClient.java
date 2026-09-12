@@ -43,6 +43,10 @@ public class BrowserClient {
         return exchange(HttpMethod.POST, path, body, responseType);
     }
 
+    public <T> ResponseEntity<T> put(String path, Object body, Class<T> responseType) {
+        return exchange(HttpMethod.PUT, path, body, responseType);
+    }
+
     private <T> ResponseEntity<T> exchange(HttpMethod method, String path, Object body, Class<T> responseType) {
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);

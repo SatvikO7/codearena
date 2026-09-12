@@ -8,10 +8,11 @@ The interesting part of this project is not the CRUD. It is everything around it
 asynchronous job processing, sandboxed execution of untrusted code, queue reliability,
 idempotency and concurrency control.
 
-> **Project status: Phase 2 of 16 complete and verified.** Accounts, roles and sessions
-> work end to end. Problems, submissions and the judge itself are the phases that follow.
-> This README describes what exists today; it is updated at the end of every phase.
-> Nothing below is aspirational — every claim here was executed, not assumed.
+> **Project status: Phase 3 of 16 complete and verified.** Accounts, sessions and the
+> problem catalogue work end to end. Submissions and the judge itself are the phases that
+> follow — **no code is executed by anything in this repository yet.** This README
+> describes what exists today; it is updated at the end of every phase. Nothing below is
+> aspirational — every claim here was executed, not assumed.
 
 ---
 
@@ -214,6 +215,105 @@ in what exists today.
 
 ---
 
+## Problems
+
+Administrators author problems; authenticated users browse the ones that are published.
+
+### Lifecycle
+
+A problem is never created already published, and status is never a writable field. It
+moves only through explicit endpoints, each of which enforces the rules:
+
+```mermaid
+stateDiagram-v2
+    [*] --> DRAFT: create
+    DRAFT --> PUBLISHED: publish (content checked)
+    PUBLISHED --> DRAFT: unpublish
+    DRAFT --> ARCHIVED: archive
+    PUBLISHED --> ARCHIVED: archive
+    ARCHIVED --> DRAFT: restore
+```
+
+`ARCHIVED → DRAFT` is an addition to the four transitions the brief listed. Archiving is a
+single click, and without a way back an administrator who archives the wrong problem has no
+recourse short of editing the database. Restoring lands in DRAFT, never straight in
+PUBLISHED, so a problem cannot silently reappear in the catalogue.
+
+**Publication is gated on completeness.** A problem cannot be published without a
+statement, an input and output format, constraints, at least one worked example and at
+least one test case. The refusal names every field still missing, and the authoring API
+surfaces the same list as `missingForPublication` so the UI can show it before anyone
+presses Publish. Drafts, by contrast, may be as incomplete as the author likes — the
+content columns are nullable precisely so a rough draft can be saved.
+
+### Visibility
+
+| Who | Sees |
+|---|---|
+| Anonymous | Nothing. Both problem endpoints require a session (`401`). |
+| Authenticated user | PUBLISHED problems only |
+| Administrator | Every status, through `/api/admin/problems` |
+
+A DRAFT or ARCHIVED problem answers **404, not 403**, to a normal user. Answering
+"forbidden" would confirm that a problem with that slug exists, which is exactly what an
+unreleased problem is meant to withhold.
+
+### Examples versus test cases
+
+These are separate tables and separate response types, deliberately:
+
+- **Examples** are public by definition — one exists in order to be read.
+- **Test cases** are judge data. They are hidden by default, in the schema as well as the
+  code, and are returned *only* by the admin API. For a hidden case the expected output is
+  the answer key; publishing it would make an ACCEPTED verdict trivially forgeable once
+  judging exists.
+
+`ProblemDetailResponse`, the user-facing type, has **no field** that could hold a test
+case, so leaking one would take a deliberate code change rather than a forgotten filter. A
+test asserts the raw response body contains neither the hidden input nor its expected
+output.
+
+### Endpoints
+
+| Endpoint | Auth | Purpose |
+|---|---|---|
+| `GET /api/problems` | session | Published catalogue, paged and filtered |
+| `GET /api/problems/{slug}` | session | One published problem |
+| `GET /api/admin/problems` | ADMIN | Every status; `status` is a filter here |
+| `POST /api/admin/problems` | ADMIN | Create (always DRAFT) |
+| `GET /api/admin/problems/{id}` | ADMIN | Authoring view, includes test cases |
+| `PUT /api/admin/problems/{id}` | ADMIN | Update content |
+| `POST /api/admin/problems/{id}/publish` | ADMIN | DRAFT → PUBLISHED |
+| `POST /api/admin/problems/{id}/unpublish` | ADMIN | PUBLISHED → DRAFT |
+| `POST /api/admin/problems/{id}/archive` | ADMIN | → ARCHIVED |
+| `POST /api/admin/problems/{id}/restore` | ADMIN | ARCHIVED → DRAFT |
+
+Admin endpoints address a problem by **UUID**; the public detail endpoint uses the
+**slug**. A slug is editable, so hanging admin links off it would break them on a rename; a
+UUID never changes. Sequential ids are never exposed. See ADR-015.
+
+### Pagination
+
+Zero-based `page`; `size` defaults to 20 and is **clamped** to 100 rather than rejected — a
+client asking for 5000 rows is more often naive than hostile, and serving a sane page is
+friendlier than a 400 while still refusing to read the whole table. A `size` below 1, or a
+negative page, is a mistake with no sensible reading and is rejected.
+
+`sort` accepts `NEWEST`, `OLDEST`, `TITLE` or `DIFFICULTY` — a closed vocabulary, not a
+property name, so no caller can order by an arbitrary column. Every ordering ends with a
+unique tiebreaker, without which rows sharing a sort key could appear on two consecutive
+pages while another is skipped. Filtering, sorting and paging all happen in the database;
+no more than one page of rows is ever materialised.
+
+Filters: `difficulty`, `tag`, and `search` (case-insensitive substring of title or slug).
+
+### Deferred, explicitly
+
+Test cases are **stored** here; nothing executes them. There is no submission, no compiler,
+no sandbox and no judge in this repository yet. Those are Phases 4 through 7.
+
+---
+
 ## Configuration
 
 No secret is committed and none is hardcoded. Every environment-specific value is read
@@ -249,9 +349,10 @@ Unit tests (`*Test`) run under Surefire and have no external dependencies. Integ
 tests (`*IT`) run under Failsafe against real containers — never an in-memory database,
 because the system depends on real PostgreSQL behaviour. See ADR-003.
 
-Current suite: 60 tests — 29 backend unit (error contract, password policy, role
-mapping, registration including the concurrent-insert race), 3 worker unit
-(configuration validation), and 28 integration against a real PostgreSQL and Redis.
+Current suite: 157 tests — 95 backend unit (error contract, password policy, role
+mapping, registration races, slug rules, the status machine, publication rules and
+pagination), 3 worker unit (configuration validation), and 59 integration against a real
+PostgreSQL and Redis.
 
 The integration tests drive real HTTP with a genuine cookie jar and CSRF handling rather
 than Spring's `MockMvc` CSRF shortcut. That shortcut injects a valid token directly, so
@@ -316,8 +417,8 @@ as it lands, never before.
 |---|---|---|
 | 1 | Repository, build, Docker stack, service skeletons | **Complete** |
 | 2 | Users, roles, sessions, registration and login | **Complete** |
-| 3 | Problems, tags, test cases, search and pagination | Next |
-| 4 | Submission API and state machine | Planned |
+| 3 | Problems, tags, test cases, search and pagination | **Complete** |
+| 4 | Submission API and state machine | Next |
 | 5 | Redis queue, worker loop, retries, idempotency | Planned |
 | 6 | Docker execution engine, resource limits, isolation | Planned |
 | 7 | Judging, output comparison, verdicts | Planned |
