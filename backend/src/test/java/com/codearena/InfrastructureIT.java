@@ -4,16 +4,10 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
-import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.jdbc.core.JdbcTemplate;
-import org.springframework.test.context.DynamicPropertyRegistry;
-import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
-import org.testcontainers.containers.GenericContainer;
-import org.testcontainers.containers.PostgreSQLContainer;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.junit.jupiter.Testcontainers;
-import org.testcontainers.utility.DockerImageName;
+
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -21,31 +15,15 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 /**
- * Phase 1 acceptance test: the API server boots against a real PostgreSQL and a real
- * Redis, Flyway applies the schema, and both dependencies report healthy.
+ * Infrastructure acceptance test: the API server boots against a real PostgreSQL and a
+ * real Redis, Flyway applies the schema, and both dependencies report healthy.
  *
  * <p>Named {@code *IT} so it runs under Failsafe during {@code mvn verify}. It needs a
  * running Docker daemon; {@code mvn test} skips it.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.MOCK)
 @AutoConfigureMockMvc
-@Testcontainers
-class InfrastructureIT {
-
-    @Container
-    @ServiceConnection
-    static final PostgreSQLContainer<?> POSTGRES =
-            new PostgreSQLContainer<>(DockerImageName.parse("postgres:16-alpine"));
-
-    @Container
-    static final GenericContainer<?> REDIS =
-            new GenericContainer<>(DockerImageName.parse("redis:7-alpine")).withExposedPorts(6379);
-
-    @DynamicPropertySource
-    static void redisProperties(DynamicPropertyRegistry registry) {
-        registry.add("spring.data.redis.host", REDIS::getHost);
-        registry.add("spring.data.redis.port", () -> REDIS.getMappedPort(6379));
-    }
+class InfrastructureIT extends AbstractIntegrationTest {
 
     @Autowired
     private MockMvc mockMvc;
@@ -54,14 +32,51 @@ class InfrastructureIT {
     private JdbcTemplate jdbcTemplate;
 
     @Test
-    void flywayAppliesTheBaselineMigration() {
-        Integer applied = jdbcTemplate.queryForObject(
-                "SELECT count(*) FROM flyway_schema_history WHERE success = true", Integer.class);
-        assertThat(applied).isPositive();
+    void flywayAppliesEveryMigrationInOrder() {
+        List<String> applied = jdbcTemplate.queryForList(
+                "SELECT version FROM flyway_schema_history WHERE success = true ORDER BY installed_rank",
+                String.class);
 
+        assertThat(applied).containsExactly("1", "2");
+
+        // V1 installs citext. V2 ended up not using it (see the note in that migration),
+        // but V1 is already applied everywhere and migrations are immutable, so the
+        // extension stays. Asserted here so the migration history stays honest.
         Integer citext = jdbcTemplate.queryForObject(
                 "SELECT count(*) FROM pg_extension WHERE extname = 'citext'", Integer.class);
         assertThat(citext).isEqualTo(1);
+    }
+
+    /**
+     * The uniqueness guarantees live in the database, not only in application code, so
+     * they are asserted against the real schema.
+     */
+    @Test
+    void usersTableCarriesTheExpectedConstraints() {
+        List<String> constraints = jdbcTemplate.queryForList(
+                "SELECT conname FROM pg_constraint WHERE conrelid = 'users'::regclass", String.class);
+
+        assertThat(constraints).contains(
+                "uq_users_public_id",
+                "ck_users_role", "ck_users_username_length", "ck_users_email_length");
+    }
+
+    /**
+     * Case-insensitive identity is enforced by unique indexes over lower(...). Asserting
+     * they are both UNIQUE and functional is the point: a plain index on the raw column
+     * would let a case-variant duplicate through.
+     */
+    @Test
+    void identityIsUniqueCaseInsensitively() {
+        List<String> definitions = jdbcTemplate.queryForList(
+                "SELECT indexdef FROM pg_indexes WHERE tablename = 'users'", String.class);
+
+        assertThat(definitions).anySatisfy(definition -> assertThat(definition)
+                .contains("UNIQUE").contains("uq_users_username_lower")
+                .contains("lower(").contains("username"));
+        assertThat(definitions).anySatisfy(definition -> assertThat(definition)
+                .contains("UNIQUE").contains("uq_users_email_lower")
+                .contains("lower(").contains("email"));
     }
 
     @Test
@@ -87,14 +102,34 @@ class InfrastructureIT {
         mockMvc.perform(get("/v3/api-docs"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.info.title").value("CodeArena API"))
-                .andExpect(jsonPath("$.paths['/api/system/info']").exists());
+                .andExpect(jsonPath("$.paths['/api/system/info']").exists())
+                .andExpect(jsonPath("$.paths['/api/auth/login']").exists())
+                .andExpect(jsonPath("$.paths['/api/auth/register']").exists());
+    }
+
+    /**
+     * Since Phase 2 the API is authenticated by default, so an anonymous caller learns
+     * only that credentials are required — not whether the path exists. That is the
+     * intended behaviour: route existence should not be probeable by strangers.
+     */
+    @Test
+    void hidesRouteExistenceFromAnonymousCallers() throws Exception {
+        mockMvc.perform(get("/api/does-not-exist"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.error").value("AUTHENTICATION_REQUIRED"))
+                .andExpect(jsonPath("$.path").value("/api/does-not-exist"));
     }
 
     @Test
-    void unknownApiPathReturnsTheStandardErrorShape() throws Exception {
-        mockMvc.perform(get("/api/does-not-exist"))
+    void returnsTheStandardNotFoundShapeToAnAuthenticatedCaller() throws Exception {
+        mockMvc.perform(get("/api/does-not-exist").with(user()))
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.error").value("RESOURCE_NOT_FOUND"))
                 .andExpect(jsonPath("$.path").value("/api/does-not-exist"));
+    }
+
+    private static org.springframework.test.web.servlet.request.RequestPostProcessor user() {
+        return org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors
+                .user("someone").roles("USER");
     }
 }

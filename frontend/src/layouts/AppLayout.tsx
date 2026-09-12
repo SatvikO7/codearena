@@ -1,4 +1,5 @@
-import { NavLink, Outlet } from 'react-router-dom';
+import { NavLink, Outlet, useNavigate } from 'react-router-dom';
+import { useAuth } from '../hooks/useAuth';
 
 /**
  * Primary navigation. Entries are added as their routes become real; a link is never
@@ -8,14 +9,23 @@ const NAV_ITEMS: { to: string; label: string; end?: boolean }[] = [
   { to: '/', label: 'Home', end: true },
 ];
 
-/** Shared chrome: masthead, primary navigation and the routed page body. */
+/** Shared chrome: masthead, primary navigation, account controls and the routed page. */
 export function AppLayout() {
+  const { status, user, logout } = useAuth();
+  const navigate = useNavigate();
+
+  async function handleLogout() {
+    await logout();
+    navigate('/', { replace: true });
+  }
+
   return (
     <div className="app-shell">
       <header className="app-header">
         <NavLink to="/" className="brand" end>
           Code<span>Arena</span>
         </NavLink>
+
         <nav aria-label="Primary">
           <ul className="nav-list">
             {NAV_ITEMS.map((item) => (
@@ -31,6 +41,31 @@ export function AppLayout() {
             ))}
           </ul>
         </nav>
+
+        <div className="account-controls">
+          {/* Render nothing until the session is resolved, so the header does not flash
+              "Sign in" at somebody who is already signed in. */}
+          {status === 'authenticated' && user && (
+            <>
+              <NavLink to="/profile" className="account-name">
+                {user.username}
+              </NavLink>
+              <button type="button" className="button button--quiet" onClick={handleLogout}>
+                Sign out
+              </button>
+            </>
+          )}
+          {status === 'anonymous' && (
+            <>
+              <NavLink to="/login" className="nav-link">
+                Sign in
+              </NavLink>
+              <NavLink to="/register" className="button button--quiet">
+                Register
+              </NavLink>
+            </>
+          )}
+        </div>
       </header>
 
       <main className="app-main">

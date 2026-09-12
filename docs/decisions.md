@@ -110,6 +110,22 @@ removes a whole class of "login works for one casing only" bugs.
 **Trade-off.** A PostgreSQL-specific type, which deepens the commitment to PostgreSQL.
 That commitment is already deliberate (see ADR-003).
 
+> **Superseded in Phase 2 — this decision did not survive contact with Hibernate.**
+> `CITEXT` is reported to JDBC as `Types#OTHER`, and Hibernate's schema validator rejects
+> it against a `String` field: the application refuses to start under `ddl-auto: validate`.
+> Every workaround amounts to relaxing that validation, and that check is worth more than
+> the syntactic nicety — it is what catches an entity mapping drifting away from the
+> migrations.
+>
+> The replacement keeps the actual guarantee and drops only the spelling: unique indexes
+> over `lower(username)` and `lower(email)`. Uniqueness is still enforced by the database,
+> still case-insensitive, and the same indexes serve the login lookup. The reasoning in
+> the original decision was right; the mechanism was wrong. See ADR-012.
+>
+> `V1` already installs the extension and migrations are immutable, so it stays installed
+> and unused. Dropping it would be tidier and is not worth a migration that could fail on
+> a database where something else has come to depend on it.
+
 ---
 
 ## ADR-006 — Stack traces are logged, never returned
@@ -198,3 +214,132 @@ would fix that; with two locations it is not yet worth the indirection.
 configuration. The same applies to the port-publishing assumption: `ports:` entries for
 PostgreSQL and Redis were silently inert because Docker cannot publish from an
 `internal: true` network, and only checking real reachability revealed it.
+
+---
+
+## ADR-010 — Server-side sessions in Redis rather than JWT
+
+**Problem.** Phase 2 needs an authentication mechanism for a browser client. The original
+specification named JWT with access and refresh tokens.
+
+**Options.**
+1. Stateless JWT access token plus a rotating refresh token.
+2. JWT held in an HttpOnly cookie, with a Redis denylist for revocation.
+3. Server-side session in Redis, delivered as an HttpOnly cookie.
+
+**Chosen.** Option 3.
+
+**Why.** The deciding requirement is that logging out must actually invalidate access, and
+that disabling an abusive account must take effect immediately rather than whenever a
+token expires. Option 1 cannot do this at all — a stolen access token stays valid for its
+full lifetime, and shortening that lifetime just trades the problem for refresh traffic.
+Option 2 can, but only by consulting server-side state on every request, at which point the
+token is no longer stateless and the design has become a session store with extra
+cryptography to get wrong.
+
+JWT earns its keep when many independent services must verify a caller without a shared
+store, or when clients are not browsers. Neither holds here: there is one API server, and
+the judge worker never authenticates a user. Sessions in Redis mean the API server can be
+restarted or scaled horizontally without signing anyone out, which was the only real
+advantage option 1 offered.
+
+Storing the session id in an HttpOnly cookie also removes a whole class of failure: there
+is no token for JavaScript to read, so an XSS bug does not directly hand over the account,
+and no developer is tempted to put a credential in `localStorage`.
+
+**Trade-off, stated plainly.** Authentication now depends on Redis. If Redis is down,
+nobody can sign in and existing sessions stop resolving — a JWT design would have kept
+serving reads through a Redis outage. That is accepted because Redis is already a hard
+dependency of the submission queue, so the system has no meaningful degraded mode without
+it. Redis persistence is enabled (`appendonly yes`) so sessions survive a restart of the
+container. The second cost is a Redis round-trip per authenticated request; it is a
+sub-millisecond local lookup, and it is what buys immediate revocation.
+
+This decision supersedes the JWT and refresh-token requirement in the original
+specification, and the `JWT_*` environment variables have been removed rather than left in
+place as dead configuration.
+
+---
+
+## ADR-011 — One role per user, stored as text
+
+**Problem.** Users need roles. The original specification listed a separate `Role` entity,
+implying a many-to-many relationship.
+
+**Options.** A `roles` join table; a single `role` column constrained to an enum; a bitmask
+of permissions.
+
+**Chosen.** A single `role` column holding `USER` or `ADMIN`, mirrored by a Java enum.
+
+**Why.** An online judge distinguishes people who solve problems from people who author
+them, and nothing in the roadmap requires one account to hold two roles simultaneously.
+Adding a role later — `MODERATOR`, say — means one enum constant and one value in the
+`ck_users_role` check constraint, with no change to any authentication code, which is what
+"extensible" was actually asking for. A join table would add a query, an eager-fetch
+decision and a mapping for a cardinality nothing needs; that is the speculative generality
+the brief warns against.
+
+The column is `VARCHAR` holding the enum *name*, never its ordinal. Persisting an ordinal
+means reordering the Java enum silently promotes existing users, which is the kind of bug
+that is discovered late and in production. A test pins the mapping.
+
+**Trade-off.** A genuine multi-role requirement would need a migration and a join table.
+That is a contained change — the `Role` lookup lives behind `AuthenticatedUser` — and is
+cheaper than carrying an unused join table through fourteen more phases.
+
+---
+
+## ADR-012 — Case-insensitive identity via functional unique indexes
+
+**Problem.** `alice@example.com` and `Alice@Example.com` must not be able to register as
+two accounts. ADR-005 chose `CITEXT`; that turned out not to work (see the note there).
+
+**Options.**
+1. Normalise to lower case in application code before every insert and lookup.
+2. `CITEXT`, with schema validation disabled or a custom dialect to appease Hibernate.
+3. `VARCHAR` with unique indexes over `lower(username)` and `lower(email)`.
+
+**Chosen.** Option 3.
+
+**Why.** Option 1 was rejected in ADR-005 for the right reason and the reason still holds:
+correctness that depends on every code path remembering to normalise will eventually meet a
+code path that forgets. Option 2 keeps the nicer spelling but pays for it by weakening
+`ddl-auto: validate`, which is the check that catches an entity drifting away from the
+migrations — a bad trade for cosmetics.
+
+Option 3 keeps the guarantee exactly where it belongs. The database rejects a case-variant
+duplicate whatever the application does, Hibernate validates the schema strictly, and the
+same indexes serve the login lookup, which queries `lower(username)` and `lower(email)` so
+it uses them rather than scanning.
+
+**Trade-off.** Queries must remember to wrap both sides in `lower(...)`, or they will be
+case-sensitive *and* miss the index. This is confined to `UserRepository`, where the two
+lookups are written once and the derived `existsBy…IgnoreCase` queries generate the same
+form. An integration test asserts both indexes exist, are `UNIQUE`, and are functional.
+
+---
+
+## ADR-013 — Integration tests drive real HTTP instead of MockMvc's CSRF shortcut
+
+**Problem.** The authentication tests need to exercise sessions and CSRF.
+
+**Options.** `MockMvc` with `.with(csrf())`; `MockMvc` with a real token round-trip; a real
+HTTP client with a cookie jar.
+
+**Chosen.** A real HTTP client (`TestRestTemplate`) wrapped in a small `BrowserClient` that
+keeps cookies and echoes the CSRF token back as a header.
+
+**Why.** `.with(csrf())` injects a valid token directly into the request. That makes the
+tests pass whether or not the server ever issues the CSRF cookie — and "the cookie is never
+delivered, so the SPA's first POST always fails" is exactly the bug most likely to reach
+production. It is also precisely the bug this project hit: the first version of the suite
+failed with `403` on every registration because a real client had no token to send, which a
+mocked token would have hidden completely.
+
+The same reasoning drives the logout test. Rather than asserting that logout returns `204`,
+it captures the session cookie, logs out, and replays the captured cookie — proving the
+session is gone from Redis rather than merely forgotten by the client.
+
+**Trade-off.** Slower than `MockMvc`, and the client is about eighty lines of test support
+code to maintain. Worth it: these tests fail when the mechanism is broken, which is the only
+property that matters in an authentication suite.

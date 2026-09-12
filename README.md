@@ -8,10 +8,10 @@ The interesting part of this project is not the CRUD. It is everything around it
 asynchronous job processing, sandboxed execution of untrusted code, queue reliability,
 idempotency and concurrency control.
 
-> **Project status: Phase 1 of 16 complete and verified.** Authentication, problems,
-> submissions and the judge itself are the phases that follow. This README describes
-> what exists today; it is updated at the end of every phase. Nothing below is
-> aspirational — every claim here was executed, not assumed.
+> **Project status: Phase 2 of 16 complete and verified.** Accounts, roles and sessions
+> work end to end. Problems, submissions and the judge itself are the phases that follow.
+> This README describes what exists today; it is updated at the end of every phase.
+> Nothing below is aspirational — every claim here was executed, not assumed.
 
 ---
 
@@ -99,8 +99,7 @@ version itself.
 
 ```bash
 cp .env.example .env
-# Set POSTGRES_PASSWORD and JWT_SECRET - compose refuses to start without them.
-# Generate a secret with:  openssl rand -base64 48
+# Set POSTGRES_PASSWORD - compose refuses to start without it.
 
 docker compose up --build
 ```
@@ -160,6 +159,61 @@ cd frontend && npm install && npm run dev
 
 ---
 
+## Authentication
+
+Accounts are protected by **server-side sessions stored in Redis**, delivered to the
+browser as an HttpOnly cookie. There is no JWT, and no token is ever placed anywhere
+JavaScript can read it.
+
+That choice is deliberate. The client is a browser and there is one API server; the judge
+worker never authenticates a user. A stateless token would buy nothing here and would cost
+the property this system actually needs — immediate revocation. Signing out, or disabling
+an abusive account, has to take effect now, not whenever a token happens to expire. Doing
+that with JWT means a server-side denylist consulted on every request, which is a session
+store with extra steps. The full trade-off, including what is given up, is in
+[ADR-010](docs/decisions.md).
+
+| Endpoint | Auth | Purpose |
+|---|---|---|
+| `POST /api/auth/register` | public | Create a `USER` account. Does not sign you in. |
+| `POST /api/auth/login` | public | Authenticate by username **or** email; sets the session cookie. |
+| `POST /api/auth/logout` | session | Destroys the session in Redis and clears the cookie. |
+| `GET /api/auth/me` | session | The current account, or `401`. |
+
+Authorisation rules, enforced by the server on every request:
+
+| Path | Rule |
+|---|---|
+| `/api/system/info`, `/actuator/health/**`, `/v3/api-docs/**`, `/swagger-ui/**` | public |
+| `/api/admin/**` | `ADMIN` only |
+| `/actuator/**` (other than health) | `ADMIN` only |
+| everything else under `/api/**` | any authenticated user |
+
+The frontend's `ProtectedRoute` is a usability measure only. Bypassing it in the browser
+yields an empty page and a `401` from the API — hiding a route is never what keeps it safe.
+
+### Passwords
+
+Length and screening, not composition rules, following NIST SP 800-63B: at least 10
+characters, no requirement for a symbol-and-digit ritual that reliably produces
+`Password1!`. A password may not contain the username or email local-part, and the most
+frequently breached choices are screened out.
+
+The upper bound is **72 bytes**, measured in UTF-8 rather than characters. BCrypt silently
+ignores everything past 72 bytes, so a longer passphrase would be truncated without warning
+and two passwords sharing a 72-byte prefix would both authenticate. Rejecting over-long
+input is honest; quietly truncating it is not.
+
+### Known gap
+
+Login is **not yet rate limited**. BCrypt at cost 12 makes offline cracking expensive and
+online guessing slow, but nothing currently stops sustained attempts against a single
+account. Rate limiting arrives in Phase 9, where Redis is already the counter store. This
+is stated plainly rather than filed under "future improvements", because it is a real gap
+in what exists today.
+
+---
+
 ## Configuration
 
 No secret is committed and none is hardcoded. Every environment-specific value is read
@@ -170,13 +224,17 @@ from an environment variable with a development default; see
 |---|---|
 | `DATABASE_URL`, `DATABASE_USERNAME`, `DATABASE_PASSWORD` | PostgreSQL connection |
 | `REDIS_HOST`, `REDIS_PORT`, `REDIS_PASSWORD` | Redis connection |
-| `JWT_SECRET` | Token signing key (used from Phase 2) |
+| `SESSION_TIMEOUT` | Idle lifetime of a session (ISO-8601, default `PT2H`) |
+| `SESSION_COOKIE_SECURE` | Marks session and CSRF cookies `Secure`. **Must be `true` behind HTTPS** |
+| `BCRYPT_STRENGTH` | Password hashing cost factor (default `12`) |
 | `WORKER_CONCURRENCY` | Submissions judged in parallel per worker process |
 | `CORS_ALLOWED_ORIGINS` | Explicit browser origin allow-list |
 | `VITE_API_BASE_URL` | API base URL baked into the frontend bundle |
 
-`docker-compose.yml` uses `${VAR:?message}` for `POSTGRES_PASSWORD` and `JWT_SECRET`, so
-the stack fails loudly rather than silently starting with a default credential.
+`docker-compose.yml` uses `${VAR:?message}` for `POSTGRES_PASSWORD`, so the stack fails
+loudly rather than silently starting with a default credential. There is no token signing
+key to manage: sessions live in Redis, so revoking one is a delete rather than a wait for
+expiry.
 
 ---
 
@@ -191,11 +249,14 @@ Unit tests (`*Test`) run under Surefire and have no external dependencies. Integ
 tests (`*IT`) run under Failsafe against real containers — never an in-memory database,
 because the system depends on real PostgreSQL behaviour. See ADR-003.
 
-Current suite: 12 tests — 4 backend unit (the error contract), 3 worker unit
-(configuration validation), and 5 integration that boot the API against a real
-PostgreSQL and Redis and assert that Flyway applied the schema, both health indicators
-report UP, the OpenAPI document is published, and unknown paths return the documented
-error envelope.
+Current suite: 60 tests — 29 backend unit (error contract, password policy, role
+mapping, registration including the concurrent-insert race), 3 worker unit
+(configuration validation), and 28 integration against a real PostgreSQL and Redis.
+
+The integration tests drive real HTTP with a genuine cookie jar and CSRF handling rather
+than Spring's `MockMvc` CSRF shortcut. That shortcut injects a valid token directly, so
+the suite would still pass if the server never issued the CSRF cookie at all — which is
+precisely the bug most likely to reach production.
 
 Frontend:
 
@@ -216,8 +277,18 @@ In place and verified as of Phase 1:
   connection fails with `Network unreachable` — confirmed against a raw IP, not just a
   hostname. No host port is published for either datastore.
 - **No secrets in the repository.** `.env` is git-ignored; only `.env.example` is
-  committed, with placeholders. Compose refuses to start if `POSTGRES_PASSWORD` or
-  `JWT_SECRET` is unset rather than falling back to a default credential.
+  committed, with placeholders. Compose refuses to start if `POSTGRES_PASSWORD` is unset
+  rather than falling back to a default credential.
+- **Passwords are BCrypt hashes at cost 12**, stored through a `DelegatingPasswordEncoder`
+  so the algorithm can be migrated later without invalidating existing hashes. No endpoint
+  can return a hash: responses are built from a closed record with no password field.
+- **Sessions, not tokens.** The session id is an HttpOnly, SameSite=Lax cookie, so
+  JavaScript cannot read it and an XSS bug does not hand over the account. Logging out
+  destroys the session in Redis, verified by replaying the captured cookie and getting 401.
+- **CSRF tokens** on every state-changing request, since the browser attaches the session
+  cookie automatically.
+- **Login does not leak which accounts exist**: a wrong password and an unknown username
+  return an identical status and message, asserted by a test.
 - **Containers run as a non-root user** (`uid=100 codearena`, confirmed at runtime),
   from a JRE-only runtime image carrying neither the JDK nor the build cache.
 - **Errors leak nothing.** Stack traces are logged server-side and never serialised into
@@ -244,8 +315,8 @@ as it lands, never before.
 | Phase | Scope | Status |
 |---|---|---|
 | 1 | Repository, build, Docker stack, service skeletons | **Complete** |
-| 2 | Users, roles, JWT access and refresh tokens | Next |
-| 3 | Problems, tags, test cases, search and pagination | Planned |
+| 2 | Users, roles, sessions, registration and login | **Complete** |
+| 3 | Problems, tags, test cases, search and pagination | Next |
 | 4 | Submission API and state machine | Planned |
 | 5 | Redis queue, worker loop, retries, idempotency | Planned |
 | 6 | Docker execution engine, resource limits, isolation | Planned |

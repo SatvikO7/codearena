@@ -251,3 +251,124 @@ h2 {
     padding: 1.5rem 1rem 2.5rem;
   }
 }
+
+/* ---- Account controls in the masthead ---- */
+
+.account-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.9rem;
+  margin-left: auto;
+}
+
+.account-name {
+  color: var(--text);
+  font-size: 0.94rem;
+  font-weight: 500;
+  text-decoration: none;
+}
+
+.account-name:hover {
+  text-decoration: underline;
+}
+
+/* ---- Forms ---- */
+
+.page--narrow {
+  max-width: 26rem;
+  margin: 0 auto;
+}
+
+.form-field {
+  margin-bottom: 1.1rem;
+}
+
+.form-field label {
+  display: block;
+  margin-bottom: 0.3rem;
+  font-size: 0.9rem;
+  font-weight: 600;
+}
+
+.form-field input {
+  width: 100%;
+  padding: 0.55rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  font: inherit;
+  font-size: 0.95rem;
+}
+
+.form-field input:focus-visible {
+  border-color: var(--accent);
+}
+
+.form-field input[aria-invalid='true'] {
+  border-color: var(--error);
+}
+
+.field-hint {
+  margin: 0.35rem 0 0;
+  color: var(--text-muted);
+  font-size: 0.83rem;
+}
+
+.field-error {
+  margin: 0.35rem 0 0;
+  color: var(--error);
+  font-size: 0.85rem;
+}
+
+.form-error {
+  margin: 0 0 1rem;
+  padding: 0.65rem 0.8rem;
+  border: 1px solid var(--error);
+  border-radius: var(--radius);
+  color: var(--error);
+  font-size: 0.9rem;
+}
+
+.form-aside {
+  margin: 1.2rem 0 0;
+  color: var(--text-muted);
+  font-size: 0.9rem;
+}
+
+/* ---- Buttons ---- */
+
+button.button {
+  border: none;
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.95rem;
+  font-weight: 500;
+  margin-top: 0;
+}
+
+.button[disabled] {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.button--quiet {
+  margin-top: 0;
+  padding: 0.35rem 0.8rem;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-size: 0.9rem;
+}
+
+.button--quiet:hover {
+  border-color: var(--accent);
+  filter: none;
+}
+
+@media (max-width: 40rem) {
+  .account-controls {
+    margin-left: 0;
+    width: 100%;
+  }
+}

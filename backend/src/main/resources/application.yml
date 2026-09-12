@@ -39,12 +39,37 @@ spring:
       password: ${REDIS_PASSWORD:}
       timeout: 3s
 
+  # Sessions are the authentication credential, held in Redis rather than in servlet
+  # memory so the API server can be restarted or scaled without signing everyone out.
+  session:
+    store-type: redis
+    timeout: ${SESSION_TIMEOUT:PT2H}
+    redis:
+      namespace: codearena:session
+      # Write session changes immediately rather than at request end. Two API instances
+      # behind a load balancer must never serve a request from a stale session.
+      flush-mode: immediate
+      save-mode: on_set_attribute
+
 server:
   port: ${BACKEND_PORT:8080}
   error:
     include-stacktrace: never    # stack traces are logged, never returned
     include-message: never
   shutdown: graceful
+  servlet:
+    session:
+      cookie:
+        name: CODEARENA_SESSION
+        # The browser must never expose the session id to JavaScript: an XSS bug should
+        # not become a full account takeover.
+        http-only: true
+        # Off for plain-HTTP local development; must be true wherever HTTPS terminates.
+        secure: ${SESSION_COOKIE_SECURE:false}
+        # Lax still sends the cookie on same-site XHR (the SPA and API share a site in
+        # both dev and deployment) while withholding it from cross-site POSTs.
+        same-site: lax
+        path: /
 
 management:
   endpoints:
@@ -74,6 +99,12 @@ codearena:
   version: @project.version@
   cors:
     allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:5173}
+  security:
+    # Cost factor for BCrypt. Raising it strengthens stored hashes and slows every login;
+    # 12 is roughly a quarter-second per verification on modern hardware.
+    bcrypt-strength: ${BCRYPT_STRENGTH:12}
+    # Marks the session and CSRF cookies Secure. Must be true behind HTTPS.
+    require-secure-cookies: ${SESSION_COOKIE_SECURE:false}
 
 logging:
   level:

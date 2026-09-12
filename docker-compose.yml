@@ -69,8 +69,12 @@ services:
       REDIS_HOST: redis
       REDIS_PORT: 6379
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
-      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set in .env}
       CORS_ALLOWED_ORIGINS: http://localhost:${FRONTEND_PORT:-5173}
+      # Sessions are kept in Redis, so there is no signing secret to configure.
+      # Cookies are marked Secure only where HTTPS terminates; local compose is plain
+      # HTTP, and a Secure cookie would simply never be sent.
+      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-false}
+      SESSION_TIMEOUT: ${SESSION_TIMEOUT:-PT2H}
     ports:
       - "${BACKEND_PORT:-8080}:8080"
     healthcheck:

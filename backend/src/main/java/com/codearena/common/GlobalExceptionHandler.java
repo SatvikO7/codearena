@@ -1,5 +1,6 @@
 package com.codearena.common;
 
+import com.codearena.auth.AuthenticationFailedException;
 import jakarta.servlet.http.HttpServletRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -32,6 +33,37 @@ import java.util.List;
 public class GlobalExceptionHandler {
 
     private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
+
+    /**
+     * A rejected login. The status and message were chosen deliberately by the
+     * authentication layer; this only renders them.
+     */
+    @ExceptionHandler(AuthenticationFailedException.class)
+    public ResponseEntity<ApiErrorResponse> handleAuthenticationFailed(
+            AuthenticationFailedException ex, HttpServletRequest request) {
+        return ResponseEntity.status(ex.getStatus()).body(ApiErrorResponse.of(
+                ex.getStatus().value(), ex.getErrorCode(), ex.getMessage(), request.getRequestURI()));
+    }
+
+    /** A duplicate username or email. */
+    @ExceptionHandler(ConflictException.class)
+    public ResponseEntity<ApiErrorResponse> handleConflict(
+            ConflictException ex, HttpServletRequest request) {
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(ApiErrorResponse.of(
+                409, ex.getErrorCode(), ex.getMessage(), request.getRequestURI()));
+    }
+
+    /**
+     * A rule the annotations could not express. Rendered in the same shape as
+     * annotation-driven validation so clients need only one code path for both.
+     */
+    @ExceptionHandler(ValidationException.class)
+    public ResponseEntity<ApiErrorResponse> handleDomainValidation(
+            ValidationException ex, HttpServletRequest request) {
+        return ResponseEntity.badRequest().body(ApiErrorResponse.validation(
+                "Request validation failed", request.getRequestURI(),
+                List.of(new ApiErrorResponse.FieldViolation(ex.getField(), ex.getMessage()))));
+    }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)
     public ResponseEntity<ApiErrorResponse> handleValidation(

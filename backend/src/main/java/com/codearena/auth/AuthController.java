@@ -1,0 +1,192 @@
+package com.codearena.auth;
+
+import com.codearena.auth.dto.LoginRequest;
+import com.codearena.auth.dto.RegistrationRequest;
+import com.codearena.auth.dto.UserProfileResponse;
+import com.codearena.user.User;
+import com.codearena.user.UserRegistrationService;
+import com.codearena.user.UserRepository;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.responses.ApiResponse;
+import io.swagger.v3.oas.annotations.responses.ApiResponses;
+import io.swagger.v3.oas.annotations.tags.Tag;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import jakarta.servlet.http.HttpSession;
+import jakarta.validation.Valid;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.security.authentication.AuthenticationManager;
+import org.springframework.security.authentication.DisabledException;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.security.core.context.SecurityContext;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.security.web.authentication.logout.SecurityContextLogoutHandler;
+import org.springframework.security.web.context.SecurityContextRepository;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
+
+/**
+ * Registration, login, logout and "who am I".
+ *
+ * <p>Authenticated state is a server-side session keyed by an HttpOnly cookie. The
+ * browser never sees a credential it could read from JavaScript, and logging out
+ * destroys the session on the server rather than merely discarding client state.
+ */
+@RestController
+@RequestMapping("/api/auth")
+@Tag(name = "Authentication", description = "Account creation and session lifecycle")
+public class AuthController {
+
+    private static final Logger log = LoggerFactory.getLogger(AuthController.class);
+
+    public static final String INVALID_CREDENTIALS = "INVALID_CREDENTIALS";
+    public static final String ACCOUNT_DISABLED = "ACCOUNT_DISABLED";
+
+    private final UserRegistrationService registrationService;
+    private final AuthenticationManager authenticationManager;
+    private final SecurityContextRepository securityContextRepository;
+    private final UserRepository userRepository;
+
+    public AuthController(UserRegistrationService registrationService,
+                          AuthenticationManager authenticationManager,
+                          SecurityContextRepository securityContextRepository,
+                          UserRepository userRepository) {
+        this.registrationService = registrationService;
+        this.authenticationManager = authenticationManager;
+        this.securityContextRepository = securityContextRepository;
+        this.userRepository = userRepository;
+    }
+
+    @PostMapping("/register")
+    @Operation(summary = "Create an account",
+               description = """
+                       Creates a USER account. Registration does not log you in; call
+                       `POST /api/auth/login` afterwards.
+
+                       The password must be at least 10 characters, at most 72 bytes, and
+                       must not contain your username or email address.
+                       """)
+    @ApiResponses({
+            @ApiResponse(responseCode = "201", description = "Account created"),
+            @ApiResponse(responseCode = "400", description = "Validation failed", content = @io.swagger.v3.oas.annotations.media.Content),
+            @ApiResponse(responseCode = "409", description = "Username or email already in use", content = @io.swagger.v3.oas.annotations.media.Content)
+    })
+    public ResponseEntity<UserProfileResponse> register(@Valid @RequestBody RegistrationRequest request) {
+        User created = registrationService.register(request);
+        return ResponseEntity.status(HttpStatus.CREATED).body(UserProfileResponse.from(created));
+    }
+
+    @PostMapping("/login")
+    @Operation(summary = "Start a session",
+               description = """
+                       Authenticates with a username **or** email address and establishes a
+                       session. The session id is returned as an HttpOnly cookie; there is no
+                       token in the response body for JavaScript to store or leak.
+                       """)
+    @ApiResponses({
+            @ApiResponse(responseCode = "200", description = "Authenticated"),
+            @ApiResponse(responseCode = "401", description = "Invalid credentials", content = @io.swagger.v3.oas.annotations.media.Content),
+            @ApiResponse(responseCode = "403", description = "Account disabled", content = @io.swagger.v3.oas.annotations.media.Content)
+    })
+    public ResponseEntity<UserProfileResponse> login(@Valid @RequestBody LoginRequest request,
+                                                     HttpServletRequest httpRequest,
+                                                     HttpServletResponse httpResponse) {
+
+        Authentication authentication = authenticate(request);
+        AuthenticatedUser principal = (AuthenticatedUser) authentication.getPrincipal();
+
+        // Session fixation defence: discard any session the caller arrived holding, so the
+        // authenticated session is always one this server has just issued. An attacker who
+        // planted a session id before login therefore holds a dead one.
+        HttpSession existingSession = httpRequest.getSession(false);
+        if (existingSession != null) {
+            existingSession.invalidate();
+        }
+        httpRequest.getSession(true);
+
+        SecurityContext context = SecurityContextHolder.createEmptyContext();
+        context.setAuthentication(authentication);
+        SecurityContextHolder.setContext(context);
+        // The filter chain runs with requireExplicitSave, so the context reaches the
+        // session, and Redis, only because it is saved here.
+        securityContextRepository.saveContext(context, httpRequest, httpResponse);
+
+        log.info("Login succeeded for publicId={}", principal.getPublicId());
+
+        return ResponseEntity.ok(loadProfile(principal));
+    }
+
+    private Authentication authenticate(LoginRequest request) {
+        try {
+            return authenticationManager.authenticate(
+                    UsernamePasswordAuthenticationToken.unauthenticated(request.identifier(), request.password()));
+        } catch (DisabledException e) {
+            // Distinguished from bad credentials deliberately: telling a suspended user
+            // that their account is disabled is far better than letting them believe they
+            // have forgotten their password. Registration already reveals which usernames
+            // exist, so this leaks nothing that was previously hidden.
+            log.info("Login rejected for a disabled account");
+            throw new AuthenticationFailedException(
+                    ACCOUNT_DISABLED, HttpStatus.FORBIDDEN, "This account has been disabled");
+        } catch (org.springframework.security.core.AuthenticationException e) {
+            // One message for "no such user" and "wrong password" so that login cannot be
+            // used to enumerate accounts.
+            log.info("Login failed: bad credentials");
+            throw new AuthenticationFailedException(
+                    INVALID_CREDENTIALS, HttpStatus.UNAUTHORIZED, "Invalid username or password");
+        }
+    }
+
+    @PostMapping("/logout")
+    @Operation(summary = "End the session",
+               description = """
+                       Invalidates the server-side session and clears the session cookie.
+                       The session is destroyed in Redis, so the cookie cannot be replayed
+                       even if it was captured.
+                       """)
+    @ApiResponse(responseCode = "204", description = "Session ended")
+    public ResponseEntity<Void> logout(HttpServletRequest request, HttpServletResponse response) {
+        Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
+
+        // Invalidates the HttpSession (removing it from Redis), clears the context and
+        // clears the context holder. Deleting the cookie alone would leave a usable
+        // session on the server.
+        SecurityContextLogoutHandler logoutHandler = new SecurityContextLogoutHandler();
+        logoutHandler.setInvalidateHttpSession(true);
+        logoutHandler.setClearAuthentication(true);
+        logoutHandler.logout(request, response, authentication);
+
+        return ResponseEntity.noContent().build();
+    }
+
+    @GetMapping("/me")
+    @Operation(summary = "The current user",
+               description = "Returns the authenticated account, or 401 when there is no valid session.")
+    @ApiResponses({
+            @ApiResponse(responseCode = "200", description = "The authenticated account"),
+            @ApiResponse(responseCode = "401", description = "No valid session", content = @io.swagger.v3.oas.annotations.media.Content)
+    })
+    public UserProfileResponse currentUser(@AuthenticationPrincipal AuthenticatedUser principal) {
+        return loadProfile(principal);
+    }
+
+    /**
+     * Reads the account fresh rather than trusting the session copy, so a role change or
+     * a disabled flag set by an administrator is reflected on the next call instead of
+     * lingering until the session expires.
+     */
+    private UserProfileResponse loadProfile(AuthenticatedUser principal) {
+        return userRepository.findByPublicId(principal.getPublicId())
+                .map(UserProfileResponse::from)
+                .orElseThrow(() -> new AuthenticationFailedException(
+                        INVALID_CREDENTIALS, HttpStatus.UNAUTHORIZED, "Session refers to an account that no longer exists"));
+    }
+}
