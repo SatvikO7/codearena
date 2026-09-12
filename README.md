@@ -8,11 +8,17 @@ The interesting part of this project is not the CRUD. It is everything around it
 asynchronous job processing, sandboxed execution of untrusted code, queue reliability,
 idempotency and concurrency control.
 
-> **Project status: Phase 3 of 16 complete and verified.** Accounts, sessions and the
-> problem catalogue work end to end. Submissions and the judge itself are the phases that
-> follow — **no code is executed by anything in this repository yet.** This README
-> describes what exists today; it is updated at the end of every phase. Nothing below is
-> aspirational — every claim here was executed, not assumed.
+> **Project status: Phase 4 of 16 complete and verified.** The judge works: a submission
+> is queued, claimed by a worker, compiled and run inside a locked-down container, and
+> given a verdict. C++, Java and Python. This README describes what exists today; it is
+> updated at the end of every phase. Nothing below is aspirational — every claim here was
+> executed, not assumed, including every verdict, which was produced by really compiling
+> and running a program.
+>
+> **The sandbox is competent, not hardened.** The worker holds the Docker socket, which is
+> host-root-equivalent if the worker itself is compromised, and containers share the host
+> kernel. Both are stated plainly in [docs/security.md](docs/security.md) along with the
+> hardening Phase 12 should bring. Do not put this on the public internet yet.
 
 ---
 
@@ -61,7 +67,8 @@ trade-offs.
 | Database | PostgreSQL 16, schema managed by Flyway |
 | Cache / queue | Redis 7 (append-only persistence enabled) |
 | Frontend | React 19, TypeScript, Vite, React Router, Axios |
-| Execution | Docker, one disposable container per submission |
+| Execution | Docker: one disposable container per compile and per test run |
+| Languages | C++ (g++ 13), Java (Temurin 21), Python 3.12 |
 | Build | Maven 3.9 (multi-module reactor, wrapper committed), npm |
 | API docs | OpenAPI 3 via springdoc, Swagger UI |
 | Testing | JUnit 5, AssertJ, MockMvc, Testcontainers |
@@ -72,6 +79,7 @@ trade-offs.
 
 ```
 codearena/
+├── common/             Domain vocabulary shared by the API and the worker
 ├── backend/            Spring Boot API server (owns the Flyway migrations)
 ├── worker/             Spring Boot judge worker
 ├── frontend/           React + TypeScript client
@@ -314,6 +322,118 @@ no sandbox and no judge in this repository yet. Those are Phases 4 through 7.
 
 ---
 
+## Submissions and judging
+
+A user picks a language, writes a solution, and submits. The API writes a row, pushes an id
+onto Redis, and returns in milliseconds — it never compiles or runs anything. A worker picks
+the job up, claims it atomically, and judges it inside a disposable container.
+
+```mermaid
+flowchart LR
+    B["Browser"] -->|"POST /submissions"| A["API server"]
+    A -->|"INSERT (QUEUED)"| P[("PostgreSQL")]
+    A -.->|"202 Accepted"| B
+    A -->|"after commit: LPUSH"| R[("Redis")]
+    R -->|"BLMOVE"| W["Worker"]
+    W -->|"atomic claim"| P
+    W -->|"create · compile · run · destroy"| S["Sandbox container<br/>no network · no socket · capped"]
+    W -->|"verdict"| P
+    B -->|"poll GET /submissions/{id}"| A
+```
+
+### The endpoints
+
+| Endpoint | Auth | Purpose |
+|---|---|---|
+| `POST /api/problems/{id}/submissions` | session | Queue a solution. Returns `202` with an id and `QUEUED`. |
+| `GET /api/submissions/{id}` | session | Status, verdict and **your own** source. |
+| `GET /api/submissions` | session | Your history, newest first. No source code. |
+
+The request body is two fields — `language` and `sourceCode`. There is no userId (it comes
+from the session), no problemId (it comes from the path), and no status, verdict, runtime or
+worker field, because those do not exist on the request type and therefore cannot be
+overposted.
+
+**Source code appears in the detail response and nowhere else.** A user reviewing their own
+history needs to see what they wrote; a list of twenty submissions does not need a few
+hundred kilobytes of program text, and the summary type has no field capable of carrying it.
+
+### Verdicts
+
+| Status | Meaning |
+|---|---|
+| `QUEUED` / `RUNNING` | In flight |
+| `ACCEPTED` | Every test passed |
+| `WRONG_ANSWER` | Output did not match on at least one test |
+| `COMPILATION_ERROR` | The source did not compile |
+| `RUNTIME_ERROR` | Exited non-zero, crashed, or was killed by a signal |
+| `TIME_LIMIT_EXCEEDED` | Exceeded the problem's wall-clock budget |
+| `MEMORY_LIMIT_EXCEEDED` | Killed by the kernel for exceeding its memory ceiling |
+| `SYSTEM_ERROR` | The judge failed. Says nothing about the code. |
+
+A verdict names *which* test failed and nothing about what it contained. The expected output
+never enters the sandbox at all: only the input goes to stdin, and the comparison happens in
+the worker — a program that could read the answer key could print it.
+
+### Execution isolation
+
+Every run is a fresh container, created with these flags and no others. Each is verified by
+a test against a real daemon:
+
+`--network none` · `--memory` with swap disabled · `--cpus` · `--pids-limit` ·
+`--cap-drop ALL` · `--security-opt no-new-privileges` · `--user 65534:65534` ·
+`--read-only` with a small `tmpfs` · no host mount · **no Docker socket**
+
+No shell is involved anywhere. Commands are fixed argv arrays in `LanguageSpec`, and the
+client chooses a language by sending an **enum constant** — a value that does not match one
+is rejected before any code runs. There is no path by which a request contributes an element
+to a command line.
+
+Containers and per-submission volumes are destroyed in a `finally`, so a crashed submission
+leaves nothing behind.
+
+### Delivery and recovery
+
+**At-least-once, made safe by an idempotent claim.** Exactly-once is not offered because it
+is not achievable — a worker can die between taking a job and recording that it did. Instead
+a duplicate delivery is harmless: the claim is a single `UPDATE … WHERE status = 'QUEUED'`,
+so of two workers racing, exactly one wins.
+
+The **submission row is the outbox record** — no second table. `enqueued_at` marks
+publication, which happens after commit (never before, or a worker could claim a row that
+rolls back) and before the marker is written (so a crash republishes rather than silently
+losing the job). A recovery sweeper republishes anything unpublished or stale and reclaims
+submissions from workers that died holding a lease, giving up with `SYSTEM_ERROR` after three
+attempts.
+
+Retried: **infrastructure failures only**. A wrong answer, compilation error, runtime error
+or timeout is a *result* — rerunning the same program would produce the same verdict and
+simply burn a container.
+
+Full detail, including the behaviour at every crash point, is in
+[docs/submission-lifecycle.md](docs/submission-lifecycle.md).
+
+### Output comparison
+
+Line endings, trailing whitespace on each line, and trailing blank lines are normalised
+away — those are properties of the author's editor, not their algorithm. Everything else is
+exact: whitespace *within* a line, leading whitespace, and interior blank lines are all
+significant. There is no floating-point tolerance, because applying an epsilon requires
+knowing a problem's intended precision and the model has no field for it.
+
+### Known gaps
+
+- **No submission rate limiting.** One authenticated user can submit as fast as they can
+  issue requests, and each submission costs a container. The size limit and per-sandbox
+  ceilings bound one submission's cost; nothing yet bounds the rate. Phase 9.
+- **Polling, not push.** The client polls once a second until the status is terminal.
+  Real-time updates are Phase 8; `useSubmissionPolling` is the seam they replace.
+- **The sandbox is not production-hardened.** See the status note at the top and
+  [docs/security.md](docs/security.md).
+
+
+---
+
 ## Configuration
 
 No secret is committed and none is hardcoded. Every environment-specific value is read
@@ -349,10 +469,16 @@ Unit tests (`*Test`) run under Surefire and have no external dependencies. Integ
 tests (`*IT`) run under Failsafe against real containers — never an in-memory database,
 because the system depends on real PostgreSQL behaviour. See ADR-003.
 
-Current suite: 157 tests — 95 backend unit (error contract, password policy, role
-mapping, registration races, slug rules, the status machine, publication rules and
-pagination), 3 worker unit (configuration validation), and 59 integration against a real
-PostgreSQL and Redis.
+Current suite: **284 tests** — 132 unit and 152 integration.
+
+The integration tests run against real infrastructure throughout: a real PostgreSQL and
+Redis via Testcontainers, and **real Docker containers** for every execution test. Mocking
+the sandbox would have been easy and worthless — a mock can be made to return any outcome,
+so the mapping from outcome to verdict would look correct while the sandbox did something
+else entirely. Instead the programs are real, the containers are real, and the verdicts are
+whatever actually happens: an infinite loop really is killed by the timeout, a runaway
+allocation really is killed by the kernel, and a fork bomb really is contained by the pid
+limit.
 
 The integration tests drive real HTTP with a genuine cookie jar and CSRF handling rather
 than Spring's `MockMvc` CSRF shortcut. That shortcut injects a valid token directly, so
@@ -395,6 +521,16 @@ In place and verified as of Phase 1:
 - **Errors leak nothing.** Stack traces are logged server-side and never serialised into
   a response; a unit test asserts the thrown exception's message is absent from the body.
 - **CORS is an explicit origin allow-list**, never a wildcard.
+- **Untrusted code runs only in a disposable container** with no network, no host mount, no
+  Docker socket, dropped capabilities, a read-only root filesystem, an unprivileged user, and
+  kernel-enforced CPU, memory and process ceilings.
+- **The client cannot name a command.** The language is an enum constant; every compiler and
+  interpreter command line is a compile-time argv array. No shell is involved anywhere.
+
+**Not hardened, and stated as such:** the worker holds the Docker socket (host-root-equivalent
+if the worker is compromised), containers share the host kernel, and submission rate limiting
+does not exist yet. [docs/security.md](docs/security.md) covers each in full, with the
+hardening work Phase 12 should do.
 - **Browser hardening headers** — `X-Content-Type-Options`, `X-Frame-Options`,
   `Referrer-Policy` — asserted present on responses, not merely configured (see ADR-009
   for why that distinction mattered).
@@ -418,8 +554,8 @@ as it lands, never before.
 | 1 | Repository, build, Docker stack, service skeletons | **Complete** |
 | 2 | Users, roles, sessions, registration and login | **Complete** |
 | 3 | Problems, tags, test cases, search and pagination | **Complete** |
-| 4 | Submission API and state machine | Next |
-| 5 | Redis queue, worker loop, retries, idempotency | Planned |
+| 4 | Submissions, queue, worker, sandboxed execution, judging | **Complete** |
+| 5 | Worker scaling, dead-letter handling, queue observability | Next |
 | 6 | Docker execution engine, resource limits, isolation | Planned |
 | 7 | Judging, output comparison, verdicts | Planned |
 | 8 | Real-time submission status | Planned |

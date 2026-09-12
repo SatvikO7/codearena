@@ -452,3 +452,164 @@ everything in the catalogue.
 
 **Trade-off.** The pattern syntax now lives in Java rather than being visible in the query.
 The helper is four lines and commented; the alternative was a query that did not run.
+
+---
+
+## ADR-018 — The submission row is the outbox record
+
+**Problem.** A submission must be committed to PostgreSQL *and* published to Redis. If the
+API dies between the two, the submission exists and nothing will ever judge it. The brief
+asks for this not to be hand-waved.
+
+**Options.**
+1. Publish inside the transaction.
+2. Publish after commit and accept the gap.
+3. A separate `submission_outbox` table, written in the same transaction, drained by a publisher.
+4. Treat the submission row itself as the outbox record.
+
+**Chosen.** Option 4, with a recovery sweeper.
+
+**Why.** Option 1 is the tempting wrong answer: a worker can then claim a submission that
+does not exist yet, or that is about to be rolled back. Option 2 is what "we'll add
+reliability later" looks like, and it loses submissions in exactly the case nobody tests.
+
+Option 3 is the textbook shape and would work. It was rejected because it creates a second
+row describing the same fact — "submission 5 exists" and "submission 5 needs queueing" — which
+then have to be kept consistent with each other, and because the brief explicitly wants
+PostgreSQL to remain the single source of truth rather than the queue.
+
+Option 4 collapses those two rows into one. `enqueued_at` is the publication marker: NULL
+means the push has not been confirmed. It satisfies every property the outbox pattern asks
+for — the submission and its intent are created atomically, a publisher transfers pending
+work to Redis, processing is idempotent, and published work is marked — with one row and one
+lifecycle.
+
+Two orderings are load-bearing. Publication fires **after commit**, so no worker sees a
+submission that might roll back. The push happens **before** the marker is written, so a
+crash in between republishes (a harmless duplicate) rather than marking something published
+that never arrived (a silent loss).
+
+**Trade-off.** A submission can be delivered more than once, and the fast path can fail
+silently and be repaired seconds later by the sweeper rather than instantly. Both are
+acceptable because claiming is atomic, and both are far better than the alternative failure
+mode, which is losing work.
+
+---
+
+## ADR-019 — At-least-once delivery with an atomic claim, not exactly-once
+
+**Problem.** Two workers must never judge the same submission, and a crash must not lose one.
+
+**Chosen.** At-least-once delivery from Redis, made safe by an atomic claim: a single
+`UPDATE ... SET status = 'RUNNING' ... WHERE public_id = ? AND status = 'QUEUED' RETURNING ...`
+
+**Why.** Exactly-once is not achievable and claiming it would be dishonest: a worker can die
+between taking a job and recording that it did, and no amount of queue machinery closes that
+gap. What *is* achievable is making a second delivery harmless.
+
+The predicate is evaluated inside the same statement that changes the row, so PostgreSQL's
+row lock picks the winner. Of two workers racing, one sees a row returned and the other sees
+none. The obvious implementation — `SELECT` then `UPDATE` — lets both read QUEUED and both
+proceed, which is precisely the bug this phase had to avoid. A test races eight threads at
+one submission and asserts exactly one claim.
+
+`BLMOVE` moves a job from `pending` to `processing` atomically, so it is never in neither
+list; a plain `BRPOP` would delete the job before the worker had done anything with it.
+
+Result writes carry the same guard (`WHERE status = 'RUNNING' AND claimed_by = ?`), so a
+worker whose lease expired writes nothing rather than overwriting a newer verdict.
+
+**Trade-off.** A submission can be *started* twice if a worker is slow enough for its lease
+to expire, wasting one container. Wasting a container is cheaper than losing a submission or
+recording a stale verdict.
+
+---
+
+## ADR-020 — The worker gets the Docker socket; the sandbox never does
+
+**Problem.** Running untrusted code in containers requires talking to a container runtime.
+Something has to hold that capability.
+
+**Options.**
+1. Mount the host Docker socket into the worker.
+2. A Docker-in-Docker sidecar, so sandboxes run inside a containerised daemon.
+3. Run the worker directly on the host, outside compose.
+
+**Chosen.** Option 1, documented rather than glossed over.
+
+**Why.** Option 3 breaks the "one command brings the stack up" property and makes the
+development environment diverge from the deployed one.
+
+Option 2 is genuinely better isolation — an escape lands in the dind container rather than on
+the host — and was seriously considered. It was rejected for this phase on a practical
+ground: dind needs `--privileged` (a host risk of its own) and needs to pull the language
+images itself, which means giving it internet access. The worker currently sits on a network
+declared `internal: true` with no route off it, and dind would have to break that. Trading a
+documented risk for a different undocumented one is not an improvement.
+
+**The risk, stated plainly.** Access to the Docker socket is equivalent to root on the host.
+If the worker process is compromised, the host is compromised. What the socket mount does
+*not* do is widen what a *submission* can reach: sandboxes get no socket, no host volume and
+no network, and a test asserts the socket is absent inside one.
+
+**Trade-off and the fix.** This is the largest piece of un-hardened surface in the system and
+is recorded as such in docs/security.md. Phase 12 should move to a rootless or remote daemon
+dedicated to judging, and/or a runtime with its own kernel boundary (gVisor, Kata,
+Firecracker), so that neither a worker compromise nor a container escape reaches the host.
+
+---
+
+## ADR-021 — Language is an enum carrying no executable configuration
+
+**Problem.** The client must choose a language. Compilers and interpreters are commands.
+Those two facts must never meet.
+
+**Chosen.** `Language` is an enum in the shared module holding a display name and a file
+extension — nothing executable. The image, compile command and run command live in
+`LanguageSpec` in the worker, as compile-time argv constants.
+
+**Why.** The client sends `"CPP"`. If that string does not name a constant, deserialisation
+fails and the request is rejected before any code runs. There is no code path by which a
+request-supplied value reaches a process argument, because the only thing that crosses the
+boundary is an enum constant.
+
+Commands are argv arrays handed to a `ProcessBuilder`, never strings handed to a shell, so a
+source file containing a shell metacharacter is a file whose name never appears on a command
+line and whose contents are only read by a compiler inside a throwaway container. Source file
+names are fixed per language, which removes path traversal by construction rather than by
+filtering.
+
+`LanguageSpecTest` asserts that no command invokes a shell, that no argument contains shell
+metacharacters, and that every image is pinned to an explicit tag — assertions that look
+pedantic and exist to fail the day somebody makes a command line configurable.
+
+**Trade-off.** Adding a language needs a code change and a deployment, not a configuration
+row. That is the point.
+
+---
+
+## ADR-022 — The worker uses JDBC, not the API server's JPA entities
+
+**Problem.** The worker needs submissions, problems and test cases. The API server already
+has JPA entities for all three.
+
+**Options.** A shared module containing the domain model; the worker owning duplicate
+entities; the worker using plain SQL.
+
+**Chosen.** Plain SQL through `JdbcTemplate`, with a tiny shared module holding only the two
+enums both services must agree on (`Language`, `SubmissionStatus`).
+
+**Why.** The worker issues four statements, one of which is an atomic claim that has to be
+hand-written SQL regardless. Sharing entities would mean a shared module containing the whole
+domain, two independently deployable services locked to one persistence mapping, and
+lazy-loading hazards in a process that runs outside any request scope — in exchange for
+nothing the worker needs.
+
+Keeping `Language` and `SubmissionStatus` shared *is* worth it: a status machine only one
+service knew would be a rule the other could violate. This is the `common` module ADR-001
+anticipated, kept deliberately small so it does not become the dumping ground that couples
+the two services together.
+
+**Trade-off.** The two services' notions of a submission can drift, since no compiler checks
+the worker's SQL against the API's entities. Integration tests against the real schema are
+what catch that, and `ddl-auto: validate` catches it on the API side.

@@ -1,6 +1,7 @@
 package com.codearena.support;
 
 import org.springframework.boot.test.web.client.TestRestTemplate;
+import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
@@ -47,7 +48,45 @@ public class BrowserClient {
         return exchange(HttpMethod.PUT, path, body, responseType);
     }
 
+    /**
+     * JSON-object helpers.
+     *
+     * <p>{@code Map.class} is a raw type, so every assertion made through it produces an
+     * unchecked-conversion warning. These overloads use a {@link ParameterizedTypeReference}
+     * instead, which preserves {@code Map<String, Object>} through the call and keeps the
+     * test source warning-free.
+     */
+    public ResponseEntity<Map<String, Object>> getJson(String path) {
+        return exchangeJson(HttpMethod.GET, path, null);
+    }
+
+    public ResponseEntity<Map<String, Object>> postJson(String path, Object body) {
+        return exchangeJson(HttpMethod.POST, path, body);
+    }
+
+    public ResponseEntity<Map<String, Object>> putJson(String path, Object body) {
+        return exchangeJson(HttpMethod.PUT, path, body);
+    }
+
+    private static final ParameterizedTypeReference<Map<String, Object>> JSON_OBJECT =
+            new ParameterizedTypeReference<>() {
+            };
+
+    private ResponseEntity<Map<String, Object>> exchangeJson(HttpMethod method, String path, Object body) {
+        ResponseEntity<Map<String, Object>> response =
+                restTemplate.exchange(path, method, new HttpEntity<>(body, headers()), JSON_OBJECT);
+        captureCookies(response.getHeaders());
+        return response;
+    }
+
     private <T> ResponseEntity<T> exchange(HttpMethod method, String path, Object body, Class<T> responseType) {
+        ResponseEntity<T> response =
+                restTemplate.exchange(path, method, new HttpEntity<>(body, headers()), responseType);
+        captureCookies(response.getHeaders());
+        return response;
+    }
+
+    private HttpHeaders headers() {
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
         headers.setAccept(List.of(MediaType.APPLICATION_JSON));
@@ -58,18 +97,14 @@ public class BrowserClient {
                     .reduce((a, b) -> a + "; " + b)
                     .orElseThrow());
         }
-        // A browser reads the token from the JavaScript-readable cookie and sends it
-        // back as a header. Only a same-origin caller can do this, which is what makes
-        // it a CSRF defence.
+        // A browser reads the token from the JavaScript-readable cookie and sends it back
+        // as a header. Only a same-origin caller can do this, which is what makes it a
+        // CSRF defence.
         String csrfToken = cookieJar.get(CSRF_COOKIE);
         if (csrfToken != null) {
             headers.add(CSRF_HEADER, csrfToken);
         }
-
-        ResponseEntity<T> response =
-                restTemplate.exchange(path, method, new HttpEntity<>(body, headers), responseType);
-        captureCookies(response.getHeaders());
-        return response;
+        return headers;
     }
 
     /** Applies {@code Set-Cookie}, honouring deletions signalled by {@code Max-Age=0}. */

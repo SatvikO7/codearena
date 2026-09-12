@@ -157,8 +157,10 @@ function ProblemDetailView({ slug }: { slug: string }) {
         </section>
       )}
 
-      {/* Submitting a solution arrives in a later phase; nothing here pretends otherwise. */}
-      <p className="form-aside">
+      <p className="form-aside solve-cta">
+        <Link className="button" to={`/problems/${problem.slug}/solve`}>
+          Solve this problem
+        </Link>
         <Link to="/problems">&larr; Back to problems</Link>
       </p>
     </article>

@@ -8,6 +8,9 @@ import { RegisterPage } from './pages/RegisterPage';
 import { ProfilePage } from './pages/ProfilePage';
 import { ProblemsPage } from './pages/ProblemsPage';
 import { ProblemDetailPage } from './pages/ProblemDetailPage';
+import { SolvePage } from './pages/SolvePage';
+import { SubmissionsPage } from './pages/SubmissionsPage';
+import { SubmissionDetailPage } from './pages/SubmissionDetailPage';
 import { AdminProblemsPage } from './pages/admin/AdminProblemsPage';
 import { AdminProblemFormPage } from './pages/admin/AdminProblemFormPage';
 import { NotFoundPage } from './pages/NotFoundPage';
@@ -28,6 +31,9 @@ export default function App() {
               <Route path="profile" element={<ProfilePage />} />
               <Route path="problems" element={<ProblemsPage />} />
               <Route path="problems/:slug" element={<ProblemDetailPage />} />
+              <Route path="problems/:slug/solve" element={<SolvePage />} />
+              <Route path="submissions" element={<SubmissionsPage />} />
+              <Route path="submissions/:submissionId" element={<SubmissionDetailPage />} />
             </Route>
 
             {/* Requires ADMIN. Again a convenience: every admin endpoint re-checks. */}

@@ -15,6 +15,11 @@
   <description>Judge worker: consumes submission jobs and runs them in isolated Docker containers</description>
 
   <dependencies>
+    <dependency>
+      <groupId>com.codearena</groupId>
+      <artifactId>codearena-common</artifactId>
+      <version>${project.version}</version>
+    </dependency>
     <!--
       The worker is deliberately NOT a web application.  It exposes an actuator
       endpoint over HTTP for health checks, but it serves no public API and is
@@ -28,9 +33,15 @@
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-actuator</artifactId>
     </dependency>
+    <!--
+      Plain JDBC, not JPA. The worker issues four statements, one of which is an atomic
+      claim that has to be hand-written SQL anyway. Hibernate would add a mapping layer,
+      a second-level of caching semantics and lazy-loading hazards to a process that runs
+      outside any request scope, in exchange for nothing it needs.
+    -->
     <dependency>
       <groupId>org.springframework.boot</groupId>
-      <artifactId>spring-boot-starter-data-jpa</artifactId>
+      <artifactId>spring-boot-starter-jdbc</artifactId>
     </dependency>
     <dependency>
       <groupId>org.springframework.boot</groupId>
@@ -48,6 +59,11 @@
       <plugin>
         <groupId>org.springframework.boot</groupId>
         <artifactId>spring-boot-maven-plugin</artifactId>
+      </plugin>
+      <!-- Runs the *IT execution tests, which need a live Docker daemon. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-failsafe-plugin</artifactId>
       </plugin>
     </plugins>
   </build>

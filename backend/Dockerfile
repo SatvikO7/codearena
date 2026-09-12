@@ -9,10 +9,16 @@ WORKDIR /build
 
 # Copy poms first so dependency resolution is cached independently of source changes.
 COPY pom.xml ./
+COPY common/pom.xml common/
 COPY backend/pom.xml backend/
 COPY worker/pom.xml worker/
-RUN mvn -B -pl backend -am dependency:go-offline
+# Warms the dependency cache so a source-only change does not re-download the world.
+# Deliberately non-fatal: go-offline also tries to resolve optional artefacts from
+# third-party repositories, and a transient failure there must not break the build -
+# the package step below fetches anything genuinely missing.
+RUN mvn -B -pl backend -am dependency:go-offline || true
 
+COPY common/src common/src
 COPY backend/src backend/src
 RUN mvn -B -pl backend -am clean package -DskipTests
 

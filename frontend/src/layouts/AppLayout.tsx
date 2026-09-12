@@ -8,6 +8,7 @@ import { useAuth } from '../hooks/useAuth';
 const NAV_ITEMS: { to: string; label: string; end?: boolean }[] = [
   { to: '/', label: 'Home', end: true },
   { to: '/problems', label: 'Problems' },
+  { to: '/submissions', label: 'My submissions' },
 ];
 
 /** Shown only to administrators, and only as a shortcut: the server authorises regardless. */

@@ -37,7 +37,7 @@ class InfrastructureIT extends AbstractIntegrationTest {
                 "SELECT version FROM flyway_schema_history WHERE success = true ORDER BY installed_rank",
                 String.class);
 
-        assertThat(applied).containsExactly("1", "2", "3");
+        assertThat(applied).containsExactly("1", "2", "3", "4");
 
         // V1 installs citext. V2 ended up not using it (see the note in that migration),
         // but V1 is already applied everywhere and migrations are immutable, so the
@@ -111,6 +111,51 @@ class InfrastructureIT extends AbstractIntegrationTest {
                 WHERE conname = 'fk_problem_test_cases_problem'
                 """, String.class);
         assertThat(deleteRule).as("'c' is ON DELETE CASCADE").isEqualTo("c");
+    }
+
+    /**
+     * A submission is a historical record. Deleting a problem or an account must not erase
+     * the evidence that somebody submitted something, so both foreign keys RESTRICT.
+     */
+    @Test
+    void submissionsTableProtectsHistoryFromCascadingDeletes() {
+        List<String> deleteRules = jdbcTemplate.queryForList("""
+                SELECT conname || '=' || confdeltype::text
+                FROM pg_constraint
+                WHERE conrelid = 'submissions'::regclass AND contype = 'f'
+                """, String.class);
+
+        // 'r' is ON DELETE RESTRICT; 'c' would be CASCADE and would lose history.
+        assertThat(deleteRules).contains(
+                "fk_submissions_problem=r", "fk_submissions_user=r");
+    }
+
+    @Test
+    void submissionsTableCarriesTheExpectedConstraints() {
+        List<String> constraints = jdbcTemplate.queryForList(
+                "SELECT conname FROM pg_constraint WHERE conrelid = 'submissions'::regclass", String.class);
+
+        assertThat(constraints).contains(
+                "uq_submissions_public_id", "ck_submissions_status", "ck_submissions_language",
+                "ck_submissions_source_not_blank", "ck_submissions_attempts", "ck_submissions_counts");
+    }
+
+    /**
+     * The sweeper's queries are indexed, and partially so: terminal submissions are the
+     * overwhelming majority and are never swept, so indexing them would cost write
+     * throughput on every completed judgement for nothing.
+     */
+    @Test
+    void submissionPipelineQueriesAreIndexed() {
+        List<String> indexes = jdbcTemplate.queryForList(
+                "SELECT indexdef FROM pg_indexes WHERE tablename = 'submissions'", String.class);
+
+        assertThat(indexes).anySatisfy(definition ->
+                assertThat(definition).contains("ix_submissions_user_created"));
+        assertThat(indexes).anySatisfy(definition ->
+                assertThat(definition).contains("ix_submissions_pending").contains("WHERE"));
+        assertThat(indexes).anySatisfy(definition ->
+                assertThat(definition).contains("ix_submissions_claimed").contains("WHERE"));
     }
 
     @Test

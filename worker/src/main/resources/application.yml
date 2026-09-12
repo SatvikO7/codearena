@@ -19,10 +19,6 @@ spring:
       maximum-pool-size: ${DB_POOL_SIZE:5}
       connection-timeout: 10000
 
-  jpa:
-    open-in-view: false
-    hibernate:
-      ddl-auto: validate
 
   data:
     redis:
@@ -55,7 +51,26 @@ codearena:
   worker:
     # Defaults to the container hostname, which docker compose makes unique per replica.
     id: ${WORKER_ID:${HOSTNAME:worker-local}}
+    # How many submissions this process judges at once. Each one holds a container, so
+    # this is the number of sandboxes this worker contributes to the host.
     concurrency: ${WORKER_CONCURRENCY:2}
+
+  execution:
+    # Path to the Docker client. The worker talks to the daemon through the socket mounted
+    # into its container; user code never sees either.
+    docker-binary: ${DOCKER_BINARY:docker}
+    # Compilation gets its own budget: a problem's 1s run limit says nothing about how long
+    # g++ may take, and a compiler is itself a resource-exhaustion surface.
+    compile-timeout-ms: ${COMPILE_TIMEOUT_MS:20000}
+    compile-memory-mb: ${COMPILE_MEMORY_MB:512}
+    # Fractional CPU quota per sandbox, so one busy loop cannot starve the host.
+    cpus: ${EXECUTION_CPUS:1.0}
+    # Maximum processes in a sandbox. This, not the timeout, is what stops a fork bomb.
+    pids-limit: ${EXECUTION_PIDS_LIMIT:64}
+    # Maximum stdout+stderr captured before the run is abandoned.
+    output-limit-bytes: ${EXECUTION_OUTPUT_LIMIT_BYTES:65536}
+    # Writable scratch inside each sandbox; the rest of its filesystem is read-only.
+    workspace-tmpfs-mb: ${EXECUTION_TMPFS_MB:64}
 
 logging:
   level:

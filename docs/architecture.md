@@ -150,7 +150,38 @@ flowchart LR
     AdminSvc --> TestCases
 ```
 
-## Current state (Phase 3 — complete and verified)
+## The judging pipeline
+
+The API server and the judge worker are separate processes for one reason: the API must
+never execute user code. `POST /api/submissions` writes a row, asks for it to be queued, and
+returns. Everything expensive and everything dangerous happens elsewhere.
+
+```mermaid
+flowchart TD
+    API["API server"] -->|"INSERT (QUEUED)"| PG[("PostgreSQL")]
+    API -->|"after commit"| Redis[("Redis: pending")]
+    Sweeper["Recovery sweeper<br/>(in the API)"] -->|"republish / reclaim"| Redis
+    Sweeper --> PG
+    Redis -->|"BLMOVE"| Worker["Judge worker"]
+    Worker -->|"atomic claim"| PG
+    Worker --> Exec["ExecutionService"]
+    Exec --> Sandbox["Sandbox container<br/>network none · caps dropped<br/>cpu · memory · pids capped"]
+    Worker -->|"verdict"| PG
+```
+
+Three properties hold this together:
+
+- **The submission row is the outbox.** Creating a submission and recording that it needs
+  queueing are one INSERT, so there is no state in which one exists without the other.
+- **The claim is atomic.** `UPDATE … WHERE status = 'QUEUED'` lets exactly one worker win,
+  so duplicate delivery is a no-op rather than a double execution.
+- **Terminal is terminal.** Nothing leaves a verdict, so a straggling worker cannot
+  overwrite a newer result.
+
+The worker uses plain JDBC rather than the API's JPA entities (ADR-022), and the two
+services share only `Language` and `SubmissionStatus` — the rules both must agree on.
+
+## Current state (Phase 4 — complete and verified)
 
 Implemented:
 
@@ -173,6 +204,14 @@ Added in Phase 2:
   responses for 401 and 403
 - Frontend auth context, protected routes, and login/register/profile pages
 
+Added in Phase 4:
+
+- `common` module: `Language` and `SubmissionStatus`, shared by both deployables
+- `submissions` (`V4`), doubling as the transactional outbox
+- Submission API, Redis queue, publication-after-commit and a recovery sweeper
+- Judge worker: atomic claim, Docker execution, verdict mapping, bounded retries
+- Frontend solve page with a code editor, live polling and verdict display
+
 Added in Phase 3:
 
 - `problems`, `problem_examples`, `problem_test_cases` and `problem_tags` (`V3`), with
@@ -182,16 +221,17 @@ Added in Phase 3:
 - Database-level pagination, filtering and search with a closed sort vocabulary
 - Frontend catalogue, problem detail, and the admin authoring and management screens
 
-Verified by execution, not assumed: `./mvnw clean verify` passes (98 unit, 59 integration
-against real PostgreSQL and Redis); all five compose services reach `healthy` with zero
+Verified by execution, not assumed: `./mvnw clean verify` passes (132 unit, 152 integration
+against real PostgreSQL, Redis and **real Docker containers**); all five compose services reach `healthy` with zero
 restarts; Flyway records `V1`, `V2` and `V3` as applied; a draft answers 404 rather than
 403 to a normal user; the raw catalogue response is asserted to contain neither a hidden
 test case's input nor its expected output; a `status` field added to an update payload is
 ignored; and every admin mutation returns 403 to a USER and 401 to an anonymous caller.
 
-**Not implemented, and not claimed:** nothing in this repository executes code. Test cases
-are stored as authoring data only. Submissions, the queue, the sandbox and the judge are
-Phases 4 to 7.
+**Not implemented, and not claimed:** there is no submission rate limiting, no push-based
+status updates (the client polls), no dead-letter queue for inspection, and the sandbox is
+not production-hardened — the worker holds the Docker socket and containers share the host
+kernel. See docs/security.md.
 
 Planned, in phase order:
 submission API and state machine (4), Redis queue and worker loop (5), Docker execution

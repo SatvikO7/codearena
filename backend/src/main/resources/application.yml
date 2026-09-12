@@ -106,6 +106,27 @@ codearena:
     # Marks the session and CSRF cookies Secure. Must be true behind HTTPS.
     require-secure-cookies: ${SESSION_COOKIE_SECURE:false}
 
+  submission:
+    # Largest accepted program, in UTF-8 bytes. Generous for a solution, small enough that
+    # it cannot be used to push megabytes into the database one POST at a time.
+    max-source-bytes: ${MAX_SOURCE_BYTES:65536}
+
+  queue:
+    # How often the recovery sweeper looks for lost or stranded submissions.
+    sweep-interval-ms: ${QUEUE_SWEEP_INTERVAL_MS:30000}
+    # A QUEUED submission published longer ago than this is presumed lost and republished.
+    # Generous, because republishing early only creates duplicate deliveries - harmless,
+    # but pointless work.
+    publish-stale-after: ${QUEUE_PUBLISH_STALE_AFTER:PT2M}
+    # How long a worker may hold a claim before it is presumed dead. Must comfortably
+    # exceed the slowest legitimate judgement: compile timeout plus every test running to
+    # its limit.
+    claim-lease: ${QUEUE_CLAIM_LEASE:PT5M}
+    # How many times a submission may be claimed before the judge gives up on it with
+    # SYSTEM_ERROR. Bounded so a submission that reliably kills its worker cannot cycle
+    # through the pool forever.
+    max-attempts: ${QUEUE_MAX_ATTEMPTS:3}
+
 logging:
   level:
     com.codearena: ${LOG_LEVEL_APP:INFO}

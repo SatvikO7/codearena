@@ -109,6 +109,46 @@ services:
       REDIS_PORT: 6379
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
       WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
+    volumes:
+      # =====================================================================
+      # The Docker socket. Read the following before changing it.
+      #
+      # WHY IT IS HERE
+      #   The worker's job is to run untrusted code inside disposable containers. To
+      #   create those containers it must talk to a container runtime, and the socket is
+      #   how it does so. No socket, no sandbox - the alternative would be running user
+      #   code in the worker's own JVM, which is the thing this whole design exists to
+      #   avoid.
+      #
+      # WHAT IT DOES NOT DO
+      #   The socket is never passed to a sandbox. Containers created for user code get
+      #   `--network none`, no volume from the host, and no socket of their own; a
+      #   submitted program has no path to the daemon. This mount widens the blast radius
+      #   of a compromised *worker*, not of a compromised *submission*.
+      #
+      # THE RISK, PLAINLY
+      #   Access to the Docker socket is equivalent to root on the host: anything holding
+      #   it can start a privileged container that mounts the host filesystem. The worker
+      #   runs only code from this repository and never evaluates user input as a command,
+      #   but "the process is trusted" is a weaker guarantee than "the process cannot".
+      #   This is the single largest piece of un-hardened surface in the system.
+      #
+      # WHAT WOULD FIX IT (Phase 12)
+      #   A rootless or remote daemon dedicated to judging, so the socket grants control
+      #   over an isolated runtime rather than the host; or a sandbox runtime with its own
+      #   kernel boundary (gVisor, Kata, Firecracker) so a container escape is not a host
+      #   escape. Both are deliberately out of scope here and documented in
+      #   docs/security.md rather than quietly left for someone to discover.
+      #
+      # Deliberately NOT granted to the backend or frontend containers.
+      # =====================================================================
+      - /var/run/docker.sock:/var/run/docker.sock
+    # The worker process runs as an unprivileged user, so it needs the socket's owning group
+    # to open it. That gid is a property of the host, not of the image: 0 on Docker Desktop's
+    # VM, usually the `docker` group on a Linux host. Set DOCKER_SOCKET_GID in .env if
+    # `docker compose exec worker docker version` reports a permission error.
+    group_add:
+      - "${DOCKER_SOCKET_GID:-0}"
     # No published ports: the worker serves no public traffic. The health check below
     # runs inside the container itself, so the endpoint never has to be exposed.
     healthcheck:

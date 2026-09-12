@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>com.codearena</groupId>
+    <artifactId>codearena-parent</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+  </parent>
+
+  <artifactId>codearena-common</artifactId>
+  <name>CodeArena Common</name>
+  <description>
+    Domain vocabulary shared by the API server and the judge worker.
+
+    Deliberately tiny and dependency-free. It holds the identifiers and rules both
+    deployables must agree on - what a language is called, what states a submission can be
+    in, and which transitions are legal - and nothing else. Entities, repositories and
+    services stay in the module that owns them, so this does not become a dumping ground
+    that couples the two services together.
+  </description>
+
+  <!-- No dependencies on purpose: plain enums, no Spring, no JPA. -->
+</project>
