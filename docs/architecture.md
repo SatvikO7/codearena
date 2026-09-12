@@ -54,9 +54,15 @@ everything dangerous happens in a worker, behind a queue.
   attaches no gateway. Containers on it cannot reach the internet and cannot be reached
   from outside the compose project.
 
-The worker sits only on `internal` and publishes no ports. PostgreSQL and Redis publish
-to `127.0.0.1` only, for local `psql`/`redis-cli` inspection, never on a routable
-interface.
+The worker sits only on `internal` and publishes no ports.
+
+PostgreSQL and Redis publish **no** host ports at all. This is a property of the
+network, not just a policy: Docker cannot set up port publishing for a container whose
+only network is `internal: true`, because there is no NAT for it. The datastores are
+therefore unreachable from the host and from the LAN, and are inspected from inside the
+network (`docker compose exec postgres psql …`). Verified by observation: a container on
+`internal` has no default route at all — only its own subnet — so an outbound connection
+to a raw IP fails with `Network unreachable`, not merely a DNS failure.
 
 ## Schema ownership
 
@@ -66,7 +72,7 @@ classpath at all. This makes it structurally impossible for several worker repli
 race each other to migrate the database. The worker runs with
 `hibernate.ddl-auto: validate` and waits for the backend's health check before starting.
 
-## Current state (Phase 1)
+## Current state (Phase 1 — complete and verified)
 
 Implemented:
 
@@ -79,6 +85,13 @@ Implemented:
   connectivity panel with loading / connected / error states
 - Full docker compose stack with health-gated startup ordering
 - Flyway baseline migration
+
+Verified by execution, not assumed: `./mvnw clean verify` passes (4 backend unit, 5
+integration against real PostgreSQL and Redis, 3 worker unit); all five compose
+services reach `healthy` with zero restarts and zero ERROR log lines; the API, health,
+OpenAPI and error-envelope endpoints respond correctly; Flyway records `V1` as applied
+and `citext` is installed; the worker's startup probe reaches both dependencies; and
+containers on the internal network have no route off it.
 
 Planned, in phase order: authentication and roles (2), problems and test cases (3),
 submission API and state machine (4), Redis queue and worker loop (5), Docker execution

@@ -127,3 +127,74 @@ that a thrown exception's message does not appear in the response body.
 
 **Trade-off.** Debugging a client-reported failure requires correlating with server
 logs. Request-scoped correlation IDs will be added with the observability work.
+
+---
+
+## ADR-007 — Health checks live in `docker-compose.yml`, not in the images
+
+**Problem.** The frontend's health check was originally a `HEALTHCHECK` instruction in
+its Dockerfile while the other four were defined in compose. Liveness policy was split
+across two files, and the two halves could disagree.
+
+**Options.** Keep `HEALTHCHECK` in every image; define every check in the orchestrator;
+keep both and accept duplication.
+
+**Chosen.** All five checks are defined in `docker-compose.yml`; no image declares a
+`HEALTHCHECK`.
+
+**Why.** Liveness is a deployment concern, not a property of the artefact: the same
+image is probed differently by compose, by ECS and by Kubernetes, and each orchestrator
+wants to own the interval, timeout and retry budget. Defining it once, where the
+dependency graph already lives, keeps `depends_on: condition: service_healthy` and the
+probe it depends on in the same file.
+
+**Trade-off.** `docker run` on the image alone reports no health status. Acceptable —
+the image is never run that way outside of debugging.
+
+---
+
+## ADR-008 — Health checks probe `127.0.0.1`, never `localhost`
+
+**Problem.** The frontend container was permanently `unhealthy` while nginx was in fact
+serving correctly.
+
+**Cause.** Inside the container `localhost` resolves to `::1` before `127.0.0.1`. nginx
+binds IPv4 only (`0.0.0.0:80`), so the probe was refused. The JVM services happened to
+pass the identical check only because Tomcat binds dual-stack (`:::8080`) — the same
+latent bug, masked by a coincidence of the runtime.
+
+**Chosen.** Every health check targets `127.0.0.1` explicitly.
+
+**Why.** It removes name resolution and dual-stack behaviour from the probe entirely.
+Relying on Tomcat's binding happening to be dual-stack is exactly the kind of accident
+that breaks on a base-image upgrade.
+
+**Trade-off.** An IPv6-only listener would not be probed. Nothing in the stack is
+IPv6-only, and the check is explicit enough that the assumption is visible.
+
+---
+
+## ADR-009 — Security headers are repeated per `location` in nginx
+
+**Problem.** The configured `X-Content-Type-Options`, `X-Frame-Options` and
+`Referrer-Policy` headers were absent from every response.
+
+**Cause.** nginx does not inherit `add_header` from an outer block into any `location`
+that declares an `add_header` of its own. Both locations set `Cache-Control`, which
+silently discarded all server-level headers. Separately, combining `expires 1y` with an
+`add_header Cache-Control` emitted two conflicting `Cache-Control` headers on assets.
+
+**Chosen.** The security headers are declared inside each `location`, with a comment
+stating the inheritance rule; `Cache-Control` is set through `add_header` only.
+
+**Why.** This is the behaviour nginx actually has. The duplication is deliberate and
+annotated, because the alternative — a correct-looking server-level block that emits
+nothing — is far worse than three repeated lines.
+
+**Trade-off.** A new `location` must remember the headers. A future `include` snippet
+would fix that; with two locations it is not yet worth the indirection.
+
+**How it was caught.** Asserting on the response headers rather than trusting the
+configuration. The same applies to the port-publishing assumption: `ports:` entries for
+PostgreSQL and Redis were silently inert because Docker cannot publish from an
+`internal: true` network, and only checking real reachability revealed it.

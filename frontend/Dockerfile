@@ -24,6 +24,3 @@ COPY frontend/nginx.conf /etc/nginx/conf.d/default.conf
 COPY --from=build /build/dist /usr/share/nginx/html
 
 EXPOSE 80
-
-HEALTHCHECK --interval=15s --timeout=3s --retries=5 --start-period=5s \
-  CMD wget --spider -q http://localhost/ || exit 1

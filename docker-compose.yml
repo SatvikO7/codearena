@@ -26,10 +26,6 @@ services:
       POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
     volumes:
       - postgres-data:/var/lib/postgresql/data
-    ports:
-      # Published for local inspection with psql. Bound to loopback so the database
-      # is never exposed on the machine's network interfaces.
-      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-codearena} -d ${POSTGRES_DB:-codearena}"]
       interval: 5s
@@ -46,8 +42,6 @@ services:
     command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
     volumes:
       - redis-data:/data
-    ports:
-      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -80,7 +74,7 @@ services:
     ports:
       - "${BACKEND_PORT:-8080}:8080"
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/actuator/health/readiness"]
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8080/actuator/health/readiness"]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -111,10 +105,10 @@ services:
       REDIS_PORT: 6379
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
       WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
-    # No published ports: the worker serves no traffic. Its health endpoint is
-    # reached over the compose network by the healthcheck below.
+    # No published ports: the worker serves no public traffic. The health check below
+    # runs inside the container itself, so the endpoint never has to be exposed.
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8081/actuator/health/readiness"]
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8081/actuator/health/readiness"]
       interval: 10s
       timeout: 5s
       retries: 12
@@ -134,6 +128,14 @@ services:
         condition: service_healthy
     ports:
       - "${FRONTEND_PORT:-5173}:80"
+    healthcheck:
+      # 127.0.0.1, not `localhost`: in the container `localhost` resolves to ::1 first
+      # and nginx binds IPv4 only, so a localhost probe reports a false failure.
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1/"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
     networks:
       - edge
 
@@ -144,7 +146,12 @@ volumes:
 networks:
   edge:
   internal:
-    # Cuts this network off from the host's external network. Combined with the
-    # per-container limits applied to execution sandboxes, it means a compromised
-    # component cannot phone home.
+    # Cuts this network off from the host's external network: containers attached to
+    # it get no default route, so a compromised component cannot phone home.
+    #
+    # A consequence worth knowing: Docker cannot publish a host port for a container
+    # that is only on an internal network, so PostgreSQL and Redis are deliberately
+    # NOT reachable from the host. Inspect them from inside the network instead:
+    #   docker compose exec postgres psql -U codearena -d codearena
+    #   docker compose exec redis redis-cli
     internal: true
