@@ -6,6 +6,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.sql.Timestamp;
 import java.time.Instant;
@@ -93,7 +94,7 @@ public class JudgeRepository {
      */
     public List<JudgeTestCase> loadTestCases(long problemId) {
         return jdbc.query("""
-                SELECT position, input, expected_output, weight
+                SELECT position, input, expected_output, weight, hidden
                 FROM problem_test_cases
                 WHERE problem_id = ?
                 ORDER BY position ASC
@@ -102,7 +103,8 @@ public class JudgeRepository {
                         rs.getInt("position"),
                         rs.getString("input"),
                         rs.getString("expected_output"),
-                        rs.getInt("weight")),
+                        rs.getInt("weight"),
+                        rs.getBoolean("hidden")),
                 problemId);
     }
 
@@ -117,6 +119,7 @@ public class JudgeRepository {
      *
      * @return true when this worker's result was the one recorded
      */
+    @Transactional
     public boolean recordResult(long submissionId, String workerId, JudgeResult result) {
         int updated = jdbc.update("""
                 UPDATE submissions
@@ -145,10 +148,39 @@ public class JudgeRepository {
                 workerId);
 
         if (updated == 0) {
+            // The lease expired and somebody else owns this submission now. Writing the
+            // per-test rows anyway would attach this worker's findings to another worker's
+            // verdict, so nothing is written at all.
             log.warn("event=RESULT_DISCARDED submission={} worker={} reason=claim_no_longer_held",
                     submissionId, workerId);
+            return false;
         }
-        return updated == 1;
+
+        writeTestOutcomes(submissionId, result.testOutcomes());
+        return true;
+    }
+
+    /**
+     * Stores the per-test rows.
+     *
+     * <p>Deleted first, so a retried submission replaces its previous attempt's results
+     * rather than accumulating two sets. Runs in the same transaction as the verdict, so a
+     * reader never sees a terminal status alongside a previous attempt's test rows.
+     */
+    private void writeTestOutcomes(long submissionId, List<TestOutcome> outcomes) {
+        jdbc.update("DELETE FROM submission_test_results WHERE submission_id = ?", submissionId);
+        if (outcomes.isEmpty()) {
+            return;
+        }
+        jdbc.batchUpdate("""
+                INSERT INTO submission_test_results (submission_id, position, passed, runtime_ms, hidden)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                outcomes.stream()
+                        .map(outcome -> new Object[]{
+                                submissionId, outcome.position(), outcome.passed(),
+                                outcome.runtimeMs(), outcome.hidden()})
+                        .toList());
     }
 
     /** Work handed to the judge after a successful claim. */
@@ -170,13 +202,14 @@ public class JudgeRepository {
         }
     }
 
-    /** One test case. Confidential: neither field may leave the worker. */
-    public record JudgeTestCase(int position, String input, String expectedOutput, int weight) {
+    /** One test case. Confidential: neither the input nor the answer may leave the worker. */
+    public record JudgeTestCase(int position, String input, String expectedOutput,
+                                int weight, boolean hidden) {
 
         /** Never prints input or the expected answer. */
         @Override
         public String toString() {
-            return "JudgeTestCase{position=%d, weight=%d}".formatted(position, weight);
+            return "JudgeTestCase{position=%d, weight=%d, hidden=%s}".formatted(position, weight, hidden);
         }
     }
 
@@ -188,6 +221,28 @@ public class JudgeRepository {
             Integer failedTestIndex,
             Integer runtimeMs,
             Integer memoryKb,
-            String errorMessage) {
+            String errorMessage,
+            List<TestOutcome> testOutcomes) {
+
+        /** A result with no per-test detail, for failures that never reached the tests. */
+        public static JudgeResult withoutTestDetail(SubmissionStatus status, Integer testsTotal,
+                                                    Integer testsPassed, String errorMessage) {
+            return new JudgeResult(status, testsTotal, testsPassed, null, null, null,
+                    errorMessage, List.of());
+        }
+    }
+
+    /**
+     * One test's outcome, as the worker records it.
+     *
+     * <p>Carries a number, a pass flag and a duration — never the test's input, expected
+     * output, or what the program actually printed. A type that could hold those would
+     * eventually be persisted or logged, and for a hidden test the expected output is the
+     * answer key.
+     *
+     * @param runtimeMs null when the test never ran, which is every test after the first
+     *                  failure: recording zero would claim they ran and passed instantly
+     */
+    public record TestOutcome(int position, boolean passed, Integer runtimeMs, boolean hidden) {
     }
 }

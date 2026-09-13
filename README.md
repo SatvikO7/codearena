@@ -8,12 +8,17 @@ The interesting part of this project is not the CRUD. It is everything around it
 asynchronous job processing, sandboxed execution of untrusted code, queue reliability,
 idempotency and concurrency control.
 
-> **Project status: Phase 4 of 16 complete and verified.** The judge works: a submission
-> is queued, claimed by a worker, compiled and run inside a locked-down container, and
-> given a verdict. C++, Java and Python. This README describes what exists today; it is
-> updated at the end of every phase. Nothing below is aspirational — every claim here was
-> executed, not assumed, including every verdict, which was produced by really compiling
-> and running a program.
+> **Project status: Phase 5 of 16 complete and verified.** The judge works end to end: a
+> submission is queued, claimed by a worker, compiled and run inside a locked-down
+> container, given a verdict, and the result appears on the page without a reload. C++,
+> Java and Python. This README describes what exists today; it is updated at the end of
+> every phase. Nothing below is aspirational — every claim here was executed, not assumed,
+> including every verdict, which was produced by really compiling and running a program.
+>
+> **Live updates are best-effort, and the code says so.** Delivery is at-least-once, not
+> exactly-once, and real-time delivery is not guaranteed; a snapshot on connect, a
+> convergent client reducer and a bounded fallback poll are what make that safe. See
+> [Live status](#live-status).
 >
 > **The sandbox is competent, not hardened.** The worker holds the Docker socket, which is
 > host-root-equivalent if the worker itself is compromised, and containers share the host
@@ -338,7 +343,9 @@ flowchart LR
     W -->|"atomic claim"| P
     W -->|"create · compile · run · destroy"| S["Sandbox container<br/>no network · no socket · capped"]
     W -->|"verdict"| P
-    B -->|"poll GET /submissions/{id}"| A
+    W -->|"PUBLISH"| R
+    R -->|"notification"| A
+    A -->|"re-read, then SSE"| B
 ```
 
 ### The endpoints
@@ -347,7 +354,12 @@ flowchart LR
 |---|---|---|
 | `POST /api/problems/{id}/submissions` | session | Queue a solution. Returns `202` with an id and `QUEUED`. |
 | `GET /api/submissions/{id}` | session | Status, verdict and **your own** source. |
-| `GET /api/submissions` | session | Your history, newest first. No source code. |
+| `GET /api/submissions` | session | Your history, newest first. No source code. Filter by `problemId`, `status`, `language`; paginated. |
+| `GET /api/submissions/{id}/events` | session | Live status as Server-Sent Events. Snapshot first, then changes, then the stream closes at the verdict. |
+
+The stream runs the **same authorisation check as the endpoint beside it**, before the first
+byte, and answers a bodiless `404` when it fails — the same answer `GET /api/submissions/{id}`
+gives, so watching a stream discloses nothing that reading cannot.
 
 The request body is two fields — `language` and `sourceCode`. There is no userId (it comes
 from the session), no problemId (it comes from the path), and no status, verdict, runtime or
@@ -421,13 +433,52 @@ exact: whitespace *within* a line, leading whitespace, and interior blank lines 
 significant. There is no floating-point tolerance, because applying an epsilon requires
 knowing a problem's intended precision and the model has no field for it.
 
+### Live status
+
+The submission page updates itself. SSE is the primary transport and a bounded poll is the
+fallback; both feed the same reducer, so whichever arrives first wins and the other is
+discarded as a duplicate.
+
+**What is guaranteed, precisely.** Delivery is **at-least-once and best-effort**. It is
+**not exactly-once**, and real-time delivery is **not guaranteed** — Redis Pub/Sub retains
+nothing, so an API instance that is restarting when a verdict is published simply does not
+hear about it, and there is no replay. What holds the guarantee together instead:
+
+- The worker publishes a **notification**, not state: submission id, status, timestamp. The
+  API instance holding the stream **re-reads PostgreSQL** and sends the result of that read.
+  The payload is never forwarded, so Redis is never asked what a submission's status is.
+- Every stream's **first event is a snapshot** of current state, so a client that connects
+  late or reconnects after a gap starts from the truth.
+- The client reducer is **convergent**: an event applies only if strictly newer than what was
+  already applied, and a terminal status absorbs everything after it. A duplicate is a no-op;
+  a client that has seen `ACCEPTED` can never be walked back to `RUNNING`.
+- If the stream fails, a **fallback poll** every 2.5 s takes over, and stops at the verdict.
+  If nothing settles within five minutes the client stops and says so, rather than spinning.
+
+When the stream is unavailable the page says live updates are unavailable and that it is
+checking periodically. It does not pretend to be live when it is not.
+
+### Per-test results
+
+A verdict comes with a strip showing which tests passed, which failed, and which never ran —
+judging stops at the first failure, and a test that never ran is not a test the program got
+wrong.
+
+`submission_test_results` stores a position, a pass flag, a runtime and a `hidden` marker.
+**There is no column that could hold a test's input or expected output**, so there is nothing
+to filter on the way out. A hidden test reports only whether it passed.
+
 ### Known gaps
 
+- **Memory is enforced but not measured.** The ceiling is real — the kernel OOM killer
+  produces `MEMORY_LIMIT_EXCEEDED`, and a test proves it — but nothing reports how much a
+  program used, and `memoryKb` was removed from the API rather than shipped as a field that
+  is always null. Measuring it needs a sandbox image we control (ADR-026).
+- **The SSE connection cap is global, not per user.** 500 concurrent streams server-wide;
+  one account can consume them all. Per-principal limits belong with rate limiting, Phase 9.
 - **No submission rate limiting.** One authenticated user can submit as fast as they can
   issue requests, and each submission costs a container. The size limit and per-sandbox
   ceilings bound one submission's cost; nothing yet bounds the rate. Phase 9.
-- **Polling, not push.** The client polls once a second until the status is terminal.
-  Real-time updates are Phase 8; `useSubmissionPolling` is the seam they replace.
 - **The sandbox is not production-hardened.** See the status note at the top and
   [docs/security.md](docs/security.md).
 
@@ -469,7 +520,7 @@ Unit tests (`*Test`) run under Surefire and have no external dependencies. Integ
 tests (`*IT`) run under Failsafe against real containers — never an in-memory database,
 because the system depends on real PostgreSQL behaviour. See ADR-003.
 
-Current suite: **284 tests** — 132 unit and 152 integration.
+Current suite: **315 tests** — 172 unit and 143 integration — plus **25 frontend tests**.
 
 The integration tests run against real infrastructure throughout: a real PostgreSQL and
 Redis via Testcontainers, and **real Docker containers** for every execution test. Mocking
@@ -489,9 +540,21 @@ Frontend:
 
 ```bash
 cd frontend
+npm test        # Vitest + Testing Library, jsdom
 npm run lint
 npm run build   # type-checks with tsc, then bundles
 ```
+
+The frontend tests cover the two things worth testing here. The first is the **convergence
+reducer**, which is where at-least-once delivery is actually made safe: every scenario the
+transport can produce — a duplicate, a straggler arriving after the verdict, an event lost
+entirely, an unparseable timestamp — is a case in `submissionStream.test.ts`, and the file
+is the specification for the rule.
+
+The second is that the verdict display **does not depend on colour** to say what happened,
+and that a test result carries no field capable of holding test data. That last one asserts
+the *shape* rather than the rendering, because the shape is the actual guarantee: a
+component cannot leak a field that does not exist.
 
 ---
 
@@ -555,14 +618,20 @@ as it lands, never before.
 | 2 | Users, roles, sessions, registration and login | **Complete** |
 | 3 | Problems, tags, test cases, search and pagination | **Complete** |
 | 4 | Submissions, queue, worker, sandboxed execution, judging | **Complete** |
-| 5 | Worker scaling, dead-letter handling, queue observability | Next |
-| 6 | Docker execution engine, resource limits, isolation | Planned |
-| 7 | Judging, output comparison, verdicts | Planned |
-| 8 | Real-time submission status | Planned |
-| 9 | Caching, cache invalidation, rate limiting | Planned |
+| 5 | Submission history, per-test results, real-time status | **Complete** |
+| 6 | Worker scaling, dead-letter handling, queue observability | Next |
+| 7 | Caching and cache invalidation | Planned |
+| 8 | User profiles, statistics, solved-problem tracking | Planned |
+| 9 | Rate limiting and abuse controls | Planned |
 | 10 | Contests, scoring, leaderboards | Planned |
 | 11 | Full frontend | Planned |
-| 12–16 | Hardening, testing, CI/CD, docs, deployment | Planned |
+| 12 | Sandbox hardening (gVisor / rootless daemon) | Planned |
+| 13–16 | Testing, CI/CD, docs, deployment | Planned |
+
+The Docker execution engine and the judging and verdict logic were originally sketched as
+separate later phases. They were delivered in Phase 4, because a submission pipeline that
+queues work nothing can execute is not testable and therefore not verifiable. The table
+above reflects what was actually built, not the original guess at the order.
 
 ---
 

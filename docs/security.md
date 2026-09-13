@@ -92,7 +92,19 @@ cost of *one* submission; nothing yet bounds the *rate*. This is a real gap, sta
 rather than filed under future improvements. Phase 9 brings rate limiting, where Redis is
 already the counter store.
 
-### 5. Disk is bounded only indirectly
+### 5. Live streams are capped, but the cap is global
+
+Each open SSE stream pins a servlet container thread for its lifetime, so an unbounded number
+of them stops the API answering anything — a denial of service needing no more privilege than
+an account. `SubmissionStreamRegistry` caps concurrent streams (default 500,
+`codearena.events.max-sse-connections`) and refuses beyond it.
+
+The cap is **global, not per user**: one account opening 500 streams denies the rest. Making
+it per-principal is the right fix and belongs with the rest of the rate limiting in Phase 9.
+A refused stream is not an error the user sees — it still receives its snapshot, then closes,
+and the client falls back to polling.
+
+### 6. Disk is bounded only indirectly
 
 A per-submission volume plus a `tmpfs` for scratch limits what one execution can write, and
 volumes are removed in a `finally`. There is no global quota on judge storage, so a
@@ -118,6 +130,11 @@ sustained failure of the cleanup path would eventually fill the disk.
 | Can two workers judge the same submission at once? | No — a single atomic `UPDATE … WHERE status = 'QUEUED'` decides the winner. Tested with 8 concurrent claimers. |
 | Can a worker crash lose a submission? | No — the row is the outbox; the sweeper republishes or fails it. Tested. |
 | Can hidden test data leak through the API? | No. The user-facing types have no field capable of holding it, and tests assert the raw response bodies. |
+| Can a user open a stream for another user's submission? | No. `SubmissionStreamController` runs the same authorisation check as the REST endpoint *before* the first byte, and answers a bodiless 404 — the same answer, so the stream discloses no more than the endpoint beside it. Tested. |
+| Can the event stream disclose more than the REST endpoint? | No. The subscriber re-reads through the same service method and serialises the same DTO; there is no separate stream-only payload that could drift. |
+| Can a user learn a submission exists by watching for events? | No. Events are fanned out per submission id to emitters already registered, and registering requires passing the authorisation check. |
+| Can the client set verdict, runtime or test results? | No. Every field on the stream and on both read endpoints is server-derived; no write endpoint accepts any of them. Tested. |
+| Can hidden test data leak through per-test results? | No. `submission_test_results` has no column able to hold it, and `TestResultResponse` has no such field. The guarantee is structural, not a filter. |
 | Can hidden test data leak through logs? | No. `ProblemTestCase.toString()` and `JudgeTestCase.toString()` both omit input and expected output, and the worker logs only ids, statuses and counts. |
 
 ---
@@ -129,5 +146,10 @@ sustained failure of the cleanup path would eventually fill the disk.
 - **Source code** — stored as `TEXT`, never interpreted, never logged, never placed on a command
   line. Returned only from the submission detail endpoint, only to its author. Retained for the
   lifetime of the submission; there is no expiry or purge job yet.
+- **Submission events** — the Redis channel carries a submission id, a status and a timestamp.
+  No source code, no test data, no user identity. Any process able to read the channel learns
+  that *some* submission changed status, which is why the payload is never forwarded to a
+  browser: the authorisation decision is made by the API re-reading the row, not by whoever
+  published the event.
 - **Hidden test cases** — readable only by the admin API and the worker. The expected output never
   enters a sandbox: only the input is written to stdin, and comparison happens in the worker.

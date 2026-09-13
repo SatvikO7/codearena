@@ -1,5 +1,6 @@
 package com.codearena.queue;
 
+import com.codearena.events.SubmissionEventPublisher;
 import com.codearena.submission.Submission;
 import com.codearena.submission.SubmissionRepository;
 import org.slf4j.Logger;
@@ -48,6 +49,7 @@ public class SubmissionRecoverySweeper {
 
     private final SubmissionRepository submissionRepository;
     private final SubmissionQueuePublisher publisher;
+    private final SubmissionEventPublisher events;
     private final Duration publishStaleAfter;
     private final Duration claimLease;
     private final int maxAttempts;
@@ -55,11 +57,13 @@ public class SubmissionRecoverySweeper {
     public SubmissionRecoverySweeper(
             SubmissionRepository submissionRepository,
             SubmissionQueuePublisher publisher,
+            SubmissionEventPublisher events,
             @Value("${codearena.queue.publish-stale-after:PT2M}") Duration publishStaleAfter,
             @Value("${codearena.queue.claim-lease:PT5M}") Duration claimLease,
             @Value("${codearena.queue.max-attempts:3}") int maxAttempts) {
         this.submissionRepository = submissionRepository;
         this.publisher = publisher;
+        this.events = events;
         this.publishStaleAfter = publishStaleAfter;
         this.claimLease = claimLease;
         this.maxAttempts = maxAttempts;
@@ -111,6 +115,12 @@ public class SubmissionRecoverySweeper {
                         submission.getPublicId(), submission.getAttempts(), submission.getClaimedBy());
                 submission.returnToQueue();
             }
+            // Announce the recovery so a watching browser sees the submission go back to
+            // QUEUED, or reach SYSTEM_ERROR, instead of sitting on RUNNING until it gives up.
+            // Published inside the transaction is acceptable here and nowhere else: the
+            // subscriber re-reads the row, so a rolled-back sweep produces a redundant event
+            // that resolves to the unchanged state rather than a wrong one.
+            events.publish(submission.getPublicId(), submission.getStatus(), Instant.now());
         }
         return expired.size();
     }

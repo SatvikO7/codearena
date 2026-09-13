@@ -20,6 +20,10 @@ sequenceDiagram
     Note over A,P: one transaction; the row IS the outbox record
     A-->>B: 202 { submissionId, status: QUEUED }
 
+    B->>A: GET /api/submissions/{id}/events (SSE)
+    A->>P: SELECT status
+    A-->>B: event: snapshot
+
     Note over A: after commit, never before
     A->>R: LPUSH pending {submissionId}
     A->>P: UPDATE enqueued_at = now()
@@ -34,8 +38,12 @@ sequenceDiagram
     W->>P: UPDATE … SET verdict WHERE status='RUNNING' AND claimed_by=me
     W->>R: LREM processing
 
-    B->>A: GET /api/submissions/{id} (polled)
-    A-->>B: terminal status
+    W->>R: PUBLISH codearena:submissions:events
+    R-->>A: {submissionId, status, occurredAt}
+    Note over A,R: a doorbell, not a letter
+    A->>P: SELECT status (re-read; payload never forwarded)
+    A-->>B: event: submission
+    A-->>B: stream closed (terminal)
 ```
 
 ---
@@ -80,6 +88,51 @@ RETURNING …
 
 so of two workers racing, exactly one sees a row and the other sees none and drops the job.
 A read-then-update would let both proceed; this cannot.
+
+---
+
+## Live status delivery
+
+The browser is told about a verdict over Server-Sent Events, with a bounded poll as the
+fallback. Neither transport is trusted on its own.
+
+**What is actually guaranteed.** The event that travels over Redis Pub/Sub is a
+*notification*, not the state: three fields saying "submission X reached status Y at time Z".
+The API instance that receives it **re-reads the submission from PostgreSQL** and sends the
+result of that read. The payload is never forwarded to a browser.
+
+This is **at-least-once, best-effort** delivery. It is **not exactly-once**, and it is not a
+guarantee of real-time delivery:
+
+- Redis Pub/Sub retains nothing. An API instance that is restarting when a message is
+  published never sees it, and there is no replay.
+- An event can arrive twice, or out of order, or after a later one.
+- A proxy can strip the stream without either end noticing.
+
+Four mechanisms make that safe rather than merely survivable:
+
+| Mechanism | What it repairs |
+|---|---|
+| **Snapshot on connect** — every stream's first event is current state, read from PostgreSQL | A client that connected late, reconnected, or missed events while disconnected |
+| **Convergent client reducer** — an event applies only if strictly newer; a terminal status absorbs everything after it | Duplicates, stragglers, out-of-order arrival; a client that saw ACCEPTED can never be walked back to RUNNING |
+| **Bounded fallback poll** (2.5 s, armed only on stream failure, stops at the verdict) | A stream that died silently, an environment with no `EventSource`, a server at its connection cap |
+| **Client watchdog** (5 min) | A submission that never settles; the UI says the submission is safe and to reload, rather than spinning for ever |
+
+`applyStreamEvent` in `frontend/src/services/submissionStream.ts` is where convergence
+actually lives, and its test file is the specification for it — every scenario in it is one
+the transport can genuinely produce.
+
+**PostgreSQL is authoritative throughout.** Redis holds the queue and carries notifications;
+it is never asked what a submission's status is. Redis restarting with an empty keyspace
+costs notifications and delayed browser updates, and costs no verdicts. The sweeper
+(`SubmissionRecoverySweeper`) repairs the queue from the database, never the reverse.
+
+**Shutdown.** Open streams are closed deliberately before the server begins its graceful
+shutdown wait, because a stream is an in-flight request that is designed not to finish. That
+alone turned out not to be enough — a stream whose browser has already gone away stays
+counted as in-flight by Tomcat regardless — so the shutdown wait itself is bounded at five
+seconds. Restarts are predictable rather than stalling for half a minute whenever the judge
+is in use. ADR-027 has the measurement.
 
 ---
 
@@ -142,7 +195,12 @@ Compile once, then run once per test case, **stopping at the first failure** —
 already decided and continuing would only spend containers confirming it.
 
 ACCEPTED requires every test to pass. The verdict names *which* test failed
-(`failedTestIndex`) and nothing about its contents. The expected output never enters the
+(`failedTestIndex`) and nothing about its contents.
+
+Per-test outcomes are recorded in `submission_test_results`: position, pass/fail, runtime,
+and whether the test was hidden. **The table has no column that could hold test data**, so
+there is nothing to filter on the way out (ADR-025). A NULL `runtime_ms` means the test never
+ran — judging stopped before reaching it — which the UI shows as distinct from a failure. The expected output never enters the
 sandbox: only the input is written to stdin, and comparison happens in the worker. A program
 that could read the answer key could print it.
 

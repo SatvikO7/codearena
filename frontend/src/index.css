@@ -901,3 +901,66 @@ button.button {
     max-height: none;
   }
 }
+
+/* ---- Status pill glyph ---- */
+
+.pill-glyph {
+  font-size: 0.9em;
+  line-height: 1;
+}
+
+/* ---- Per-test result strip ---- */
+
+.test-results {
+  margin-top: 1.2rem;
+  padding-top: 1.1rem;
+  border-top: 1px solid var(--border);
+}
+
+.test-results h3 {
+  margin: 0 0 0.6rem;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+}
+
+.test-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  margin: 0 0 0.6rem;
+  padding: 0;
+  list-style: none;
+}
+
+.test-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.2rem 0.45rem;
+  border: 1px solid currentColor;
+  border-radius: var(--radius);
+  font-size: 0.76rem;
+  font-weight: 600;
+  cursor: default;
+}
+
+.test-chip--pass {
+  color: var(--ok);
+}
+
+.test-chip--fail {
+  color: var(--error);
+}
+
+/* A test that never ran is neither a pass nor a failure, and must not look like either. */
+.test-chip--skipped {
+  color: var(--text-muted);
+  border-style: dashed;
+}
+
+.test-chip-number {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.75;
+}

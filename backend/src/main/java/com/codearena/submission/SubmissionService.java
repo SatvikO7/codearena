@@ -7,10 +7,12 @@ import com.codearena.problem.Problem;
 import com.codearena.problem.ProblemRepository;
 import com.codearena.problem.ProblemStatus;
 import com.codearena.queue.SubmissionQueuePublisher;
+import com.codearena.shared.Language;
 import com.codearena.shared.SubmissionStatus;
 import com.codearena.submission.dto.SubmissionAcceptedResponse;
 import com.codearena.submission.dto.SubmissionDetailResponse;
 import com.codearena.submission.dto.SubmissionRequest;
+import com.codearena.submission.dto.SubmissionStatusResponse;
 import com.codearena.submission.dto.SubmissionSummaryResponse;
 import com.codearena.user.Role;
 import com.codearena.user.User;
@@ -25,6 +27,8 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.nio.charset.StandardCharsets;
+import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 
 /**
@@ -40,17 +44,20 @@ public class SubmissionService {
     private static final Logger log = LoggerFactory.getLogger(SubmissionService.class);
 
     private final SubmissionRepository submissionRepository;
+    private final SubmissionTestResultRepository testResultRepository;
     private final ProblemRepository problemRepository;
     private final UserRepository userRepository;
     private final ApplicationEventPublisher eventPublisher;
     private final int maxSourceBytes;
 
     public SubmissionService(SubmissionRepository submissionRepository,
+                             SubmissionTestResultRepository testResultRepository,
                              ProblemRepository problemRepository,
                              UserRepository userRepository,
                              ApplicationEventPublisher eventPublisher,
                              @Value("${codearena.submission.max-source-bytes:65536}") int maxSourceBytes) {
         this.submissionRepository = submissionRepository;
+        this.testResultRepository = testResultRepository;
         this.problemRepository = problemRepository;
         this.userRepository = userRepository;
         this.eventPublisher = eventPublisher;
@@ -120,7 +127,44 @@ public class SubmissionService {
             log.info("event=SUBMISSION_ACCESS_DENIED submission={} viewer={}", submissionPublicId, viewerPublicId);
             throw notFound();
         }
-        return SubmissionDetailResponse.from(submission);
+        return SubmissionDetailResponse.from(
+                submission, testResultRepository.findBySubmissionIdOrderByPositionAsc(submission.getId()));
+    }
+
+    /**
+     * Confirms the caller may watch this submission, for the SSE endpoint.
+     *
+     * <p>Authorisation is the same rule as {@link #get}, evaluated once when the stream is
+     * opened. It has to be: an event channel that skipped the ownership check would be a
+     * second, weaker door to the same data.
+     */
+    @Transactional(readOnly = true)
+    public SubmissionStatusResponse requireReadableStatus(UUID submissionPublicId,
+                                                          UUID viewerPublicId,
+                                                          Role viewerRole) {
+        Submission submission = submissionRepository.findByPublicId(submissionPublicId)
+                .orElseThrow(SubmissionService::notFound);
+
+        boolean owner = submission.getUser().getPublicId().equals(viewerPublicId);
+        if (!owner && viewerRole != Role.ADMIN) {
+            log.info("event=SUBMISSION_STREAM_DENIED submission={} viewer={}",
+                    submissionPublicId, viewerPublicId);
+            throw notFound();
+        }
+        return SubmissionStatusResponse.from(submission);
+    }
+
+    /**
+     * The current state, for pushing over an already-authorised stream.
+     *
+     * <p>No ownership check, and that is safe only because it is unreachable from HTTP: the
+     * single caller is the event subscriber, which sends the result exclusively to
+     * connections that passed {@link #requireReadableStatus} when they opened.
+     */
+    @Transactional(readOnly = true)
+    public Optional<SubmissionStatusResponse> findStatus(UUID submissionPublicId) {
+        return submissionRepository.findByPublicId(submissionPublicId)
+                .map(SubmissionStatusResponse::from);
     }
 
     /**
@@ -133,15 +177,20 @@ public class SubmissionService {
     public PageResponse<SubmissionSummaryResponse> listOwn(UUID viewerPublicId,
                                                            UUID problemPublicId,
                                                            SubmissionStatus status,
+                                                           Language language,
                                                            Pageable pageable) {
         User viewer = userRepository.findByPublicId(viewerPublicId)
                 .orElseThrow(() -> new ResourceNotFoundException("Authenticated account no longer exists"));
 
+        // An unknown problem resolves to a sentinel that matches nothing, rather than to
+        // null. Null would mean "no filter", so a mistyped problem id would silently widen
+        // the result to the user's entire history instead of returning nothing.
         Long problemId = problemPublicId == null
                 ? null
                 : problemRepository.findByPublicId(problemPublicId).map(Problem::getId).orElse(-1L);
 
-        Page<Submission> page = submissionRepository.findForUser(viewer.getId(), problemId, status, pageable);
+        Page<SubmissionSummaryProjection> page = submissionRepository.findSummariesForUser(
+                viewer.getId(), problemId, status, language, pageable);
         return PageResponse.from(page, SubmissionSummaryResponse::from);
     }
 

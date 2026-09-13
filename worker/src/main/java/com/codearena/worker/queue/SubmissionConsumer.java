@@ -1,5 +1,6 @@
 package com.codearena.worker.queue;
 
+import com.codearena.shared.SubmissionStatus;
 import com.codearena.worker.config.WorkerProperties;
 import com.codearena.worker.judge.JudgeRepository;
 import com.codearena.worker.judge.JudgeRepository.ClaimedSubmission;
@@ -68,6 +69,7 @@ public class SubmissionConsumer implements ApplicationRunner {
     private static final Duration POLL_TIMEOUT = Duration.ofSeconds(2);
 
     private final StringRedisTemplate redis;
+    private final WorkerEventPublisher events;
     private final JudgeRepository judgeRepository;
     private final JudgeService judgeService;
     private final WorkerProperties properties;
@@ -76,10 +78,12 @@ public class SubmissionConsumer implements ApplicationRunner {
     private ExecutorService consumers;
 
     public SubmissionConsumer(StringRedisTemplate redis,
+                              WorkerEventPublisher events,
                               JudgeRepository judgeRepository,
                               JudgeService judgeService,
                               WorkerProperties properties) {
         this.redis = redis;
+        this.events = events;
         this.judgeRepository = judgeRepository;
         this.judgeService = judgeService;
         this.properties = properties;
@@ -182,6 +186,10 @@ public class SubmissionConsumer implements ApplicationRunner {
         log.info("event=SUBMISSION_CLAIMED submission={} worker={} attempt={} language={}",
                 submissionId, properties.id(), claimed.attempts(), claimed.language());
 
+        // The claim is already committed, so announcing RUNNING now cannot show a browser a
+        // state the database does not hold.
+        events.publish(submissionId, SubmissionStatus.RUNNING);
+
         long startedAt = System.nanoTime();
         List<JudgeTestCase> testCases = judgeRepository.loadTestCases(claimed.problemId());
         JudgeResult result = judgeService.judge(claimed, testCases);
@@ -192,6 +200,13 @@ public class SubmissionConsumer implements ApplicationRunner {
         log.info("event=SUBMISSION_JUDGED submission={} worker={} status={} tests={}/{} durationMs={} recorded={}",
                 submissionId, properties.id(), result.status(),
                 result.testsPassed(), result.testsTotal(), durationMs, recorded);
+
+        // Only announce a verdict this worker actually wrote. If the claim had expired the
+        // update matched nothing, and publishing would tell watchers about a result that is
+        // not in the database and that another worker may already have superseded.
+        if (recorded) {
+            events.publish(submissionId, result.status());
+        }
     }
 
     private void sleepBriefly() {

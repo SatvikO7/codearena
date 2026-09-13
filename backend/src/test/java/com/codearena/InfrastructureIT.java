@@ -37,7 +37,7 @@ class InfrastructureIT extends AbstractIntegrationTest {
                 "SELECT version FROM flyway_schema_history WHERE success = true ORDER BY installed_rank",
                 String.class);
 
-        assertThat(applied).containsExactly("1", "2", "3", "4");
+        assertThat(applied).containsExactly("1", "2", "3", "4", "5");
 
         // V1 installs citext. V2 ended up not using it (see the note in that migration),
         // but V1 is already applied everywhere and migrations are immutable, so the
@@ -156,6 +156,46 @@ class InfrastructureIT extends AbstractIntegrationTest {
                 assertThat(definition).contains("ix_submissions_pending").contains("WHERE"));
         assertThat(indexes).anySatisfy(definition ->
                 assertThat(definition).contains("ix_submissions_claimed").contains("WHERE"));
+    }
+
+    /**
+     * The per-test results table must have no column capable of holding a test's input,
+     * expected output, or what the program printed. This asserts the absence directly: a
+     * future migration that adds one fails here rather than in production.
+     */
+    @Test
+    void testResultsTableCannotHoldHiddenTestData() {
+        List<String> columns = jdbcTemplate.queryForList("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name = 'submission_test_results'
+                """, String.class);
+
+        assertThat(columns).containsExactlyInAnyOrder(
+                "id", "submission_id", "position", "passed", "runtime_ms", "hidden", "created_at");
+        assertThat(columns).noneMatch(column ->
+                column.contains("input") || column.contains("output") || column.contains("expected"));
+    }
+
+    /**
+     * Test results CASCADE with their submission — they are components of it, not history in
+     * their own right — while submissions themselves stay RESTRICT-protected.
+     */
+    @Test
+    void testResultsAreDeletedWithTheirSubmission() {
+        String deleteRule = jdbcTemplate.queryForObject("""
+                SELECT confdeltype::text FROM pg_constraint
+                WHERE conname = 'fk_submission_test_results_submission'
+                """, String.class);
+
+        assertThat(deleteRule).as("'c' is ON DELETE CASCADE").isEqualTo("c");
+    }
+
+    @Test
+    void verdictFilteringIsIndexed() {
+        List<String> indexes = jdbcTemplate.queryForList(
+                "SELECT indexname FROM pg_indexes WHERE tablename = 'submissions'", String.class);
+
+        assertThat(indexes).contains("ix_submissions_user_status_created");
     }
 
     @Test

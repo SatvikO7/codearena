@@ -1,5 +1,6 @@
 package com.codearena.submission;
 
+import com.codearena.shared.Language;
 import com.codearena.shared.SubmissionStatus;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
@@ -26,23 +27,36 @@ public interface SubmissionRepository extends JpaRepository<Submission, Long> {
     Optional<Submission> findByPublicId(UUID publicId);
 
     /**
-     * One user's history, newest first.
+     * One user's history, newest first, as a <strong>projection</strong>.
      *
-     * <p>Scoped by user id in the query itself rather than filtered afterwards: a listing
-     * that fetched everything and then removed other people's rows would be one forgotten
-     * line away from leaking them, and would read the whole table to do it.
+     * <p>Selecting columns rather than entities is the point. A submission row carries its
+     * whole source program in a TEXT column, and a page of twenty would drag a few hundred
+     * kilobytes out of the database to render a table that shows none of it. The projection
+     * names exactly the columns the summary needs, so the source is never read, never
+     * travels over the wire from PostgreSQL, and never occupies heap.
+     *
+     * <p>It also flattens the problem join, which removes the N+1 that a lazy
+     * {@code submission.getProblem().getTitle()} per row would otherwise cause.
+     *
+     * <p>The user id is a predicate in the query, not a filter applied afterwards: there is
+     * no arrangement of request parameters that widens this beyond the caller's own rows.
      */
-    @EntityGraph(attributePaths = {"problem"})
     @Query("""
-            SELECT s FROM Submission s
+            SELECT new com.codearena.submission.SubmissionSummaryProjection(
+                s.publicId, p.publicId, p.slug, p.title,
+                s.language, s.status, s.testsTotal, s.testsPassed,
+                s.runtimeMs, s.createdAt, s.finishedAt)
+            FROM Submission s JOIN s.problem p
             WHERE s.user.id = :userId
-              AND (:problemId IS NULL OR s.problem.id = :problemId)
+              AND (:problemId IS NULL OR p.id = :problemId)
               AND (:status IS NULL OR s.status = :status)
+              AND (:language IS NULL OR s.language = :language)
             """)
-    Page<Submission> findForUser(@Param("userId") Long userId,
-                                 @Param("problemId") Long problemId,
-                                 @Param("status") SubmissionStatus status,
-                                 Pageable pageable);
+    Page<SubmissionSummaryProjection> findSummariesForUser(@Param("userId") Long userId,
+                                                           @Param("problemId") Long problemId,
+                                                           @Param("status") SubmissionStatus status,
+                                                           @Param("language") Language language,
+                                                           Pageable pageable);
 
     // ------------------------------------------------------- recovery sweeper
 
@@ -86,6 +100,4 @@ public interface SubmissionRepository extends JpaRepository<Submission, Long> {
     @Modifying
     @Query("UPDATE Submission s SET s.enqueuedAt = :at, s.updatedAt = :at WHERE s.publicId = :publicId")
     int markEnqueued(@Param("publicId") UUID publicId, @Param("at") Instant at);
-
-    long countByUserIdAndStatusIn(Long userId, List<SubmissionStatus> statuses);
 }

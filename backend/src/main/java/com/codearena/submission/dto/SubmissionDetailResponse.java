@@ -3,10 +3,12 @@ package com.codearena.submission.dto;
 import com.codearena.shared.Language;
 import com.codearena.shared.SubmissionStatus;
 import com.codearena.submission.Submission;
+import com.codearena.submission.SubmissionTestResult;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import io.swagger.v3.oas.annotations.media.Schema;
 
 import java.time.Instant;
+import java.util.List;
 import java.util.UUID;
 
 /**
@@ -22,8 +24,14 @@ import java.util.UUID;
  * <p>What is <b>never</b> here, no matter what happened during judging: any hidden test's
  * input or expected output, any container id, host path, environment variable or command
  * line. {@code errorMessage} carries compiler diagnostics or a short runtime message that
- * the worker has already truncated and stripped; {@code failedTestIndex} says <em>which</em>
- * test failed without saying anything about what it contained.
+ * the worker has already truncated and sanitised; {@code failedTestIndex} and
+ * {@code testResults} say <em>which</em> tests failed without saying anything about what
+ * they contained.
+ *
+ * <p>Memory is deliberately absent. It is <em>enforced</em> — a program exceeding its
+ * ceiling is killed by the kernel and reported as MEMORY_LIMIT_EXCEEDED — but peak usage is
+ * not <em>measured</em>, and a field that was always null would be worse than no field. The
+ * reason and the fix are in the README's known limitations.
  */
 @JsonInclude(JsonInclude.Include.NON_NULL)
 @Schema(description = "A submission and its verdict. Only the submission's author, or an administrator, may read one.")
@@ -45,16 +53,24 @@ public record SubmissionDetailResponse(
         Integer failedTestIndex,
 
         Integer runtimeMs,
-        Integer memoryKb,
 
         @Schema(description = "Sanitised compiler or runtime output. Never contains hidden test data or host paths.")
         String errorMessage,
 
+        @Schema(description = "Per-test outcomes, in test order. Empty until judging finishes. "
+                            + "Never includes any test's input or expected output.")
+        List<TestResultResponse> testResults,
+
+        @Schema(description = "How many times a worker has claimed this submission. Greater than "
+                            + "one means an earlier worker failed and it was retried.")
+        int attempts,
+
         Instant createdAt,
         Instant startedAt,
-        Instant finishedAt) {
+        Instant finishedAt,
+        Instant updatedAt) {
 
-    public static SubmissionDetailResponse from(Submission submission) {
+    public static SubmissionDetailResponse from(Submission submission, List<SubmissionTestResult> testResults) {
         return new SubmissionDetailResponse(
                 submission.getPublicId(),
                 submission.getProblem().getPublicId(),
@@ -67,10 +83,12 @@ public record SubmissionDetailResponse(
                 submission.getTestsPassed(),
                 submission.getFailedTestIndex(),
                 submission.getRuntimeMs(),
-                submission.getMemoryKb(),
                 submission.getErrorMessage(),
+                testResults.stream().map(TestResultResponse::from).toList(),
+                submission.getAttempts(),
                 submission.getCreatedAt(),
                 submission.getStartedAt(),
-                submission.getFinishedAt());
+                submission.getFinishedAt(),
+                submission.getUpdatedAt());
     }
 }

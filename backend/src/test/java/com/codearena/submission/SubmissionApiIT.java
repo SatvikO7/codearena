@@ -486,7 +486,150 @@ class SubmissionApiIT extends AbstractIntegrationTest {
                 .containsEntry("totalItems", 0);
     }
 
+    // ------------------------------------------------------- history and filters
+
+    @Test
+    void filtersHistoryByLanguage() {
+        submit(author, publishedProblemId, Language.PYTHON, "print(1)");
+        submit(author, publishedProblemId, Language.CPP, "int main(){}");
+        submit(author, publishedProblemId, Language.CPP, "int main(){return 0;}");
+
+        assertThat(author.getJson("/api/submissions?language=CPP").getBody())
+                .containsEntry("totalItems", 2);
+        assertThat(author.getJson("/api/submissions?language=PYTHON").getBody())
+                .containsEntry("totalItems", 1);
+        assertThat(author.getJson("/api/submissions?language=JAVA").getBody())
+                .containsEntry("totalItems", 0);
+    }
+
+    @Test
+    void combinesFilters() {
+        submit(author, publishedProblemId, Language.PYTHON, "print(1)");
+        submit(author, publishedProblemId, Language.CPP, "int main(){}");
+
+        assertThat(author.getJson(
+                "/api/submissions?language=CPP&status=QUEUED&problemId=" + publishedProblemId).getBody())
+                .containsEntry("totalItems", 1);
+        assertThat(author.getJson(
+                "/api/submissions?language=CPP&status=ACCEPTED").getBody())
+                .as("a filter combination matching nothing must return nothing, not everything")
+                .containsEntry("totalItems", 0);
+    }
+
+    @Test
+    void reportsAnUnknownFilterValueAsABadRequest() {
+        assertThat(author.getJson("/api/submissions?language=COBOL").getStatusCode())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(author.getJson("/api/submissions?status=MAYBE").getStatusCode())
+                .isEqualTo(HttpStatus.BAD_REQUEST);
+    }
+
+    @Test
+    void paginatesHistoryDeterministically() {
+        for (int i = 0; i < 5; i++) {
+            submit(author, publishedProblemId, Language.PYTHON, "print(" + i + ")");
+        }
+
+        ResponseEntity<Map<String, Object>> first = author.getJson("/api/submissions?page=0&size=2");
+        ResponseEntity<Map<String, Object>> second = author.getJson("/api/submissions?page=1&size=2");
+
+        assertThat(first.getBody()).containsEntry("totalItems", 5).containsEntry("totalPages", 3)
+                .containsEntry("hasNext", true).containsEntry("hasPrevious", false);
+        // No id may appear on two pages, which is what a unique tiebreaker guarantees.
+        assertThat(idsOf(first)).doesNotContainAnyElementsOf(idsOf(second));
+    }
+
+    @Test
+    void clampsAnOversizedHistoryPage() {
+        submit(author, publishedProblemId, Language.PYTHON, "print(1)");
+
+        assertThat(author.getJson("/api/submissions?size=99999").getBody())
+                .containsEntry("size", 100);
+    }
+
+    // ------------------------------------------------ per-problem history endpoint
+
+    @Test
+    void listsSubmissionsForOneProblem() {
+        submit(author, publishedProblemId, Language.PYTHON, "print(1)");
+
+        ResponseEntity<Map<String, Object>> response =
+                author.getJson("/api/problems/" + publishedProblemId + "/submissions");
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getBody()).containsEntry("totalItems", 1);
+    }
+
+    /**
+     * This endpoint is addressed by problem, so it is the most tempting one to mistake for a
+     * public feed of everybody's attempts. It is not: it returns the caller's own rows only.
+     */
+    @Test
+    void theProblemScopedHistoryIsNotAPublicFeed() {
+        submit(author, publishedProblemId, Language.PYTHON, "print('ada-only')");
+
+        ResponseEntity<String> theirs = bystander.get(
+                "/api/problems/" + publishedProblemId + "/submissions", String.class);
+
+        assertThat(theirs.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(theirs.getBody()).contains("\"totalItems\":0");
+        assertThat(theirs.getBody()).doesNotContain("ada-only");
+    }
+
+    @Test
+    void theProblemScopedHistoryNeverReturnsSourceCode() {
+        submit(author, publishedProblemId, Language.PYTHON, "print('UNIQUE-LIST-SOURCE')");
+
+        assertThat(author.get("/api/problems/" + publishedProblemId + "/submissions", String.class).getBody())
+                .doesNotContain("UNIQUE-LIST-SOURCE")
+                .doesNotContain("sourceCode");
+    }
+
+    // ------------------------------------------------------------ test results
+
+    /**
+     * The detail response exposes which tests failed and nothing about them. This asserts
+     * the whole body, so a future field carrying test content fails here.
+     */
+    @Test
+    void exposesPerTestOutcomesWithoutTheTestContents() {
+        UUID submissionId = submitAndExtractId(author, publishedProblemId, Language.PYTHON, "print(1)");
+        Submission stored = submissionRepository.findByPublicId(submissionId).orElseThrow();
+
+        jdbc.update("UPDATE submissions SET status = 'WRONG_ANSWER', tests_total = 2, tests_passed = 1, "
+                + "failed_test_index = 1, runtime_ms = 12, finished_at = now() WHERE public_id = ?", submissionId);
+        jdbc.update("INSERT INTO submission_test_results (submission_id, position, passed, runtime_ms, hidden) "
+                + "VALUES (?, 0, true, 11, false), (?, 1, false, 12, true)", stored.getId(), stored.getId());
+
+        ResponseEntity<String> raw = author.get("/api/submissions/" + submissionId, String.class);
+
+        assertThat(raw.getBody())
+                .contains("testResults")
+                .contains("\"position\":0")
+                .contains("\"passed\":true")
+                .contains("\"hidden\":true")
+                .doesNotContain(HIDDEN_INPUT)
+                .doesNotContain(HIDDEN_ANSWER)
+                .doesNotContain("expectedOutput");
+    }
+
+    @Test
+    void aSubmissionWithNoResultsYetReportsAnEmptyTestList() {
+        UUID submissionId = submitAndExtractId(author, publishedProblemId, Language.PYTHON, "print(1)");
+
+        ResponseEntity<Map<String, Object>> response = author.getJson("/api/submissions/" + submissionId);
+
+        assertThat((List<?>) response.getBody().get("testResults")).isEmpty();
+        assertThat(response.getBody()).containsEntry("attempts", 0);
+    }
+
     // ------------------------------------------------------------------ helpers
+
+    private List<String> idsOf(ResponseEntity<Map<String, Object>> response) {
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> items = (List<Map<String, Object>>) response.getBody().get("items");
+        return items.stream().map(item -> item.get("id").toString()).toList();
+    }
 
     private ResponseEntity<Map<String, Object>> submit(BrowserClient client, UUID problemId,
                                                        Language language, String source) {

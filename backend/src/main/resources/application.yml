@@ -8,6 +8,21 @@ spring:
   application:
     name: codearena-backend
 
+  lifecycle:
+    # How long graceful shutdown waits for in-flight requests before giving up.
+    #
+    # Deliberately far below the 30s default, because of SSE. An event stream is a request
+    # that is designed not to finish, and a stream whose browser has already gone away stays
+    # counted as in-flight by Tomcat even after the server completes its emitter — so the
+    # wait runs to the full timeout on any restart where somebody was watching a submission.
+    #
+    # Five seconds is generous for what actually needs draining here: no non-streaming
+    # endpoint in this service does anything slower than a few indexed queries. The cost of
+    # the shorter window is that a genuinely slow request could be cut off at five seconds
+    # instead of thirty; the benefit is that restarts are predictable rather than stalling
+    # for half a minute whenever the judge is in use. See ADR-027.
+    timeout-per-shutdown-phase: 5s
+
   datasource:
     url: ${DATABASE_URL:jdbc:postgresql://localhost:5432/codearena}
     username: ${DATABASE_USERNAME:codearena}

@@ -3,7 +3,7 @@ import { Link, useParams } from 'react-router-dom';
 import { getProblem } from '../services/problemService';
 import { submitSolution } from '../services/submissionService';
 import { apiErrorCode, describeApiError } from '../services/apiClient';
-import { useSubmissionPolling } from '../hooks/useSubmissionPolling';
+import { useSubmissionStream } from '../hooks/useSubmissionStream';
 import { SubmissionVerdict } from '../components/SubmissionVerdict';
 import { DifficultyBadge } from '../components/DifficultyBadge';
 import { LANGUAGES, STARTER_CODE } from '../types/submission';
@@ -51,7 +51,7 @@ function SolveView({ slug }: { slug: string }) {
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [submissionId, setSubmissionId] = useState<string | null>(null);
 
-  const { submission, pending, timedOut } = useSubmissionPolling(submissionId);
+  const { status, pending, timedOut, transport } = useSubmissionStream(submissionId);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -260,17 +260,34 @@ function SolveView({ slug }: { slug: string }) {
             )}
           </section>
 
-          {submissionId && !submission && (
+          {submissionId && !status && (
             <p className="status status--pending" role="status">
-              Submitted. Waiting for the judge&hellip;
+              Submitted. Connecting to the judge&hellip;
             </p>
           )}
 
-          {submission && <SubmissionVerdict submission={submission} timedOut={timedOut} />}
+          {status && (
+            <SubmissionVerdict
+              status={status.status}
+              testsTotal={status.testsTotal}
+              testsPassed={status.testsPassed}
+              failedTestIndex={status.failedTestIndex}
+              runtimeMs={status.runtimeMs}
+              errorMessage={status.errorMessage}
+              timedOut={timedOut}
+            />
+          )}
 
           {submissionId && (
             <p className="form-aside">
-              <Link to="/submissions">See all your submissions</Link>
+              <Link to={"/submissions/" + submissionId}>Full result</Link>
+              {" · "}
+              <Link to="/submissions">All your submissions</Link>
+              {/* Surfaced quietly: if live updates fail the page still works, and the user
+                  deserves to know why it feels slower. */}
+              {transport === "polling" && (
+                <span className="field-hint"> Live updates unavailable; checking periodically.</span>
+              )}
             </p>
           )}
         </div>

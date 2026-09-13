@@ -41,8 +41,8 @@ class JudgeVerdictIT {
 
     /** Adds two integers. One visible test, one hidden, as a real problem would have. */
     private static final List<JudgeTestCase> ADDITION_TESTS = List.of(
-            new JudgeTestCase(0, "2 3\n", "5", 1),
-            new JudgeTestCase(1, "10 32\n", "42", 1));
+            new JudgeTestCase(0, "2 3\n", "5", 1, false),
+            new JudgeTestCase(1, "10 32\n", "42", 1, true));
 
     @BeforeAll
     static void requireDocker() {
@@ -138,7 +138,7 @@ class JudgeVerdictIT {
     @Timeout(300)
     void aWrongAnswerNeverDisclosesTheExpectedOutput() {
         List<JudgeTestCase> secretTests = List.of(
-                new JudgeTestCase(0, "SECRET-INPUT-MARKER\n", "SECRET-ANSWER-MARKER", 1));
+                new JudgeTestCase(0, "SECRET-INPUT-MARKER\n", "SECRET-ANSWER-MARKER", 1, true));
 
         JudgeResult result = judge.judge(
                 submission(Language.PYTHON, "print('definitely not the answer')"), secretTests);

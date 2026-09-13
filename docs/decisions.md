@@ -613,3 +613,193 @@ the two services together.
 **Trade-off.** The two services' notions of a submission can drift, since no compiler checks
 the worker's SQL against the API's entities. Integration tests against the real schema are
 what catch that, and `ddl-auto: validate` catches it on the API side.
+
+---
+
+## ADR-023 — Server-Sent Events for live status, not WebSockets
+
+**Problem.** A submission takes seconds to judge. The page showing it has to move from
+QUEUED to RUNNING to a verdict without the user reloading.
+
+**Options.** Polling on a timer; WebSockets; Server-Sent Events.
+
+**Chosen.** SSE as the primary transport, with a bounded poll as the fallback.
+
+**Why.** The traffic here is entirely one-directional: the server has something to say and
+the browser has nothing to reply. SSE is exactly that shape, and it costs one endpoint
+returning an `SseEmitter` — no second protocol, no upgrade handshake, no separate
+authentication story. The session cookie authorises the stream the same way it authorises
+every other request, and `SubmissionStreamController` runs the *same* authorisation check as
+the REST endpoint before the first byte is written.
+
+WebSockets would buy a channel back from the browser that nothing in this phase needs, and
+would cost a protocol that proxies handle less predictably and that Spring Security's servlet
+filter chain does not cover after the upgrade.
+
+Polling alone was the Phase 4 behaviour and is kept only as the fallback, because it is the
+one thing guaranteed to work when a proxy strips the stream.
+
+**Trade-off.** Each open stream pins a servlet container thread, which is why
+`SubmissionStreamRegistry` caps concurrent connections (default 500) and refuses past it —
+a refusal the client cannot distinguish from a failure, and does not need to, because both
+lead to the same fallback. A rejected connection still gets its snapshot before the stream
+closes, so no client is left with nothing.
+
+---
+
+## ADR-024 — Redis Pub/Sub carries a notification; PostgreSQL stays authoritative
+
+**Problem.** The worker learns the verdict. The API instance holding the browser's stream is
+a different process, possibly on a different host.
+
+**Options.** The worker writes to the browser somehow; the event payload carries the new
+state and the API forwards it; the event carries only "something changed" and the API
+re-reads.
+
+**Chosen.** The worker publishes a three-field event to one Redis channel. Every API
+instance subscribes. On receiving one, `SubmissionEventSubscriber` **re-reads the submission
+from PostgreSQL** and sends *that* to the browser. The event payload is never forwarded.
+
+**Why.** This is what keeps Redis out of the trust path. The event is a doorbell, not a
+letter: if it is duplicated, delayed, reordered or lost, the worst case is a redundant read
+or a late one, never a browser shown a status the database does not hold. Redis restarting
+with an empty keyspace loses notifications and loses nothing else.
+
+Forwarding the payload would have made Redis a second source of truth for submission state,
+and a cheaper, less durable one than the database that already holds it.
+
+The re-read is cheap and it is skipped entirely when nobody is watching — the common case,
+since most submissions are judged with no stream open.
+
+**Delivery semantics, stated plainly.** This is **at-least-once, best-effort** delivery, and
+it is not exactly-once. Redis Pub/Sub retains nothing: an API instance that is restarting
+when a message is published does not receive it, and there is no replay. Three things make
+that acceptable rather than merely tolerated:
+
+1. Every stream sends a **snapshot** of current state as its first event, so a client that
+   connects late or reconnects after a gap starts from the truth.
+2. The client's reducer (`applyStreamEvent`) is **convergent**: it applies an event only if
+   it is strictly newer than what it has already applied, and a terminal status absorbs
+   everything after it. A duplicate is a no-op, a straggler is discarded, and a client that
+   has seen ACCEPTED can never be walked back to RUNNING.
+3. A **bounded fallback poll** repairs the case where the stream dies silently.
+
+No part of the system claims guaranteed real-time delivery, and the UI does not pretend to:
+when the stream is unavailable the page says so and says it is checking periodically.
+
+**Trade-off.** A verdict can reach a browser later than it reaches the database — in the
+worst case one fallback poll interval (2.5 s), or not until reload if every transport fails.
+That is a latency guarantee we do not make, in exchange for never displaying a state the
+database does not hold.
+
+---
+
+## ADR-025 — Per-test results record an outcome and nothing else
+
+**Problem.** "3 of 5 tests passed" is not enough to act on; which ones failed matters. But
+test inputs and expected outputs are the answer key, and hidden ones must stay hidden.
+
+**Options.** Store the full per-test detail and filter it on read; store a diff; store only
+the outcome.
+
+**Chosen.** `submission_test_results` has columns for position, pass/fail, runtime and a
+`hidden` flag. **There is no column that can hold test data**, so there is nothing to filter
+on the way out.
+
+**Why.** A filter is a rule somebody can forget to apply — on a new endpoint, in a new
+projection, in a query written next year. A schema with nowhere to put the secret cannot
+leak it through any of those. The `TestResultResponse` DTO has the same shape for the same
+reason, and the frontend test asserts the shape rather than the rendering, because the shape
+is the actual guarantee.
+
+`hidden` is denormalised onto the row at judging time rather than joined from `test_cases`.
+Visibility is a property of what was judged: flipping a test case from example to hidden
+afterwards must not retroactively change what a past result was allowed to say.
+
+A `runtime_ms` of NULL means the test never ran, which is genuinely different from failing
+it — judging stops at the first failure. The UI renders those three states distinctly, and
+never as a failure the user's program did not cause.
+
+**Trade-off.** A user who fails a hidden test is told only that they failed it. That is the
+intended trade: debuggability loses to the integrity of the answer key.
+
+---
+
+## ADR-026 — Memory is enforced but not measured, and the DTO says nothing about it
+
+**Problem.** A judge conventionally reports memory used alongside runtime. Phase 4 enforces
+a memory ceiling; it does not measure consumption.
+
+**Options.** Report a number obtained some approximate way; keep a `memoryKb` field that is
+always null; remove the field.
+
+**Chosen.** Removed `memoryKb` from the API and the frontend types. The limit is still
+enforced — the container is capped with `--memory` and `--memory-swap`, and the kernel OOM
+killer produces MEMORY_LIMIT_EXCEEDED — but nothing reports how much was used.
+
+**Why.** Measuring peak RSS of a process inside a `--read-only`, `--cap-drop ALL` container
+requires either reading the container's cgroup from the host after exit (racy — the cgroup is
+gone once the container is reaped) or instrumenting the sandbox image with a supervisor. Both
+are real options; neither is Phase 5's job.
+
+Between the remaining two, an always-null field is worse than no field. It reads as a bug to
+every client author, and it is the kind of thing that quietly acquires a plausible-looking
+value later. The brief is explicit that unimplemented features must not be claimed, and a
+schema field is a claim.
+
+**Trade-off.** Users see runtime but not memory, and MEMORY_LIMIT_EXCEEDED says the ceiling
+was hit without saying by how much. Restoring the number means committing to a sandbox image
+we control, which is the same work Phase 12's isolation hardening implies.
+
+---
+
+## ADR-027 — Shutdown does not wait on event streams
+
+**Problem.** Spring Boot's graceful shutdown waits for in-flight requests to finish. An SSE
+stream is an in-flight request that is *designed* not to finish — it stays open until the
+verdict lands or its timeout expires. Every restart therefore stalled for the full 30-second
+grace period whenever anyone happened to be watching a submission, which is precisely when
+the server is in use.
+
+It surfaced as a forked test JVM that would not exit: `SubmissionStreamIT` alone reproduced
+it, and Surefire killed the fork thirty seconds after `System.exit(0)`.
+
+**Options.** Disable graceful shutdown; shorten the SSE timeout to something shutdown can
+outwait; close the streams explicitly before shutdown begins; bound the shutdown wait.
+
+**Chosen.** Two changes, because the first one alone did not work.
+
+1. `SubmissionStreamRegistry` implements `SmartLifecycle` at a phase above the web server's
+   graceful-shutdown lifecycle, and completes every open emitter there.
+2. `spring.lifecycle.timeout-per-shutdown-phase` is set to **5s**, down from the 30s default.
+
+**Why both.** The first change is correct and necessary — a stream with a live browser on the
+end of it is released cleanly, and the browser reconnects. But it is *not sufficient*, and
+the measurement says so plainly: after the change the log shows `SSE_SHUTDOWN closed=3`
+immediately followed by `Commencing graceful shutdown`, and then the full thirty-second wait
+anyway. A stream whose client has **already disconnected** stays counted as in-flight by
+Tomcat even after the server completes its emitter, and nothing the application can do from
+the registry releases it.
+
+So the wait itself is bounded. Five seconds is generous for what genuinely needs draining
+here: no non-streaming endpoint in this service does anything slower than a few indexed
+queries.
+
+Closing streams is safe in a way that cutting off an ordinary request would not be. The
+verdict lives in PostgreSQL, not in the connection. `EventSource` reconnects on its own, and
+the reconnect is handed a snapshot of current state — a client whose stream is cut during a
+deploy converges through exactly the path ADR-024 already relies on.
+
+**Trade-off.** A genuinely slow non-streaming request could now be cut off at five seconds
+rather than thirty. Nothing in this service is expected to run that long, and the alternative
+is a restart that stalls for half a minute every time the judge is in use.
+
+**What is still true and not claimed away.** An abandoned SSE connection remains counted as
+in-flight until Tomcat notices, so shutdown still waits — it simply waits five seconds
+instead of thirty. Removing the wait entirely would mean reaching into the servlet
+container's async bookkeeping, which is not worth the coupling.
+
+`SubmissionStreamRegistryTest` pins the part that is enforceable in code: that stopping
+completes every registered emitter, and that the registry's phase sits strictly above
+`WebServerGracefulShutdownLifecycle.SMART_LIFECYCLE_PHASE` — so a Spring Boot upgrade that
+moves that constant fails the build rather than silently restoring the stall.

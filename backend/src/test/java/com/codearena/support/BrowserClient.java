@@ -131,6 +131,20 @@ public class BrowserClient {
         }
     }
 
+    /**
+     * The cookie jar as a {@code Cookie} header value.
+     *
+     * <p>Needed by the SSE tests, which open a raw {@link java.net.HttpURLConnection} rather
+     * than going through {@code TestRestTemplate}: an event stream has to be read frame by
+     * frame off the socket, which a request/response client cannot do.
+     */
+    public String cookieHeader() {
+        return cookieJar.entrySet().stream()
+                .map(entry -> entry.getKey() + "=" + entry.getValue())
+                .reduce((a, b) -> a + "; " + b)
+                .orElse("");
+    }
+
     public boolean hasCookie(String name) {
         return cookieJar.containsKey(name);
     }

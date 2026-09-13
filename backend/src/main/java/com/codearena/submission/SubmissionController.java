@@ -3,7 +3,9 @@ package com.codearena.submission;
 import com.codearena.auth.AuthenticatedUser;
 import com.codearena.common.PageResponse;
 import com.codearena.common.PageRequests;
+import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
+import com.codearena.shared.Language;
 import com.codearena.shared.SubmissionStatus;
 import com.codearena.submission.dto.SubmissionAcceptedResponse;
 import com.codearena.submission.dto.SubmissionDetailResponse;
@@ -115,12 +117,41 @@ public class SubmissionController {
             @RequestParam(required = false) Integer page,
             @RequestParam(required = false) Integer size,
             @Parameter(description = "Restrict to one problem") @RequestParam(required = false) UUID problemId,
-            @Parameter(description = "Restrict to one status") @RequestParam(required = false) SubmissionStatus status,
+            @Parameter(description = "Restrict to one verdict or lifecycle state") @RequestParam(required = false) SubmissionStatus status,
+            @Parameter(description = "Restrict to one language") @RequestParam(required = false) Language language,
             @AuthenticationPrincipal AuthenticatedUser viewer) {
 
-        // Submissions are only ever listed newest-first, so the sort vocabulary the
-        // catalogue needs would be noise here; the ordering is fixed by the query.
-        return submissionService.listOwn(viewer.getPublicId(), problemId, status,
-                PageRequests.of(page, size, Sort.by(Sort.Direction.DESC, "id")));
+        return submissionService.listOwn(viewer.getPublicId(), problemId, status, language, newestFirst(page, size));
+    }
+
+    @GetMapping("/api/problems/{problemId}/submissions")
+    @Operation(summary = "Your submissions for one problem",
+               description = """
+                       Your own attempts at a single problem, newest first — the same data as
+                       `GET /api/submissions?problemId=…`, addressed from the problem.
+
+                       This is **not** a public feed: it returns only the authenticated
+                       caller's submissions, never anybody else's, whatever the problem.
+                       """)
+    @ApiResponse(responseCode = "200", description = "A page of your submissions for this problem")
+    public PageResponse<SubmissionSummaryResponse> listForProblem(
+            @PathVariable UUID problemId,
+            @RequestParam(required = false) Integer page,
+            @RequestParam(required = false) Integer size,
+            @Parameter(description = "Restrict to one verdict or lifecycle state") @RequestParam(required = false) SubmissionStatus status,
+            @Parameter(description = "Restrict to one language") @RequestParam(required = false) Language language,
+            @AuthenticationPrincipal AuthenticatedUser viewer) {
+
+        return submissionService.listOwn(viewer.getPublicId(), problemId, status, language, newestFirst(page, size));
+    }
+
+    /**
+     * Submissions are only ever listed newest first, so the closed sort vocabulary the
+     * problem catalogue needs would be noise here. Ordering by the primary key rather than
+     * by {@code createdAt} keeps it deterministic: two submissions made in the same
+     * millisecond still have a defined order, so paging cannot show one twice and skip another.
+     */
+    private Pageable newestFirst(Integer page, Integer size) {
+        return PageRequests.of(page, size, Sort.by(Sort.Direction.DESC, "id"));
     }
 }

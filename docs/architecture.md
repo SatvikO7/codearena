@@ -167,6 +167,9 @@ flowchart TD
     Worker --> Exec["ExecutionService"]
     Exec --> Sandbox["Sandbox container<br/>network none · caps dropped<br/>cpu · memory · pids capped"]
     Worker -->|"verdict"| PG
+    Worker -->|"PUBLISH (notification)"| Events[("Redis: pub/sub")]
+    Events --> API
+    API -->|"re-read, then SSE"| Browser["Browser"]
 ```
 
 Three properties hold this together:
@@ -179,9 +182,27 @@ Three properties hold this together:
   overwrite a newer result.
 
 The worker uses plain JDBC rather than the API's JPA entities (ADR-022), and the two
-services share only `Language` and `SubmissionStatus` — the rules both must agree on.
+services share only `Language`, `SubmissionStatus` and the event record — the rules both
+must agree on.
 
-## Current state (Phase 4 — complete and verified)
+### Getting the verdict to the browser
+
+A fourth property governs the return path: **Redis carries a notification, never the state.**
+The worker publishes three fields — submission, status, timestamp — to one channel. Every
+API instance subscribes, and an instance that has a browser watching that submission
+**re-reads the row from PostgreSQL** and streams the result of that read over SSE. The
+published payload is never forwarded.
+
+That is what lets the design work behind a load balancer without sticky sessions, and what
+keeps Redis out of the trust path: the notification can be duplicated, reordered or lost
+entirely without a browser ever being shown a status the database does not hold.
+
+Delivery is **at-least-once and best-effort, not exactly-once**. It is made safe by a
+snapshot on connect, a convergent client reducer that ignores anything not strictly newer,
+and a bounded fallback poll armed only when the stream fails. See
+[submission-lifecycle.md](submission-lifecycle.md) and ADR-023/ADR-024.
+
+## Current state (Phase 5 — complete and verified)
 
 Implemented:
 
@@ -210,7 +231,7 @@ Added in Phase 4:
 - `submissions` (`V4`), doubling as the transactional outbox
 - Submission API, Redis queue, publication-after-commit and a recovery sweeper
 - Judge worker: atomic claim, Docker execution, verdict mapping, bounded retries
-- Frontend solve page with a code editor, live polling and verdict display
+- Frontend solve page with a code editor and verdict display
 
 Added in Phase 3:
 
@@ -221,22 +242,47 @@ Added in Phase 3:
 - Database-level pagination, filtering and search with a closed sort vocabulary
 - Frontend catalogue, problem detail, and the admin authoring and management screens
 
-Verified by execution, not assumed: `./mvnw clean verify` passes (132 unit, 152 integration
-against real PostgreSQL, Redis and **real Docker containers**); all five compose services reach `healthy` with zero
-restarts; Flyway records `V1`, `V2` and `V3` as applied; a draft answers 404 rather than
-403 to a normal user; the raw catalogue response is asserted to contain neither a hidden
-test case's input nor its expected output; a `status` field added to an update payload is
-ignored; and every admin mutation returns 403 to a USER and 401 to an anonymous caller.
+Added in Phase 5:
 
-**Not implemented, and not claimed:** there is no submission rate limiting, no push-based
-status updates (the client polls), no dead-letter queue for inspection, and the sandbox is
-not production-hardened — the worker holds the Docker socket and containers share the host
-kernel. See docs/security.md.
+- `submission_test_results` (`V5`): per-test outcome, runtime and a denormalised `hidden`
+  marker, with **no column capable of holding test data**; plus a composite index over the
+  history page's actual access path (`user_id`, `status`, `created_at DESC`)
+- Submission history with server-side filtering by problem, verdict and language, paginated,
+  backed by a constructor projection so a listing never reads `source_code` at all
+- `GET /api/submissions/{id}/events`: Server-Sent Events, authorised identically to the REST
+  endpoint before the first byte, snapshot first, stream closed at the verdict
+- Redis Pub/Sub notifications from the worker; every API instance subscribes and **re-reads
+  PostgreSQL** rather than forwarding the payload, so the design survives a load balancer
+  without sticky sessions and keeps Redis out of the trust path
+- A convergent client reducer plus a bounded fallback poll, replacing Phase 4's
+  unconditional polling
+- Frontend test suite (Vitest + Testing Library): 25 tests, specifying the convergence rules
+  and the colour-independence of the verdict display
 
-Planned, in phase order:
-submission API and state machine (4), Redis queue and worker loop (5), Docker execution
-engine (6), judging and verdicts (7), real-time status (8), caching and rate limiting
-(9), contests and leaderboards (10).
+Verified by execution, not assumed: `./mvnw clean verify` passes (172 unit, 143 integration
+against real PostgreSQL, Redis and **real Docker containers**), plus 25 frontend tests; all
+five compose services reach `healthy` with zero restarts; Flyway records `V1` through `V5` as
+applied; a draft answers 404 rather than 403 to a normal user; the raw catalogue response is
+asserted to contain neither a hidden test case's input nor its expected output; a `status`
+field added to an update payload is ignored; and every admin mutation returns 403 to a USER
+and 401 to an anonymous caller.
+
+Phase 5 adds to that: the SSE endpoint answers 404 — not 403, and not a JSON envelope that
+`Accept: text/event-stream` cannot negotiate — for a submission belonging to someone else;
+a stream opened on an already-terminal submission sends one snapshot and closes rather than
+hanging; the history listing is asserted to carry no source code for any row; and the
+convergence reducer is proven against duplicate, reordered, lost and unparseable events.
+
+**Not implemented, and not claimed:** there is no submission rate limiting; the SSE
+connection cap is global rather than per user; memory is enforced but not measured, so no
+endpoint reports it; there is no dead-letter queue for inspection; and the sandbox is not
+production-hardened — the worker holds the Docker socket and containers share the host
+kernel. Event delivery is at-least-once and best-effort, not exactly-once, and real-time
+delivery is not guaranteed. See docs/security.md.
+
+Planned, in phase order: worker scaling and queue observability (6), caching (7), profiles
+and statistics (8), rate limiting (9), contests and leaderboards (10), full frontend (11),
+sandbox hardening (12).
 
 ## Related documents
 

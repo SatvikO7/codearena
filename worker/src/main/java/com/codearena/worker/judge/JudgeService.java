@@ -7,11 +7,13 @@ import com.codearena.worker.execution.ExecutionService;
 import com.codearena.worker.judge.JudgeRepository.ClaimedSubmission;
 import com.codearena.worker.judge.JudgeRepository.JudgeResult;
 import com.codearena.worker.judge.JudgeRepository.JudgeTestCase;
+import com.codearena.worker.judge.JudgeRepository.TestOutcome;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -114,24 +116,20 @@ public class JudgeService {
                 // output. They are truncated and carry no host paths: the compiler runs
                 // inside the sandbox with a fixed working directory and a fixed file name,
                 // so the worst it can mention is /work/main.cpp.
-                return new JudgeResult(SubmissionStatus.COMPILATION_ERROR,
-                        testCount, 0, null, null, null,
-                        truncate(preferStderr(compilation)));
+                return JudgeResult.withoutTestDetail(SubmissionStatus.COMPILATION_ERROR,
+                        testCount, 0, truncate(preferStderr(compilation)));
             }
             case TIMED_OUT -> {
-                return new JudgeResult(SubmissionStatus.COMPILATION_ERROR,
-                        testCount, 0, null, null, null,
-                        "Compilation exceeded the time limit.");
+                return JudgeResult.withoutTestDetail(SubmissionStatus.COMPILATION_ERROR,
+                        testCount, 0, "Compilation exceeded the time limit.");
             }
             case OUT_OF_MEMORY -> {
-                return new JudgeResult(SubmissionStatus.COMPILATION_ERROR,
-                        testCount, 0, null, null, null,
-                        "Compilation exceeded the memory limit.");
+                return JudgeResult.withoutTestDetail(SubmissionStatus.COMPILATION_ERROR,
+                        testCount, 0, "Compilation exceeded the memory limit.");
             }
             case OUTPUT_LIMIT_EXCEEDED -> {
-                return new JudgeResult(SubmissionStatus.COMPILATION_ERROR,
-                        testCount, 0, null, null, null,
-                        "Compilation produced too much output.");
+                return JudgeResult.withoutTestDetail(SubmissionStatus.COMPILATION_ERROR,
+                        testCount, 0, "Compilation produced too much output.");
             }
             case INFRASTRUCTURE_FAILURE -> {
                 log.error("event=COMPILATION_INFRA_FAILURE submission={} detail={}",
@@ -148,6 +146,7 @@ public class JudgeService {
                                  ExecutionLimits limits) {
         int passed = 0;
         long slowestMs = 0;
+        List<TestOutcome> outcomes = new ArrayList<>();
 
         for (JudgeTestCase testCase : testCases) {
             // Only the input crosses into the container. The expected output stays here.
@@ -157,15 +156,43 @@ public class JudgeService {
             JudgeResult failure = interpretRun(submission, execution, testCase,
                     testCases.size(), passed, slowestMs);
             if (failure != null) {
-                return failure;
+                outcomes.add(new TestOutcome(
+                        testCase.position(), false, (int) execution.durationMs(), testCase.hidden()));
+                // Judging stops at the first failure, so the remaining tests are recorded as
+                // not-run with a null duration. Omitting them would make the list look
+                // shorter than the problem; giving them a zero would claim they passed
+                // instantly.
+                appendNotRun(outcomes, testCases, testCase.position());
+                return withOutcomes(failure, outcomes);
             }
+            outcomes.add(new TestOutcome(
+                    testCase.position(), true, (int) execution.durationMs(), testCase.hidden()));
             passed++;
         }
 
         log.info("event=JUDGE_ACCEPTED submission={} tests={} slowestMs={}",
                 submission.publicId(), testCases.size(), slowestMs);
         return new JudgeResult(SubmissionStatus.ACCEPTED,
-                testCases.size(), passed, null, (int) slowestMs, null, null);
+                testCases.size(), passed, null, (int) slowestMs, null, null, outcomes);
+    }
+
+    private void appendNotRun(List<TestOutcome> outcomes, List<JudgeTestCase> testCases, int failedPosition) {
+        for (JudgeTestCase remaining : testCases) {
+            if (remaining.position() > failedPosition) {
+                outcomes.add(new TestOutcome(remaining.position(), false, null, remaining.hidden()));
+            }
+        }
+    }
+
+    private JudgeResult withOutcomes(JudgeResult result, List<TestOutcome> outcomes) {
+        // A judge failure says nothing about individual tests, so it keeps none of them: a
+        // SYSTEM_ERROR that listed tests as "failed" would blame the code for the judge.
+        if (result.status() == SubmissionStatus.SYSTEM_ERROR) {
+            return result;
+        }
+        return new JudgeResult(result.status(), result.testsTotal(), result.testsPassed(),
+                result.failedTestIndex(), result.runtimeMs(), result.memoryKb(),
+                result.errorMessage(), List.copyOf(outcomes));
     }
 
     /** @return a terminal result when this test ended the judgement, or null to keep going */
@@ -224,11 +251,12 @@ public class JudgeService {
 
     private JudgeResult verdict(SubmissionStatus status, int total, int passed,
                                 int failedIndex, long slowestMs, String message) {
-        return new JudgeResult(status, total, passed, failedIndex, (int) slowestMs, null, message);
+        return new JudgeResult(status, total, passed, failedIndex, (int) slowestMs, null,
+                message, List.of());
     }
 
     private JudgeResult systemError(String message) {
-        return new JudgeResult(SubmissionStatus.SYSTEM_ERROR, null, null, null, null, null, message);
+        return JudgeResult.withoutTestDetail(SubmissionStatus.SYSTEM_ERROR, null, null, message);
     }
 
     /** Compiler output goes to stderr; fall back to stdout for tools that disagree. */
