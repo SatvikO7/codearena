@@ -1,5 +1,6 @@
 package com.codearena.submission;
 
+import com.codearena.contest.Contest;
 import com.codearena.problem.Problem;
 import com.codearena.shared.Language;
 import com.codearena.shared.SubmissionStatus;
@@ -55,6 +56,20 @@ public class Submission {
     @ManyToOne(fetch = FetchType.LAZY, optional = false)
     @JoinColumn(name = "user_id", nullable = false, updatable = false)
     private User user;
+
+    /**
+     * The contest this was submitted to, or null for a practice submission.
+     *
+     * <p>Nullable is the whole design. Practice is the absence of a contest rather than a
+     * separate kind of submission, so every existing row is already correct, the judging
+     * pipeline needs no knowledge of contests, and there is exactly one submissions table
+     * to reason about. {@code updatable = false}: which contest a submission belongs to is
+     * decided when it is created and is never revised, because revising it would rewrite
+     * a contest's history.
+     */
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "contest_id", updatable = false)
+    private Contest contest;
 
     @Enumerated(EnumType.STRING)
     @Column(name = "language", nullable = false, length = 16, updatable = false)
@@ -115,8 +130,21 @@ public class Submission {
         // Required by JPA.
     }
 
-    /** Creates a submission in QUEUED with no queue publication yet recorded. */
+    /** Creates a practice submission in QUEUED with no queue publication yet recorded. */
     public static Submission queue(Problem problem, User user, Language language, String sourceCode) {
+        return queue(problem, user, language, sourceCode, null);
+    }
+
+    /**
+     * Creates a submission, optionally within a contest.
+     *
+     * <p>The contest is the <em>only</em> difference between a contest submission and a
+     * practice one. Same table, same status machine, same queue, same worker, same sandbox.
+     * A second execution path for contests would be a second place for a judging bug to
+     * live, and the one that runs less often would be the one nobody noticed was broken.
+     */
+    public static Submission queue(Problem problem, User user, Language language,
+                                   String sourceCode, Contest contest) {
         Submission submission = new Submission();
         submission.publicId = UUID.randomUUID();
         submission.problem = problem;
@@ -125,6 +153,7 @@ public class Submission {
         submission.sourceCode = sourceCode;
         submission.status = SubmissionStatus.QUEUED;
         submission.attempts = 0;
+        submission.contest = contest;
         return submission;
     }
 
@@ -184,6 +213,15 @@ public class Submission {
 
     public User getUser() {
         return user;
+    }
+
+    /** The contest this belongs to, or null for practice. */
+    public Contest getContest() {
+        return contest;
+    }
+
+    public boolean isContestSubmission() {
+        return contest != null;
     }
 
     public Language getLanguage() {

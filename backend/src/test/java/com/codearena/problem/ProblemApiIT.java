@@ -46,8 +46,7 @@ class ProblemApiIT extends AbstractIntegrationTest {
 
     @BeforeEach
     void setUp() {
-        jdbcTemplate.update("DELETE FROM problems");
-        jdbcTemplate.update("DELETE FROM users");
+        resetDatabase(jdbcTemplate);
 
         createAccount("root", "root@example.com", Role.ADMIN);
         admin = signIn("root");

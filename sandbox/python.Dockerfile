@@ -40,4 +40,18 @@ RUN set -eux; \
 # -----------------------------------------------------------------------------
 ENV GPG_KEY="" PYTHON_VERSION="" PYTHON_SHA256="" LANGUAGE=""
 
+# -----------------------------------------------------------------------------
+# The workspace directory must exist in the image.
+#
+# A sandbox mounts a per-submission volume at /work, and the source is staged with
+# `docker cp` into the container while it is still *created* rather than started -- at
+# which point the volume is not yet mounted and the path resolves inside the image. If
+# /work does not exist there, `docker cp` intermittently fails with "destination must be
+# a directory" under concurrent load, and the submission dies as a SYSTEM_ERROR.
+#
+# Creating it here removes the race rather than retrying it: there is always a real
+# directory to copy into, whatever the mount timing.
+# -----------------------------------------------------------------------------
+RUN mkdir -p /work && chmod 755 /work
+
 LABEL com.codearena.sandbox.language="python"

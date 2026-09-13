@@ -239,7 +239,7 @@ snapshot on connect, a convergent client reducer that ignores anything not stric
 and a bounded fallback poll armed only when the stream fails. See
 [submission-lifecycle.md](submission-lifecycle.md) and ADR-023/ADR-024.
 
-## Current state (Phase 5 — complete and verified)
+## Current state (Phase 7 — complete and verified)
 
 Implemented:
 
@@ -296,13 +296,49 @@ Added in Phase 5:
 - Frontend test suite (Vitest + Testing Library): 25 tests, specifying the convergence rules
   and the colour-independence of the verdict display
 
-Verified by execution, not assumed: `./mvnw clean verify` passes (172 unit, 143 integration
-against real PostgreSQL, Redis and **real Docker containers**), plus 25 frontend tests; all
-five compose services reach `healthy` with zero restarts; Flyway records `V1` through `V5` as
-applied; a draft answers 404 rather than 403 to a normal user; the raw catalogue response is
+Added in Phase 6:
+
+- A separate `executor` service holding the Docker socket, exposing four typed
+  operations that cannot name an image, a mount, a capability or a network; the worker
+  image no longer contains a Docker client at all (ADR-028)
+- `SandboxPolicy`: every container flag in one readable place, plus a custom seccomp
+  allowlist, private IPC and cgroup namespaces, `--pull never`, RLIMIT ceilings and a
+  fully pinned environment
+- Sandbox images built from digest-pinned bases with package managers, network tooling
+  and every setuid bit removed, asserted at build time
+- A reaper for stray containers and volumes, and OOM detection by asking the daemon
+  rather than guessing from exit code 137
+
+Added in Phase 7:
+
+- `contests`, `contest_problems`, `contest_participants` (`V6`), plus a nullable
+  `contest_id` on submissions — null means practice, so every pre-existing row is already
+  correct and no backfill was needed
+- A contest's visible status is **computed** from its lifecycle, schedule and the clock
+  rather than stored, so a contest ends on time whether or not anything is running to
+  notice it (ADR-032)
+- Registration, with the duplicate prevented by a unique constraint rather than by a
+  check that two concurrent requests can both pass
+- Contest submissions through the **existing** queue, worker and sandbox — one execution
+  path, with the contest's eligibility rules in front of it
+- ICPC-style scoring computed from persisted submissions per request, with no stored
+  score to fall out of step (ADR-034)
+- Contest, contest-solve, standings and admin contest pages, with a server-corrected
+  countdown
+
+Verified by execution, not assumed: `./mvnw clean verify` passes against real PostgreSQL,
+Redis and **real Docker containers**, alongside the frontend suite; every compose service
+reaches `healthy` with zero restarts; Flyway records `V1` through `V6` as applied; a draft answers 404 rather than 403 to a normal user; the raw catalogue response is
 asserted to contain neither a hidden test case's input nor its expected output; a `status`
 field added to an update payload is ignored; and every admin mutation returns 403 to a USER
 and 401 to an anonymous caller.
+
+Phase 7 adds to that: a draft contest answers 404 to a normal user on both the detail and
+the standings endpoints; registration is refused once a contest starts; a submission is
+refused before the start, after the end, without registration, and to a published problem
+that is simply not in that contest; eight concurrent registrations produce exactly one row;
+a SYSTEM_ERROR never adds penalty; a resubmitted solve never scores twice; and the
+standings response is asserted to carry no email address and no source code.
 
 Phase 5 adds to that: the SSE endpoint answers 404 — not 403, and not a JSON envelope that
 `Accept: text/event-stream` cannot negotiate — for a submission belonging to someone else;
@@ -310,14 +346,22 @@ a stream opened on an already-terminal submission sends one snapshot and closes 
 hanging; the history listing is asserted to carry no source code for any row; and the
 convergence reducer is proven against duplicate, reordered, lost and unparseable events.
 
-**Not implemented, and not claimed:** there is no submission rate limiting; the SSE
-connection cap is global rather than per user; memory is enforced but not measured, so no
-endpoint reports it; there is no dead-letter queue for inspection; and the sandbox is not
-production-hardened — the worker holds the Docker socket and containers share the host
-kernel. Event delivery is at-least-once and best-effort, not exactly-once, and real-time
-delivery is not guaranteed. See docs/security.md.
+**Contests add no new execution path.** A contest submission is an ordinary submission
+with a contest attached: same table, same status machine, same queue, same worker, same
+sandbox. A second engine for contests would be a second place for a judging bug to live,
+and the one that ran less often would be the one nobody noticed was broken.
 
-Planned, in phase order: worker scaling and queue observability (6), caching (7), profiles
+**Not implemented, and not claimed:** there is **no plagiarism detection and no anti-cheat
+of any kind** — nothing compares submissions between contestants; there is no scoreboard
+freeze, no late registration, no team contests and no ratings; there is no submission rate
+limiting; the SSE connection cap is global rather than per user; memory is enforced but
+not measured; there is no dead-letter queue for inspection; and the sandbox, though
+hardened in Phase 6, still shares the host kernel and its execution service still holds a
+Docker socket. Event delivery is at-least-once and best-effort, not exactly-once, and
+real-time delivery is not guaranteed. See docs/security.md, docs/threat-model.md and
+docs/contests.md.
+
+Planned, in phase order: worker scaling and queue observability (8), caching, profiles
 and statistics (8), rate limiting (9), contests and leaderboards (10), full frontend (11),
 sandbox hardening (12).
 

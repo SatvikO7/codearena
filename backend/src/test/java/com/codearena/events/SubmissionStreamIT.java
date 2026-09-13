@@ -77,10 +77,7 @@ class SubmissionStreamIT extends AbstractIntegrationTest {
 
     @BeforeEach
     void setUp() {
-        jdbc.update("DELETE FROM submission_test_results");
-        jdbc.update("DELETE FROM submissions");
-        jdbc.update("DELETE FROM problems");
-        jdbc.update("DELETE FROM users");
+        resetDatabase(jdbc);
 
         createAccount("ada", "ada@example.com", Role.USER);
         author = signIn("ada");

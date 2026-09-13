@@ -1,5 +1,6 @@
 package com.codearena;
 
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.testcontainers.containers.GenericContainer;
@@ -50,5 +51,32 @@ public abstract class AbstractIntegrationTest {
         // The encoder under test is the same DelegatingPasswordEncoder either way; only
         // the work factor differs.
         registry.add("codearena.security.bcrypt-strength", () -> 4);
+    }
+
+    /**
+     * Empties every table, in an order the foreign keys allow.
+     *
+     * <p>The containers are shared by the whole JVM, so each test class starts with
+     * whatever the previous one left behind. Every suite therefore clears the database in
+     * its setup — and it has to clear <em>all</em> of it, not the tables it happens to care
+     * about: contest_problems references problems with ON DELETE RESTRICT, so a suite that
+     * deleted only problems would fail the moment a contest test had run before it.
+     *
+     * <p>Centralised here for that reason. When a later phase adds a table, one method
+     * changes rather than five setups that fail one run at a time.
+     *
+     * <p>Order matters and is dependency-first: children before parents.
+     */
+    protected static void resetDatabase(JdbcTemplate jdbc) {
+        jdbc.update("DELETE FROM submission_test_results");
+        jdbc.update("DELETE FROM submissions");
+        jdbc.update("DELETE FROM contest_participants");
+        jdbc.update("DELETE FROM contest_problems");
+        jdbc.update("DELETE FROM contests");
+        jdbc.update("DELETE FROM problem_test_cases");
+        jdbc.update("DELETE FROM problem_examples");
+        jdbc.update("DELETE FROM problem_tags");
+        jdbc.update("DELETE FROM problems");
+        jdbc.update("DELETE FROM users");
     }
 }

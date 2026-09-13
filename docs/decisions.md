@@ -997,3 +997,136 @@ only indirectly. A filesystem with project quotas (XFS with `prjquota`, btrfs, Z
 allow a real per-container limit; that is a deployment property rather than a code change,
 and it is recorded in docs/threat-model.md §7.3 as a residual limitation rather than a solved
 problem.
+
+---
+
+## ADR-032 — A contest's status is derived, not stored
+
+**Problem.** A contest is DRAFT, UPCOMING, LIVE, ENDED or CANCELLED. The obvious design is a
+`status` column advanced by a scheduled job at `startAt` and `endAt`.
+
+**Options.** A stored status with a scheduler; a stored status advanced lazily on read; a
+status computed from the schedule and the clock.
+
+**Chosen.** Store only what a human decided — DRAFT, PUBLISHED or CANCELLED — and compute
+what users see from that plus `startAt`, `endAt` and the current time.
+
+**Why.** A stored status has to be advanced by something, and that something can be late or
+absent. If the application is down at `endAt`, or the job is delayed, or the clock skews, the
+row says LIVE after the contest is over — and a late submission is accepted because a
+background task had not got round to it. The failure is silent, it favours whoever submits at
+exactly the wrong moment, and it is discovered by the person it costs a place.
+
+Deriving the status removes the failure mode rather than making it less likely. A contest ends
+on time whether or not anything is running to notice; a restart cannot resurrect a finished
+contest; and there is no job to monitor, retry or reconcile. The brief asked that the
+application being down at the exact start or end time must not matter, and this is the only
+design where it genuinely does not.
+
+The distinction the model makes is between a *decision* and a *consequence*. Publishing and
+cancelling are decisions, and they are stored. Starting and ending are consequences of the
+schedule, and they are computed.
+
+**The window is half-open, `[startAt, endAt)`.** At exactly `startAt` a contest is LIVE; at
+exactly `endAt` it is ENDED. An inclusive end would leave one instant belonging to both
+states. `ContestStatusTest` asserts each boundary as an equality, which is only possible
+because the rule is a pure function — a system reading `Instant.now()` internally could only
+be tested by waiting.
+
+**Trade-off.** Filtering a contest list by status cannot be done in SQL, because the status is
+not a column; the service filters after deriving. At this scale that is cheap, and the
+alternative is encoding the time arithmetic into a query so that the rule lives in two places
+and can disagree with itself.
+
+---
+
+## ADR-033 — Registration closes when the contest starts
+
+**Problem.** May somebody register for a contest that is already running?
+
+**Options.** Allow it; forbid it; allow it with a per-participant clock.
+
+**Chosen.** Forbidden. Registration is open only while the contest is UPCOMING.
+
+**Why.** The penalty in an ICPC-style contest is measured from the *contest's* start, not the
+contestant's. Somebody joining ninety minutes into a three-hour contest competes for half the
+time while being charged from the beginning, so their score is not comparable with anybody
+else's — and the standings stop meaning what they claim to mean.
+
+Making late entry fair needs a per-participant start time, a penalty basis relative to it, and
+a scoreboard that explains why two contestants with identical solves have different penalties.
+That is a different product decision with its own rules, not a looser check on this one.
+
+**Trade-off.** Somebody who finds a contest ten minutes after it starts cannot take part, even
+though there is no technical obstacle. That is a real cost, and the alternative is a
+scoreboard that quietly compares unlike things.
+
+---
+
+## ADR-034 — Standings are computed per request, from submissions
+
+**Problem.** A scoreboard is the most-read page of a live contest and the most expensive to
+produce. It could be stored and updated incrementally, cached, or computed on demand.
+
+**Options.** A materialised `contest_scores` table updated when a submission settles; a cached
+scoreboard invalidated on the same event; computation from the submission history per request.
+
+**Chosen.** Computed per request. Three bounded queries and a pure function. Nothing is
+stored, nothing is cached.
+
+**Why.** Every alternative introduces a second copy of the truth that has to be kept in step
+with the first. A stored score is updated when a submission reaches a terminal state — so it
+must be updated exactly once per submission, in the same transaction, and never for a
+SYSTEM_ERROR that is later retried, and correctly when a result is recorded twice by a
+straggling worker. A missed or doubled update shows a wrong score indefinitely, and the bug is
+invisible until somebody disputes a result, by which time the contest is over.
+
+Computing from the submissions means the scoreboard cannot disagree with the submissions,
+because it *is* the submissions. There is no invalidation to miss.
+
+The cost is bounded by design. The aggregation runs in PostgreSQL against
+`ix_submissions_contest_scoring`, and what crosses the wire is one row per contestant plus one
+per solved cell — **contestants × problems, not submissions**. A contest where everyone
+submits fifty times costs the same to score as one where everyone submits once.
+
+Live updates are a 15-second poll, not SSE. The existing stream infrastructure is keyed by
+submission id and fans out to the one person watching that submission; standings are per
+contest and would need a different fan-out, its own authorisation, and its own connection cap.
+Polling an endpoint that is already fast is the smaller and more predictable thing.
+
+**Trade-off.** A contest with tens of thousands of participants would want a materialised
+scoreboard, and this design would need revisiting. The point at which that becomes true is
+measurable — it is the point where the aggregation stops being fast — rather than something to
+guess at now by building the complicated version first.
+
+---
+
+## ADR-035 — Contest history is durable; cancellation is not deletion
+
+**Problem.** What happens to a contest an administrator no longer wants?
+
+**Options.** Delete it; soft-delete it; cancel it and keep everything.
+
+**Chosen.** Cancel it. Deletion is permitted **only** for a draft that was never published,
+has no participants and has no submissions.
+
+**Why.** A contest that people entered is a record of what they did. Deleting it either takes
+their submissions with it — destroying work they may want to look at years later — or leaves
+those submissions pointing at a contest that no longer exists. Neither is a reasonable answer
+to "we are not running this after all".
+
+Cancelling says the same thing without destroying anything: submissions stop immediately, the
+submissions already made are kept, and the standings remain readable and marked cancelled.
+
+The rule is enforced twice, on purpose. `ContestAdminService` refuses, and
+`fk_submissions_contest` is `ON DELETE RESTRICT` so the database refuses too. The service
+check produces a clear 409; the constraint means a mistake in some future code path still
+cannot destroy submission history.
+
+`contest_problems` and `contest_participants` cascade from the contest, because they have no
+meaning without it — but they can only cascade for a contest that is deletable at all, which
+is one nobody has taken part in.
+
+**Trade-off.** Cancelled contests accumulate. They are cheap, they are visible to the people
+who registered for them, and a platform that quietly erases a contest somebody competed in is
+worse than one with a few dead rows.

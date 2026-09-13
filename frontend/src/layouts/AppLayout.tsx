@@ -8,12 +8,14 @@ import { useAuth } from '../hooks/useAuth';
 const NAV_ITEMS: { to: string; label: string; end?: boolean }[] = [
   { to: '/', label: 'Home', end: true },
   { to: '/problems', label: 'Problems' },
+  { to: '/contests', label: 'Contests' },
   { to: '/submissions', label: 'My submissions' },
 ];
 
 /** Shown only to administrators, and only as a shortcut: the server authorises regardless. */
 const ADMIN_NAV_ITEMS: { to: string; label: string }[] = [
   { to: '/admin/problems', label: 'Manage problems' },
+  { to: '/admin/contests', label: 'Manage contests' },
 ];
 
 /** Shared chrome: masthead, primary navigation, account controls and the routed page. */

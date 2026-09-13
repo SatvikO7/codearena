@@ -10,9 +10,14 @@ import { ProblemsPage } from './pages/ProblemsPage';
 import { ProblemDetailPage } from './pages/ProblemDetailPage';
 import { SolvePage } from './pages/SolvePage';
 import { SubmissionsPage } from './pages/SubmissionsPage';
+import { ContestsPage } from './pages/ContestsPage';
+import { ContestDetailPage } from './pages/ContestDetailPage';
+import { ContestSolvePage } from './pages/ContestSolvePage';
 import { SubmissionDetailPage } from './pages/SubmissionDetailPage';
 import { AdminProblemsPage } from './pages/admin/AdminProblemsPage';
 import { AdminProblemFormPage } from './pages/admin/AdminProblemFormPage';
+import { AdminContestsPage } from './pages/admin/AdminContestsPage';
+import { AdminContestDetailPage } from './pages/admin/AdminContestDetailPage';
 import { NotFoundPage } from './pages/NotFoundPage';
 
 export default function App() {
@@ -34,6 +39,15 @@ export default function App() {
               <Route path="problems/:slug/solve" element={<SolvePage />} />
               <Route path="submissions" element={<SubmissionsPage />} />
               <Route path="submissions/:submissionId" element={<SubmissionDetailPage />} />
+              <Route path="contests" element={<ContestsPage />} />
+              <Route path="contests/:contestId" element={<ContestDetailPage />} />
+              {/* A separate route from the practice solve page on purpose: it posts to
+                  the contest endpoint, and a contest page that created a practice
+                  submission would judge it and never score it. */}
+              <Route
+                path="contests/:contestId/problems/:problemId"
+                element={<ContestSolvePage />}
+              />
             </Route>
 
             {/* Requires ADMIN. Again a convenience: every admin endpoint re-checks. */}
@@ -41,6 +55,8 @@ export default function App() {
               <Route path="admin/problems" element={<AdminProblemsPage />} />
               <Route path="admin/problems/new" element={<AdminProblemFormPage />} />
               <Route path="admin/problems/:problemId" element={<AdminProblemFormPage />} />
+              <Route path="admin/contests" element={<AdminContestsPage />} />
+              <Route path="admin/contests/:contestId" element={<AdminContestDetailPage />} />
             </Route>
 
             <Route path="*" element={<NotFoundPage />} />

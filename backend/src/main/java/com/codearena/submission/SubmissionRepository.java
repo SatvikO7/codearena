@@ -11,6 +11,7 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
 import java.time.Instant;
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -100,4 +101,51 @@ public interface SubmissionRepository extends JpaRepository<Submission, Long> {
     @Modifying
     @Query("UPDATE Submission s SET s.enqueuedAt = :at, s.updatedAt = :at WHERE s.publicId = :publicId")
     int markEnqueued(@Param("publicId") UUID publicId, @Param("at") Instant at);
+
+    /**
+     * Problem ids the user has solved in one contest.
+     *
+     * <p>Returns internal ids rather than entities: the caller is building a set to test
+     * membership against, and loading problems to discard everything but the id would be
+     * a query per problem for no benefit.
+     */
+    @Query("SELECT DISTINCT s.problem.id FROM Submission s "
+           + "WHERE s.contest.publicId = :contestId AND s.user.publicId = :userId "
+           + "AND s.status = :status")
+    List<Long> findSolvedProblemIds(@Param("contestId") UUID contestId,
+                                    @Param("userId") UUID userId,
+                                    @Param("status") SubmissionStatus status);
+
+    /** One row per problem the user has a counted attempt on, in one contest. */
+    interface ProblemAttempts {
+        long getProblemId();
+
+        int getAttempts();
+    }
+
+    /**
+     * Counted attempts per problem for one user in one contest.
+     *
+     * <p>The verdict set is passed in from {@code ContestScoring.PENALISED_VERDICTS} so
+     * that the progress a contestant sees and the penalty the standings charge can never
+     * be computed from two different definitions of a failed attempt.
+     */
+    @Query(value = "SELECT s.problem_id AS problemId, COUNT(*) AS attempts FROM submissions s "
+                 + "JOIN contests c ON c.id = s.contest_id "
+                 + "JOIN users u ON u.id = s.user_id "
+                 + "WHERE c.public_id = :contestId AND u.public_id = :userId "
+                 + "AND s.status IN (:penalised) GROUP BY s.problem_id", nativeQuery = true)
+    List<ProblemAttempts> findAttemptCounts(@Param("contestId") UUID contestId,
+                                            @Param("userId") UUID userId,
+                                            @Param("penalised") Collection<String> penalised);
+
+    /** The caller's own submissions in one contest, newest first. */
+    @Query("SELECT s FROM Submission s JOIN FETCH s.problem "
+           + "WHERE s.contest.publicId = :contestId AND s.user.publicId = :userId "
+           + "ORDER BY s.createdAt DESC")
+    List<Submission> findContestSubmissions(@Param("contestId") UUID contestId,
+                                            @Param("userId") UUID userId);
+
+    /** Whether any submission references this contest, which makes it undeletable. */
+    boolean existsByContestPublicId(UUID contestPublicId);
 }

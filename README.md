@@ -8,10 +8,11 @@ The interesting part of this project is not the CRUD. It is everything around it
 asynchronous job processing, sandboxed execution of untrusted code, queue reliability,
 idempotency and concurrency control.
 
-> **Project status: Phase 6 of 16 complete and verified.** The judge works end to end: a
+> **Project status: Phase 7 of 16 complete and verified.** The judge works end to end: a
 > submission is queued, claimed by a worker, compiled and run inside a hardened sandbox,
-> given a verdict, and the result appears on the page without a reload. C++, Java and
-> Python. This README describes what exists today; it is updated at the end of every phase.
+> given a verdict, and the result appears on the page without a reload — in practice and in
+> timed contests, on a live scoreboard. C++, Java and Python. This README describes what
+> exists today; it is updated at the end of every phase.
 > Nothing below is aspirational — every claim here was executed, not assumed, including
 > every verdict, which was produced by really compiling and running a program.
 >
@@ -95,7 +96,7 @@ codearena/
 ├── sandbox/            Sandbox image definitions, the seccomp profile, and the
 │                       script that builds the images
 ├── frontend/           React + TypeScript client
-├── docs/               Architecture, threat model and decision records
+├── docs/               Architecture, threat model, contests and decision records
 ├── pom.xml             Maven aggregator
 ├── docker-compose.yml  Full local stack
 └── .env.example        Configuration template
@@ -575,6 +576,140 @@ to filter on the way out. A hidden test reports only whether it passed.
 
 ---
 
+## Contests
+
+An administrator schedules a contest, adds published problems and gives each a points
+value. Users register, compete while it runs, and appear on a live scoreboard.
+
+```mermaid
+flowchart LR
+    A["Admin creates<br/>a draft"] --> B["Adds published<br/>problems + points"]
+    B --> C["Publishes"]
+    C --> D["Users register"]
+    D --> E["startAt:<br/>contest is LIVE"]
+    E --> F["Submissions through<br/>the existing sandbox"]
+    F --> G["endAt:<br/>contest is ENDED"]
+    G --> H["Final standings"]
+```
+
+### Status is computed, not stored
+
+Only the lifecycle an administrator chose — DRAFT, PUBLISHED or CANCELLED — is in the
+database. UPCOMING, LIVE and ENDED are derived from that plus the schedule and the current
+time, on every read.
+
+That is not a stylistic preference. A stored status has to be advanced by something, and if
+that something is down at `endAt`, or late, or the clock skews, the row says LIVE after the
+contest is over and a late submission is accepted. Deriving it means **a contest ends on
+time whether or not anything is running to notice**, and a restart cannot resurrect a
+finished contest. There is no scheduler in this design and nothing to fall behind. ADR-032.
+
+The window is half-open, `[startAt, endAt)`: at exactly `startAt` a contest is LIVE, and at
+exactly `endAt` it is ENDED. Every instant belongs to exactly one state — an inclusive end
+would leave one millisecond that is both, which is only ever found by the person whose
+submission lands on it.
+
+### The endpoints
+
+| Endpoint | Auth | Purpose |
+|---|---|---|
+| `GET /api/contests` | session | The catalogue. Drafts are excluded by the query, for everyone. |
+| `GET /api/contests/{id}` | session | One contest. **The problem list is empty until it starts.** |
+| `POST /api/contests/{id}/register` | session | Registers the caller. No body: there is no field for another user. |
+| `POST /api/contests/{id}/problems/{problemId}/submissions` | session | Submit during the contest. |
+| `GET /api/contests/{id}/standings` | session | The scoreboard. |
+
+Publishing announces that a contest exists and when — not what is in it. Releasing the
+problem set during UPCOMING would let registered users read every statement in advance and
+start solving before the clock did.
+
+### Contest submissions are ordinary submissions
+
+Same table, same status machine, same queue, same worker, same sandbox. A submission carries
+a nullable `contest_id`; **null means practice**. There is no second execution engine,
+because a second one would be a second place for a judging bug to live — and the one that
+ran less often would be the one nobody noticed was broken.
+
+Five things are checked server-side before a contest submission is accepted, none taken from
+the request: the contest is visible, **the problem genuinely belongs to that contest**, the
+caller is registered, the contest is LIVE *now*, and the problem is still published. Knowing
+a problem's id is not authorisation to submit it to a contest.
+
+### The deadline, and the countdown
+
+The deadline is enforced on the server, against its own clock, on every submission. The page
+draws a countdown and corrects it: the API sends `serverTime` alongside the schedule, so the
+browser measures the offset between the two clocks once and counts down against a corrected
+one — on a laptop resumed from sleep an uncorrected timer is routinely minutes wrong.
+
+The countdown is **informational**. A browser still showing time remaining is refused all the
+same, and scoring uses `submissions.created_at`, written by the database. No client timestamp
+is read anywhere in the submission path, and none could be: the request type has no field for
+one.
+
+### Scoring
+
+ICPC-style. A problem is solved by the **first** ACCEPTED submission to it; later submissions
+change nothing, so resubmitting can neither help nor hurt.
+
+```
+score   = sum of the points of solved problems
+penalty = for each SOLVED problem:
+            minutes from the contest start to the solve
+          + 20 × rejections made before that solve
+```
+
+Rejections on a problem you never solve are **free**, as are rejections after solving. The
+first is the standard rule and the right one: penalising failed attempts would rank somebody
+who tried a hard problem below an identical contestant who never tried.
+
+**SYSTEM_ERROR is never counted.** It means the judge failed — a sandbox that would not
+start, a daemon that went away — and the code was never shown to be wrong. Charging twenty
+penalty minutes for our own outage would be the platform taking its failures out on the
+people using it.
+
+Standings order by score descending, then penalty ascending, then the earlier last solve,
+then user id for stability. Ranks are competition ranks: genuine ties share a rank and the
+next skips. The scoreboard carries a username, a rank, a score, a penalty and a grid — no
+email, no internal identifier, no profile data, no source code.
+
+It is recomputed from persisted submissions on every request. Nothing is stored and nothing
+is cached, so no score can fall out of step with the submissions it came from and there is no
+invalidation to miss. The aggregation runs in PostgreSQL and is bounded by
+contestants × problems rather than by how many times people submitted. ADR-034.
+
+### Immutability, cancellation and deletion
+
+A contest is freely editable while DRAFT or UPCOMING and **frozen the moment it goes LIVE** —
+schedule, problems, order and points alike. There is deliberately no override: changing what
+a problem is worth mid-contest silently rewrites the standings of everyone who already solved
+it.
+
+**Cancelling is allowed even while a contest runs**, because a broken problem or a leaked test
+set is a real reason to stop one. Submissions stop immediately, those already made are kept,
+and the standings stay readable and marked cancelled. A cancelled contest is never
+resurrected, and an ended one cannot be cancelled.
+
+**Deletion is only for an untouched draft** — never published, nobody registered, nothing
+submitted. The database enforces it independently (`ON DELETE RESTRICT`), so a mistake still
+cannot destroy submission history. ADR-035.
+
+### Known gaps
+
+- **No plagiarism detection and no anti-cheat of any kind.** Nothing compares submissions
+  between contestants or watches for collusion. A contest run on this platform is not
+  protected against it. Stated plainly, because a judge that implied otherwise would be worse
+  than one that says so.
+- **No late registration.** Registration closes at `startAt`; a contestant joining late would
+  compete over a shorter window while charged from the start, so their standing would not be
+  comparable with anyone else's. ADR-033.
+- **No scoreboard freeze.** Standings are live throughout, including the final hour.
+- **No opt-out of standings, no team contests, no divisions, no ratings, no partial credit.**
+
+Full detail is in [docs/contests.md](docs/contests.md).
+
+---
+
 ## Configuration
 
 No secret is committed and none is hardcoded. Every environment-specific value is read
@@ -710,8 +845,8 @@ as it lands, never before.
 | 4 | Submissions, queue, worker, sandboxed execution, judging | **Complete** |
 | 5 | Submission history, per-test results, real-time status | **Complete** |
 | 6 | Secure execution, sandbox hardening, execution-service separation | **Complete** |
-| 7 | Worker scaling, dead-letter handling, queue observability | Next |
-| 8 | Caching, user profiles, statistics | Planned |
+| 7 | Contests, participation and contest scoring | **Complete** |
+| 8 | Worker scaling, caching, user profiles and statistics | Next |
 | 9 | Rate limiting and abuse controls | Planned |
 | 10 | Contests, scoring, leaderboards | Planned |
 | 11 | Full frontend | Planned |

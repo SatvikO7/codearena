@@ -37,7 +37,7 @@ class InfrastructureIT extends AbstractIntegrationTest {
                 "SELECT version FROM flyway_schema_history WHERE success = true ORDER BY installed_rank",
                 String.class);
 
-        assertThat(applied).containsExactly("1", "2", "3", "4", "5");
+        assertThat(applied).containsExactly("1", "2", "3", "4", "5", "6");
 
         // V1 installs citext. V2 ended up not using it (see the note in that migration),
         // but V1 is already applied everywhere and migrations are immutable, so the

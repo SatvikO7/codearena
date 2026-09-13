@@ -49,6 +49,18 @@ public class BrowserClient {
     }
 
     /**
+     * DELETE, carrying the session cookie and the CSRF token like every other mutation.
+     *
+     * <p>Added for contest deletion. It goes through the same {@code exchange} as the
+     * others so that a DELETE is subject to exactly the CSRF handling a browser would
+     * apply -- a delete helper that quietly skipped the token would test a door nobody
+     * uses.
+     */
+    public <T> ResponseEntity<T> delete(String path, Class<T> responseType) {
+        return exchange(HttpMethod.DELETE, path, null, responseType);
+    }
+
+    /**
      * JSON-object helpers.
      *
      * <p>{@code Map.class} is a raw type, so every assertion made through it produces an

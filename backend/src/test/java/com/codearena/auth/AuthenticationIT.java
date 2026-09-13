@@ -56,7 +56,7 @@ class AuthenticationIT extends AbstractIntegrationTest {
 
     @BeforeEach
     void setUp() {
-        jdbcTemplate.update("DELETE FROM users");
+        resetDatabase(jdbcTemplate);
         browser = new BrowserClient(restTemplate);
         // A browser loading the SPA issues a GET before it can POST anything: that is the
         // request which delivers the CSRF cookie. Priming here reproduces that order

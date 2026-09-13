@@ -71,9 +71,7 @@ class SubmissionApiIT extends AbstractIntegrationTest {
 
     @BeforeEach
     void setUp() {
-        jdbc.update("DELETE FROM submissions");
-        jdbc.update("DELETE FROM problems");
-        jdbc.update("DELETE FROM users");
+        resetDatabase(jdbc);
         redis.delete(List.of(SubmissionQueue.PENDING, SubmissionQueue.PROCESSING));
 
         createAccount("ada", "ada@example.com");

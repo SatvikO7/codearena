@@ -1,8 +1,15 @@
 package com.codearena.submission;
 
+import com.codearena.common.ConflictException;
 import com.codearena.common.PageResponse;
 import com.codearena.common.ResourceNotFoundException;
 import com.codearena.common.ValidationException;
+import com.codearena.contest.Contest;
+import com.codearena.contest.ContestParticipantRepository;
+import com.codearena.contest.ContestProblem;
+import com.codearena.contest.ContestProblemRepository;
+import com.codearena.contest.ContestRepository;
+import com.codearena.contest.ContestStatus;
 import com.codearena.problem.Problem;
 import com.codearena.problem.ProblemRepository;
 import com.codearena.problem.ProblemStatus;
@@ -27,6 +34,8 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
+import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -48,6 +57,10 @@ public class SubmissionService {
     private final ProblemRepository problemRepository;
     private final UserRepository userRepository;
     private final ApplicationEventPublisher eventPublisher;
+    private final ContestParticipantRepository participantRepository;
+    private final ContestProblemRepository contestProblemRepository;
+    private final ContestRepository contestRepository;
+    private final Clock clock;
     private final int maxSourceBytes;
 
     public SubmissionService(SubmissionRepository submissionRepository,
@@ -55,12 +68,20 @@ public class SubmissionService {
                              ProblemRepository problemRepository,
                              UserRepository userRepository,
                              ApplicationEventPublisher eventPublisher,
+                             ContestParticipantRepository participantRepository,
+                             ContestProblemRepository contestProblemRepository,
+                             ContestRepository contestRepository,
+                             Clock clock,
                              @Value("${codearena.submission.max-source-bytes:65536}") int maxSourceBytes) {
         this.submissionRepository = submissionRepository;
         this.testResultRepository = testResultRepository;
         this.problemRepository = problemRepository;
         this.userRepository = userRepository;
         this.eventPublisher = eventPublisher;
+        this.participantRepository = participantRepository;
+        this.contestProblemRepository = contestProblemRepository;
+        this.contestRepository = contestRepository;
+        this.clock = clock;
         this.maxSourceBytes = maxSourceBytes;
     }
 
@@ -77,37 +98,131 @@ public class SubmissionService {
      */
     @Transactional
     public SubmissionAcceptedResponse submit(UUID problemPublicId, SubmissionRequest request, UUID authorPublicId) {
-        String source = request.sourceCode();
-        int sourceBytes = source.getBytes(StandardCharsets.UTF_8).length;
-        if (sourceBytes > maxSourceBytes) {
-            // Measured in bytes, not characters: a program of multi-byte identifiers hits
-            // the real storage and transfer cost long before it looks long.
-            throw new ValidationException("sourceCode",
-                    "Source code must be at most %d bytes (received %d)".formatted(maxSourceBytes, sourceBytes));
-        }
-
         Problem problem = problemRepository.findByPublicId(problemPublicId)
                 .filter(candidate -> candidate.getStatus() == ProblemStatus.PUBLISHED)
                 .orElseThrow(() -> new ResourceNotFoundException("PROBLEM_NOT_FOUND", "Problem not found"));
 
-        User author = userRepository.findByPublicId(authorPublicId)
-                .orElseThrow(() -> new ResourceNotFoundException("Authenticated account no longer exists"));
-
-        Submission submission = submissionRepository.saveAndFlush(
-                Submission.queue(problem, author, request.language(), source));
-
-        eventPublisher.publishEvent(
-                new SubmissionQueuePublisher.SubmissionCreatedEvent(submission.getPublicId()));
+        // Null contest: this is practice. Contest submissions go through submitToContest,
+        // which adds the eligibility checks and then lands in the same persist() below.
+        Submission submission = persist(problem, request, authorPublicId, null);
 
         // Language and size are safe to log; the source itself never is.
-        log.info("event=SUBMISSION_CREATED submission={} problem={} user={} language={} sourceBytes={}",
-                submission.getPublicId(), problem.getPublicId(), author.getPublicId(),
-                submission.getLanguage(), sourceBytes);
+        log.info("event=SUBMISSION_CREATED submission={} problem={} user={} language={}",
+                submission.getPublicId(), problem.getPublicId(), authorPublicId,
+                submission.getLanguage());
 
         return new SubmissionAcceptedResponse(
                 submission.getPublicId(), submission.getStatus(), submission.getCreatedAt());
     }
 
+    /**
+     * Accepts a submission made inside a contest.
+     *
+     * <h2>Five things are checked, and none of them are taken from the request</h2>
+     * <ol>
+     *   <li><b>The contest exists and is visible.</b> A draft answers 404.</li>
+     *   <li><b>The problem belongs to this contest.</b> Verified by looking up the
+     *       association in the database. This is what stops a contestant submitting to any
+     *       problem they happen to know the id of by pairing it with a contest id — the
+     *       relationship is read, never inferred from the two ids agreeing in a URL.</li>
+     *   <li><b>The caller is registered.</b> Being authenticated is not enough.</li>
+     *   <li><b>The contest is LIVE right now</b>, by the server's clock.</li>
+     *   <li><b>The problem is still PUBLISHED.</b></li>
+     * </ol>
+     *
+     * <h2>The deadline</h2>
+     * Evaluated here, against {@link Clock}, on the half-open window
+     * {@code [startAt, endAt)}. A browser still showing a running countdown — because its
+     * clock drifted, because the tab was asleep, or because somebody set it back — is
+     * refused all the same. The countdown is a convenience; this check is the contest.
+     *
+     * <p>The instant recorded against the submission is the database's, through the same
+     * auditing that stamps every other submission. No timestamp from a client is read
+     * anywhere in this method, and none could be: {@code SubmissionRequest} has no field
+     * for one.
+     */
+    @Transactional
+    public SubmissionAcceptedResponse submitToContest(UUID contestPublicId,
+                                                      UUID problemPublicId,
+                                                      SubmissionRequest request,
+                                                      UUID authorPublicId) {
+        Instant now = clock.instant();
+
+        Contest contest = contestRepository.findByPublicId(contestPublicId)
+                .filter(candidate -> candidate.getLifecycle().isPubliclyVisible())
+                .orElseThrow(() -> new ResourceNotFoundException("CONTEST_NOT_FOUND", "Contest not found"));
+
+        // The problem must be in THIS contest. A problem that is not answers 404: the
+        // caller is not entitled to learn whether it exists elsewhere.
+        ContestProblem entry = contestProblemRepository.findEntry(contestPublicId, problemPublicId)
+                .orElseThrow(() -> new ResourceNotFoundException(
+                        "CONTEST_PROBLEM_NOT_FOUND", "This problem is not part of this contest"));
+
+        if (!participantRepository.isRegistered(contestPublicId, authorPublicId)) {
+            throw new ConflictException("NOT_REGISTERED",
+                    "You are not registered for this contest");
+        }
+
+        ContestStatus status = contest.statusAt(now);
+        if (!status.acceptsSubmissions()) {
+            // Names the state rather than saying "closed": a contestant who submits four
+            // seconds late deserves to be told which side of the boundary they landed on.
+            log.info("event=CONTEST_SUBMISSION_REJECTED contest={} user={} status={}",
+                    contestPublicId, authorPublicId, status);
+            throw new ConflictException("CONTEST_NOT_LIVE", switch (status) {
+                case UPCOMING -> "This contest has not started yet";
+                case ENDED -> "This contest has ended";
+                case CANCELLED -> "This contest was cancelled";
+                default -> "This contest is not accepting submissions";
+            });
+        }
+
+        Problem problem = entry.getProblem();
+        if (problem.getStatus() != ProblemStatus.PUBLISHED) {
+            // A problem unpublished mid-contest. Not the contestant's fault, and not
+            // something to answer with a confusing 404 about the contest.
+            throw new ConflictException("PROBLEM_UNAVAILABLE",
+                    "This problem is temporarily unavailable");
+        }
+
+        Submission submission = persist(problem, request, authorPublicId, contest);
+
+        log.info("event=CONTEST_SUBMISSION_CREATED submission={} contest={} problem={} user={} language={}",
+                submission.getPublicId(), contestPublicId, problemPublicId,
+                authorPublicId, submission.getLanguage());
+
+        return new SubmissionAcceptedResponse(
+                submission.getPublicId(), submission.getStatus(), submission.getCreatedAt());
+    }
+
+    /**
+     * Persists a submission and asks for it to be queued.
+     *
+     * <p>Shared by the practice and contest paths on purpose: one place that writes a
+     * submission row, one place that publishes the queue event, and therefore one set of
+     * outbox semantics to get right rather than two that can drift.
+     */
+    private Submission persist(Problem problem, SubmissionRequest request,
+                               UUID authorPublicId, Contest contest) {
+        String source = request.sourceCode();
+        // Measured in bytes, not characters: a program of multi-byte identifiers hits
+        // the real storage and transfer cost long before it looks long.
+        int sourceBytes = source.getBytes(StandardCharsets.UTF_8).length;
+        if (sourceBytes > maxSourceBytes) {
+            throw new ValidationException("sourceCode",
+                    "Source code must be at most %d bytes (received %d)".formatted(maxSourceBytes, sourceBytes));
+        }
+
+        User author = userRepository.findByPublicId(authorPublicId)
+                .orElseThrow(() -> new ResourceNotFoundException("Authenticated account no longer exists"));
+
+        Submission submission = submissionRepository.saveAndFlush(
+                Submission.queue(problem, author, request.language(), source, contest));
+
+        eventPublisher.publishEvent(
+                new SubmissionQueuePublisher.SubmissionCreatedEvent(submission.getPublicId()));
+        return submission;
+    }
     /**
      * Reads one submission.
      *
