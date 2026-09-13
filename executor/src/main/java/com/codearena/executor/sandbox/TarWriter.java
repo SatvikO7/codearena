@@ -1,4 +1,4 @@
-package com.codearena.worker.execution;
+package com.codearena.executor.sandbox;
 
 import java.io.IOException;
 import java.io.OutputStream;

@@ -13,6 +13,7 @@ sequenceDiagram
     participant P as PostgreSQL
     participant R as Redis
     participant W as Worker
+    participant X as Execution service
     participant S as Sandbox container
 
     B->>A: POST /api/problems/{id}/submissions
@@ -33,8 +34,11 @@ sequenceDiagram
     Note over W,P: atomic claim; exactly one worker wins
 
     W->>P: SELECT test cases
-    W->>S: create, compile, run per test
-    S-->>W: stdout / exit code / kill reason
+    W->>X: prepare / compile / run (typed contract, shared secret)
+    Note over W,X: the worker cannot name an image,<br/>a mount, a capability or a network
+    X->>S: create, compile, run per test
+    S-->>X: stdout / exit code / kill reason
+    X-->>W: execution result
     W->>P: UPDATE … SET verdict WHERE status='RUNNING' AND claimed_by=me
     W->>R: LREM processing
 
@@ -127,6 +131,11 @@ it is never asked what a submission's status is. Redis restarting with an empty 
 costs notifications and delayed browser updates, and costs no verdicts. The sweeper
 (`SubmissionRecoverySweeper`) repairs the queue from the database, never the reverse.
 
+**Where execution happens.** As of Phase 6 the worker does not create containers; it asks the
+execution service to, over a contract that cannot express an image, a mount, a capability or
+a network, and with limits clamped on arrival. The Docker socket lives only in that service.
+See ADR-028 and [threat-model.md](threat-model.md).
+
 **Shutdown.** Open streams are closed deliberately before the server begins its graceful
 shutdown wait, because a stream is an in-flight request that is designed not to finish. That
 alone turned out not to be enough — a stream whose browser has already gone away stays
@@ -171,7 +180,9 @@ reached Redis, and nothing would ever notice.
 | Worker dies after writing the result | Row terminal | Redelivery finds it non-QUEUED and drops the job |
 | Job delivered twice | — | Second claim matches no row; no-op |
 | Submission repeatedly kills its worker | `attempts` climbs | After `max-attempts` (3) the sweeper records SYSTEM_ERROR |
-| Docker unreachable | — | SYSTEM_ERROR for that submission; the worker keeps consuming |
+| Docker unreachable | Row RUNNING with an expiring lease | The executor reports unhealthy; executions fail; the worker keeps consuming |
+| Executor unreachable or at capacity | Row RUNNING with an expiring lease | **Deferred, not failed.** No result is recorded, so the sweeper requeues it — see below |
+| Executor killed mid-execution | Row RUNNING; container and volume orphaned | Sweeper requeues the submission; the executor's reaper removes the strays on its next sweep |
 
 ---
 
@@ -179,6 +190,23 @@ reached Redis, and nothing would ever notice.
 
 Retried: **infrastructure failures only**, and only by the sweeper returning an unfinished
 submission to the queue, bounded by `attempts`.
+
+### Deferral: when no sandbox could be obtained
+
+There is a case that must not become a verdict at all. The execution service refuses work
+beyond its configured ceiling of concurrent workspaces, answering 503 — and a machine that is
+briefly full is not a statement about anybody's code.
+
+So when a sandbox cannot be *obtained*, judging does not record a result:
+`ExecutionUnavailableException` propagates, the row stays claimed with an expiring lease, and
+the recovery sweeper returns it to the queue. This is deliberately the same path a worker
+that died mid-execution takes, and it is bounded the same way — `attempts` was already
+incremented when the submission was claimed, so after `max-attempts` the sweeper records
+SYSTEM_ERROR rather than looping for ever.
+
+The distinction is between *no sandbox was obtained* (nothing was judged; try again) and *the
+sandbox existed and something went wrong with it* (INFRASTRUCTURE_FAILURE, and then
+SYSTEM_ERROR). `JudgeFailureClassificationTest` pins both.
 
 Never retried: WRONG_ANSWER, COMPILATION_ERROR, RUNTIME_ERROR, TIME_LIMIT_EXCEEDED,
 MEMORY_LIMIT_EXCEEDED. These are *results*. Running the same program against the same tests

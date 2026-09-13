@@ -8,22 +8,25 @@ The interesting part of this project is not the CRUD. It is everything around it
 asynchronous job processing, sandboxed execution of untrusted code, queue reliability,
 idempotency and concurrency control.
 
-> **Project status: Phase 5 of 16 complete and verified.** The judge works end to end: a
-> submission is queued, claimed by a worker, compiled and run inside a locked-down
-> container, given a verdict, and the result appears on the page without a reload. C++,
-> Java and Python. This README describes what exists today; it is updated at the end of
-> every phase. Nothing below is aspirational — every claim here was executed, not assumed,
-> including every verdict, which was produced by really compiling and running a program.
+> **Project status: Phase 6 of 16 complete and verified.** The judge works end to end: a
+> submission is queued, claimed by a worker, compiled and run inside a hardened sandbox,
+> given a verdict, and the result appears on the page without a reload. C++, Java and
+> Python. This README describes what exists today; it is updated at the end of every phase.
+> Nothing below is aspirational — every claim here was executed, not assumed, including
+> every verdict, which was produced by really compiling and running a program.
 >
 > **Live updates are best-effort, and the code says so.** Delivery is at-least-once, not
 > exactly-once, and real-time delivery is not guaranteed; a snapshot on connect, a
 > convergent client reducer and a bounded fallback poll are what make that safe. See
 > [Live status](#live-status).
 >
-> **The sandbox is competent, not hardened.** The worker holds the Docker socket, which is
-> host-root-equivalent if the worker itself is compromised, and containers share the host
-> kernel. Both are stated plainly in [docs/security.md](docs/security.md) along with the
-> hardening Phase 12 should bring. Do not put this on the public internet yet.
+> **The sandbox is hardened, and it is still not a virtual machine.** Containers share the
+> host kernel, so a kernel exploit escapes; and the execution service holds the Docker
+> socket, which is host-equivalent if *that service* is compromised. Phase 6 moved the
+> socket off the judge worker, narrowed the syscall surface, stripped the images and made
+> every control verifiable — it did not eliminate either of those two facts.
+> [docs/threat-model.md](docs/threat-model.md) is the honest account, including what is
+> **not** protected. Do not put this on the public internet yet.
 
 ---
 
@@ -84,11 +87,15 @@ trade-offs.
 
 ```
 codearena/
-├── common/             Domain vocabulary shared by the API and the worker
+├── common/             Vocabulary shared by the services: languages, statuses, the
+│                       submission event, and the execution API contract
 ├── backend/            Spring Boot API server (owns the Flyway migrations)
-├── worker/             Spring Boot judge worker
+├── worker/             Spring Boot judge worker - no Docker access at all
+├── executor/           Execution service - the ONLY holder of the Docker socket
+├── sandbox/            Sandbox image definitions, the seccomp profile, and the
+│                       script that builds the images
 ├── frontend/           React + TypeScript client
-├── docs/               Architecture and decision records
+├── docs/               Architecture, threat model and decision records
 ├── pom.xml             Maven aggregator
 ├── docker-compose.yml  Full local stack
 └── .env.example        Configuration template
@@ -113,7 +120,13 @@ version itself.
 
 ```bash
 cp .env.example .env
-# Set POSTGRES_PASSWORD - compose refuses to start without it.
+# Set POSTGRES_PASSWORD and EXECUTOR_TOKEN - compose refuses to start without either.
+#   openssl rand -hex 32
+
+# Build the sandbox images. These are NOT compose services: they are the images the
+# execution service creates throwaway containers from, and sandboxes are created with
+# --pull never, so they must exist before anything can be judged.
+./sandbox/build-images.sh
 
 docker compose up --build
 ```
@@ -125,29 +138,34 @@ docker compose up --build
 | Swagger UI | http://localhost:8080/swagger-ui.html | yes |
 | API health | http://localhost:8080/actuator/health | yes |
 | Worker health | `:8081/actuator/health` on the internal network | no — serves no public traffic |
+| Executor health | `:8082/actuator/health` on the sandbox network | no — only the worker talks to it |
 | PostgreSQL | `postgres:5432` on the internal network | no |
 | Redis | `redis:6379` on the internal network | no |
 
-PostgreSQL, Redis and the worker sit on a network declared `internal: true`. Docker
-cannot publish a host port from such a network, which is the intended outcome: the
-datastores are unreachable from the host and from the LAN. Inspect them from inside:
+PostgreSQL, Redis, the worker and the executor sit on networks declared `internal: true`.
+Docker cannot publish a host port from such a network, which is the intended outcome.
+The executor is on the `sandbox` network **only**, so the process holding the Docker socket
+has no route to PostgreSQL or Redis at all. Inspect things from inside:
 
 ```bash
 docker compose exec postgres psql -U codearena -d codearena
 docker compose exec redis redis-cli
-docker compose ps            # health of all five services
-docker compose logs -f worker
+docker compose ps            # health of all six services
+docker compose logs -f worker executor
 docker compose down          # stop; add -v to discard the data volumes
 ```
 
 The home page shows a live connectivity panel: if it reports the API server's name,
 version and profile, the whole chain (browser → API → PostgreSQL → Redis) is working.
 
-Startup is health-gated, not timing-based: the backend waits for PostgreSQL and Redis
-to pass their health checks, and the worker additionally waits for the backend, because
-the backend applies the database migrations. All five health checks probe `127.0.0.1`
-rather than `localhost`, because in a container `localhost` can resolve to `::1` first
-and a server bound to IPv4 only then looks dead.
+Startup is health-gated, not timing-based: the backend waits for PostgreSQL and Redis to
+pass their health checks, and the worker waits for the backend (which applies the
+migrations) and for the executor. The executor's health check fails while the Docker daemon
+is unreachable **or while any sandbox image is missing**, so forgetting
+`./sandbox/build-images.sh` shows up immediately as an unhealthy service rather than as a
+run of failed submissions. All health checks probe `127.0.0.1` rather than `localhost`,
+because in a container `localhost` can resolve to `::1` first and a server bound to IPv4
+only then looks dead.
 
 ### Without Docker
 
@@ -389,20 +407,71 @@ the worker — a program that could read the answer key could print it.
 
 ### Execution isolation
 
-Every run is a fresh container, created with these flags and no others. Each is verified by
-a test against a real daemon:
+Every run is a fresh container. Every flag is assembled in one class, `SandboxPolicy`, so the
+security boundary is a page you can read rather than something reconstructed from the middle
+of process-handling code:
 
-`--network none` · `--memory` with swap disabled · `--cpus` · `--pids-limit` ·
-`--cap-drop ALL` · `--security-opt no-new-privileges` · `--user 65534:65534` ·
-`--read-only` with a small `tmpfs` · no host mount · **no Docker socket**
+`--network none` · `--ipc none` · `--cgroupns private` · `--cap-drop ALL` ·
+`--security-opt no-new-privileges` · `--security-opt seccomp=…` (a custom allowlist) ·
+`--user 65534:65534` · `--memory` with swap disabled · `--cpus` · `--pids-limit` ·
+`--ulimit fsize` · `--ulimit core=0` · `--ulimit nofile` · `--read-only` ·
+`--tmpfs /tmp:noexec,nosuid,nodev,size=…` · `--pull never` · `--init` ·
+`--hostname sandbox` · a fixed environment · no host mount · **no Docker socket**
+
+**Every one of these is verified by running a real malicious program and checking what
+happened** — a fork bomb, an allocation storm, a network probe, a DNS lookup, an environment
+dump, a privilege-escalation attempt, a disk flood, a device probe, an orphaned child that
+tries to outlive its timeout. Asserting that a flag appears in an argument list proves that a
+string is in a list; it would keep passing if the daemon ignored the flag. Both kinds of test
+exist, and only one of them is evidence.
 
 No shell is involved anywhere. Commands are fixed argv arrays in `LanguageSpec`, and the
 client chooses a language by sending an **enum constant** — a value that does not match one
 is rejected before any code runs. There is no path by which a request contributes an element
 to a command line.
 
-Containers and per-submission volumes are destroyed in a `finally`, so a crashed submission
-leaves nothing behind.
+Cleanup is layered, because a `finally` cannot cover a process that gets killed: containers
+and volumes are removed on every path out of an execution, abandoned workspaces are closed on
+a timer, and a reaper sweeps strays by label at startup and periodically.
+
+### Who can create a container
+
+One process, and it does nothing else.
+
+Creating sandboxes means holding a Docker socket, and **a Docker socket is equivalent to root
+on the host**. Until Phase 6 the holder was the judge worker — the same process that parses
+untrusted program output and connects to PostgreSQL and Redis — so any bug anywhere in it was
+a host compromise.
+
+The socket now belongs to a separate **execution service** offering four operations: prepare
+a workspace for one of three languages, compile it, run it, discard it. That contract has no
+field for an image, a mount, a capability, a network, a user or a command, and the limits a
+caller asks for are clamped on arrival. The worker holds a shared secret for it and nothing
+else; its image no longer contains a Docker client at all.
+
+So a compromised worker can ask for a program to be run in a sandbox. It cannot ask for
+anything else.
+
+**What that does not fix:** whatever holds the socket is host-equivalent if it is
+compromised, and that is now the execution service. It is built to be a small target — no
+database, no queue, no user model, one caller — but small is not zero. The real fixes are
+rootless Docker or a runtime with its own kernel boundary, and neither is done. See ADR-028
+and [docs/threat-model.md](docs/threat-model.md) §7.1.
+
+### Sandbox images
+
+Built here, not pulled: `sandbox/build-images.sh` builds three images from pinned base
+**digests**, because a tag is rebuilt under the same name and an image that changes underneath
+the judge changes what submissions are compiled against.
+
+Each strips package managers, network and remote-access tooling, account-management tooling
+and **every setuid/setgid bit** — the Debian gcc base ships thirteen, including `su`, `mount`
+and `ssh-keysign`. The build *asserts* both: it fails if any setuid bit survives, and it
+exercises the toolchain afterwards so an image stripped past the point of working fails to
+build rather than failing every submission.
+
+Containers are created with `--pull never`, so judging never reaches a registry. A missing
+image is reported by the execution service's health check at startup.
 
 ### Delivery and recovery
 
@@ -474,6 +543,27 @@ to filter on the way out. A hidden test reports only whether it passed.
   produces `MEMORY_LIMIT_EXCEEDED`, and a test proves it — but nothing reports how much a
   program used, and `memoryKb` was removed from the API rather than shipped as a field that
   is always null. Measuring it needs a sandbox image we control (ADR-026).
+- **Per-execution disk is not hard-bounded during compilation.** At run time it is fully
+  contained — the workspace is read-only and the only writable filesystem is a size-capped
+  tmpfs charged to the memory cgroup. During compilation the bound is `RLIMIT_FSIZE` per file
+  plus the compile timeout, not a quota on total bytes. `--storage-opt size=` is deliberately
+  **not** used: this daemon accepts it and silently does not enforce it (measured — a
+  container capped at 64 MB wrote a 100 MB file), so configuring it would look like a limit
+  while being none. ADR-031.
+- **No AppArmor or SELinux.** Seccomp is applied; mandatory access control is not. This
+  daemon reports no AppArmor at all, and naming a profile the host lacks makes every
+  container fail to start, so it is applied only where a deployment genuinely has one.
+- **A problem's time limit includes sandbox startup.** The enforced wall clock and the
+  reported `runtimeMs` both cover the whole `docker run`, not just the program — and creating
+  a container costs roughly **1.5 s on Docker Desktop/WSL2** (much less on a native Linux
+  daemon). So a 2-second limit leaves well under a second of actual compute here, and a
+  1-second limit is effectively unsatisfiable. Problem authors have to allow for it.
+
+  Measured, so the cause is not guessed at: an empty Python program takes 1640 ms/run with no
+  hardening flags at all and 1525 ms/run fully hardened with seccomp and `--init`. **The
+  Phase 6 hardening costs nothing measurable**; the overhead is container creation itself.
+  Charging only the program's own time would need a supervisor inside the sandbox image,
+  which is a change to what a verdict means and is not in this phase.
 - **The SSE connection cap is global, not per user.** 500 concurrent streams server-wide;
   one account can consume them all. Per-principal limits belong with rate limiting, Phase 9.
 - **No submission rate limiting.** One authenticated user can submit as fast as they can
@@ -619,19 +709,23 @@ as it lands, never before.
 | 3 | Problems, tags, test cases, search and pagination | **Complete** |
 | 4 | Submissions, queue, worker, sandboxed execution, judging | **Complete** |
 | 5 | Submission history, per-test results, real-time status | **Complete** |
-| 6 | Worker scaling, dead-letter handling, queue observability | Next |
-| 7 | Caching and cache invalidation | Planned |
-| 8 | User profiles, statistics, solved-problem tracking | Planned |
+| 6 | Secure execution, sandbox hardening, execution-service separation | **Complete** |
+| 7 | Worker scaling, dead-letter handling, queue observability | Next |
+| 8 | Caching, user profiles, statistics | Planned |
 | 9 | Rate limiting and abuse controls | Planned |
 | 10 | Contests, scoring, leaderboards | Planned |
 | 11 | Full frontend | Planned |
-| 12 | Sandbox hardening (gVisor / rootless daemon) | Planned |
+| 12 | Kernel-level sandbox isolation (gVisor / rootless daemon) | Planned |
 | 13–16 | Testing, CI/CD, docs, deployment | Planned |
 
 The Docker execution engine and the judging and verdict logic were originally sketched as
 separate later phases. They were delivered in Phase 4, because a submission pipeline that
 queues work nothing can execute is not testable and therefore not verifiable. The table
 above reflects what was actually built, not the original guess at the order.
+
+Phase 12 is deliberately still there. Phase 6 hardened the sandbox and moved Docker control
+off the worker; it did not give containers their own kernel. That remains the one change
+that would turn a container escape into something other than a host escape.
 
 ---
 

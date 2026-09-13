@@ -17,21 +17,36 @@ the platform may depend on a submission behaving.
 ## What actually contains it
 
 Untrusted code runs only inside a container created per execution, with these flags and no
-others. Each is verified by a test in `DockerExecutionIT`.
+others. Every control is assembled in one place — `SandboxPolicy` — and verified by a test
+that runs a real malicious program and asserts what happened, in `SandboxSecurityIT` and
+`SandboxIsolationIT`.
 
 | Control | Flag | Stops |
 |---|---|---|
-| No network | `--network none` | Reaching PostgreSQL, Redis, the internet, other containers |
+| No network | `--network none` | Reaching PostgreSQL, Redis, the internet, other containers, DNS |
 | Memory ceiling | `--memory`, `--memory-swap` equal | Exhausting host RAM; swap cannot be used to evade it |
-| CPU quota | `--cpus` | A busy loop starving the host |
-| Process ceiling | `--pids-limit` | Fork bombs, which no timeout catches |
-| No capabilities | `--cap-drop ALL` | Raw sockets, mounts, ptrace, module loading |
+| CPU quota | `--cpus` | A busy loop starving the host; not bypassable by forking |
+| Process ceiling | `--pids-limit` | Fork bombs and thread storms, which no timeout catches |
+| No capabilities | `--cap-drop ALL` | Raw sockets, mounts, module loading. `CapBnd` is empty too, so none can be acquired |
 | No re-escalation | `--security-opt no-new-privileges` | Regaining privileges through setuid |
+| Syscall allowlist | `--security-opt seccomp=…` | `ptrace`, `mount`, `unshare`, `bpf`, `io_uring`, `capset`, kernel-module loading — see ADR-029 |
 | Unprivileged user | `--user 65534:65534` | Acting as root even inside the sandbox |
-| Read-only root | `--read-only` + small `tmpfs` | Persisting anything; filling a disk |
-| Wall-clock kill | worker-enforced timeout | Infinite loops |
-| Output ceiling | bounded stream reader | Flooding the worker's heap with stdout |
-| Disposal | volume and containers removed in `finally` | Accumulating artefacts across runs |
+| Read-only root | `--read-only` | Modifying the image; persisting anything |
+| Bounded scratch | `--tmpfs /tmp:noexec,nosuid,nodev,size=…` | Filling a disk; writing a payload and executing it |
+| Read-only workspace at run time | `-v …:/work:ro` | Writing anything at all during a run |
+| File-size ceiling | `--ulimit fsize` | Writing one enormous file during compilation |
+| No core dumps | `--ulimit core=0` | A crash writing a file the size of the address space |
+| Private namespaces | `--ipc none`, `--cgroupns private` | Shared IPC; seeing the host's cgroup tree |
+| No registry access | `--pull never` | Judging depending on, or reaching, a network registry |
+| Zombie reaping | `--init` | Processes accumulating inside a run |
+| Fixed identity | `--hostname sandbox` | Learning the container id |
+| Fixed environment | explicit `--env` set | Inheriting credentials; locale- or timezone-dependent verdicts |
+| Wall-clock kill | container removed at the deadline | Infinite loops, and children that outlive their parent |
+| Output ceiling | bounded stream reader | Flooding the executor's heap with stdout |
+| Disposal | containers and volumes removed in `finally`, plus a reaper | Accumulating artefacts across runs and across crashes |
+
+A fuller account, including the evidence for each control and what is deliberately **not**
+covered, is in [threat-model.md](threat-model.md).
 
 **No shell is ever involved.** Commands are fixed `List<String>` argv values in
 `LanguageSpec`, handed to a `ProcessBuilder`. Nothing from a request, a database row or a
@@ -46,29 +61,37 @@ does not match a constant fails deserialisation before any code runs.
 
 ## What is *not* contained — read this before deploying
 
-### 1. The worker holds the Docker socket
+### 1. Something still holds the Docker socket — now the execution service
 
-This is the single largest piece of un-hardened surface in the system.
+Creating containers requires talking to a container runtime, and **a Docker socket is
+equivalent to root on the host**: anything holding one can start a privileged container that
+mounts the host filesystem. Something has to hold it. The question is what else that
+something does.
 
-The worker must talk to a container runtime in order to create sandboxes, and it does so
-through `/var/run/docker.sock`, mounted into the worker container by
-`docker-compose.yml`. **Access to that socket is equivalent to root on the host**: anything
-holding it can start a privileged container that mounts the host filesystem.
+**What changed in Phase 6.** The socket moved off the judge worker and onto a dedicated
+execution service. The worker — which parses untrusted program output and connects to
+PostgreSQL and Redis — now holds only a shared secret for a contract with four operations:
+prepare a workspace for one of three languages, compile it, run it, discard it. That contract
+has no field for an image, a mount, a capability, a network, a user or a command, and limits
+are clamped server-side. The worker image no longer even contains a Docker client.
 
-What limits the damage today:
+So a compromise of the worker now yields "can ask for a sandboxed program to be run" rather
+than host control. That is a large reduction in blast radius from a previously
+host-equivalent process.
 
-- The socket is **never** passed into a sandbox. Containers running user code get no socket,
-  no host volume and no network. A submitted program has no path to the daemon — verified by
-  `deniesAccessToTheDockerSocket`.
-- The worker runs only code from this repository and never evaluates user input as a command.
-- The backend and frontend containers do not get the socket.
+**What has not changed.** The executor is host-equivalent if *it* is compromised. It is built
+to be as small a target as possible — no database driver, no Redis client, no user model, one
+caller, one shared secret, four typed endpoints, no inherited environment — but small is not
+zero, and nobody should read this section as saying the problem is solved.
 
-What that does *not* cover: if the worker process itself is compromised — a deserialisation
-bug, a dependency with a supply-chain problem — the attacker has the host. "The process is
-trusted" is a weaker guarantee than "the process cannot".
+The socket is **never** passed into a sandbox, and neither is a Docker client. A submitted
+program has no path to the daemon — verified by `cannotSeeTheDockerSocketOrAClientForIt`.
+That is a different question from this one, and the two should not be confused.
 
-**Fix (Phase 12):** a rootless or remote daemon dedicated to judging, so the socket grants
-control over an isolated runtime rather than the host.
+**Real fixes, none of them done:** rootless Docker, so the daemon's authority is a user's
+rather than root's; or a runtime with its own kernel boundary (gVisor, Kata, Firecracker), so
+a container escape is not a host escape; or a dedicated judging host, so "host-equivalent"
+means a machine that does nothing else. See ADR-028 and threat-model.md §7.1.
 
 ### 2. Containers share the host kernel
 
@@ -79,10 +102,18 @@ escape.
 **Fix (Phase 12):** a runtime with its own kernel boundary — gVisor, Kata, or Firecracker —
 so that a container escape is not a host escape.
 
-### 3. No seccomp or AppArmor profile beyond the defaults
+### 3. AppArmor and SELinux are not applied
 
-Docker's default seccomp profile is applied, which blocks a useful set of syscalls. No
-custom, tighter profile has been written.
+**Seccomp is** — a custom allowlist narrower than Docker's default, described in ADR-029 and
+verified by a test asserting that `ptrace` returns `EPERM` where the daemon default allows
+it. If the profile file cannot be read the sandbox falls back to the daemon default, logs a
+warning, and reports it on the health endpoint rather than degrading silently.
+
+**Mandatory access control is not applied.** This daemon reports only `seccomp` and
+`cgroupns` as security options; Docker Desktop on WSL2 has no AppArmor at all. Naming a
+profile the host does not have makes every container **fail to start**, so a profile is
+applied only when `SANDBOX_APPARMOR_PROFILE` names one that genuinely exists. It is empty by
+default: the configuration is absent rather than present-and-unenforced.
 
 ### 4. Submission rate limiting is not implemented
 
@@ -92,7 +123,23 @@ cost of *one* submission; nothing yet bounds the *rate*. This is a real gap, sta
 rather than filed under future improvements. Phase 9 brings rate limiting, where Redis is
 already the counter store.
 
-### 5. Live streams are capped, but the cap is global
+### 5. Per-execution disk is not hard-bounded during compilation
+
+At run time this is fully contained: the workspace is mounted read-only and the only writable
+filesystem is a size-capped tmpfs charged to the memory cgroup, so filling it is an OOM kill
+and the host disk is never touched.
+
+During **compilation** the workspace must be writable. The bound there is `RLIMIT_FSIZE` per
+file plus the compile timeout — not a quota on total bytes.
+
+`--storage-opt size=` would be the right control and is **deliberately not used**: this
+daemon accepts it and silently does not enforce it. Measured — a container capped at 64 MB
+wrote a 100 MB file successfully, because overlayfs here has no project quota. Configuring it
+would look like a disk limit in every future review while being none. A filesystem with
+project quotas (XFS `prjquota`, btrfs, ZFS) would allow a real one; that is a deployment
+property, not a code change. See ADR-031.
+
+### 6. Live streams are capped, but the cap is global
 
 Each open SSE stream pins a servlet container thread for its lifetime, so an unbounded number
 of them stops the API answering anything — a denial of service needing no more privilege than
@@ -104,11 +151,13 @@ it per-principal is the right fix and belongs with the rest of the rate limiting
 A refused stream is not an error the user sees — it still receives its snapshot, then closes,
 and the client falls back to polling.
 
-### 6. Disk is bounded only indirectly
+### 7. There is no global quota on judge storage
 
-A per-submission volume plus a `tmpfs` for scratch limits what one execution can write, and
-volumes are removed in a `finally`. There is no global quota on judge storage, so a
-sustained failure of the cleanup path would eventually fill the disk.
+Individual executions are bounded as described above, and containers and volumes are removed
+in a `finally` with `SandboxReaper` as a backstop for crashes. But nothing caps the *total*
+storage judging may occupy, so a sustained failure of both cleanup paths would eventually
+fill the disk. The reaper's sweep count is exposed as a metric precisely so that this shows
+up as a number climbing rather than as a full disk.
 
 ---
 
@@ -122,7 +171,18 @@ sustained failure of the cleanup path would eventually fill the disk.
 | Can a user set status, verdict, runtime or worker fields? | No. `SubmissionRequest` has two fields; the rest do not exist on the type, so they cannot be overposted. Tested. |
 | Can a user supply an arbitrary command? | No. The language is an enum; commands are compile-time constants. |
 | Can submitted code read the host filesystem? | No host path is mounted into a sandbox. |
-| Can submitted code reach the Docker socket? | No. Tested. |
+| Can submitted code reach the Docker socket? | No — and there is no Docker client in the sandbox either. Tested. |
+| Can submitted code resolve DNS? | No. Tested. |
+| Can submitted code acquire a capability? | No. `CapEff`, `CapPrm` and `CapBnd` are all empty, and `capset` is denied by seccomp. Tested. |
+| Can submitted code call `ptrace`? | No — denied by the custom seccomp profile, which the daemon default allows. Tested. |
+| Can submitted code open a host device? | No. Tested. |
+| Can submitted code write anywhere but `/tmp`? | No. Even its own workspace is read-only during a run. Tested. |
+| Can submitted code execute something it wrote? | No — `/tmp` is `noexec`. |
+| Can a child process outlive a timeout? | No. Removing the container kills the whole cgroup. Tested with a deliberately orphaned child. |
+| Can extra processes buy extra CPU? | No — the quota is per-cgroup. Tested by comparing one unit of work against four. |
+| Can two concurrent submissions see each other? | No. Tested with six at once, each checking for the others' markers. |
+| Can a compromised *worker* reach the Docker socket? | No — it holds a token for a four-operation contract, and its image has no Docker client. |
+| Can a compromised *execution service* reach the host? | **Yes.** That is the residual risk of this design; see item 1 above. |
 | Can submitted code use the network? | No — `--network none`. Tested. |
 | Can submitted code exhaust memory? | No — killed by the kernel. Tested. |
 | Can submitted code exhaust CPU or run forever? | No — CPU quota plus wall-clock kill. Tested. |

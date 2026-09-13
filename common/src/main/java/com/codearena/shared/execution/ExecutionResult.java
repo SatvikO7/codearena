@@ -1,4 +1,4 @@
-package com.codearena.worker.execution;
+package com.codearena.shared.execution;
 
 /**
  * The structured result of one sandboxed run.

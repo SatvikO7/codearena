@@ -1,6 +1,7 @@
 package com.codearena.worker.queue;
 
 import com.codearena.shared.SubmissionStatus;
+import com.codearena.worker.execution.ExecutionService;
 import com.codearena.worker.config.WorkerProperties;
 import com.codearena.worker.judge.JudgeRepository;
 import com.codearena.worker.judge.JudgeRepository.ClaimedSubmission;
@@ -192,7 +193,19 @@ public class SubmissionConsumer implements ApplicationRunner {
 
         long startedAt = System.nanoTime();
         List<JudgeTestCase> testCases = judgeRepository.loadTestCases(claimed.problemId());
-        JudgeResult result = judgeService.judge(claimed, testCases);
+
+        JudgeResult result;
+        try {
+            result = judgeService.judge(claimed, testCases);
+        } catch (ExecutionService.ExecutionUnavailableException e) {
+            // No result is recorded, so the row stays claimed with an expiring lease and the
+            // recovery sweeper returns it to the queue. This is the same path a worker that
+            // died mid-execution takes, and it is bounded by `attempts` in exactly the same
+            // way -- after the last one the sweeper records SYSTEM_ERROR.
+            log.warn("event=JUDGE_DEFERRED submission={} worker={} attempt={} reason={}",
+                    submissionId, properties.id(), claimed.attempts(), e.getMessage());
+            return;
+        }
         long durationMs = (System.nanoTime() - startedAt) / 1_000_000;
 
         boolean recorded = judgeRepository.recordResult(claimed.id(), properties.id(), result);

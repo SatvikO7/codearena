@@ -52,6 +52,24 @@
       <artifactId>postgresql</artifactId>
       <scope>runtime</scope>
     </dependency>
+    <!--
+      TEST SCOPE ONLY, and the scope is the point.
+
+      JudgeVerdictIT asserts that a real timeout, a real OOM kill and a real compiler
+      failure map to the right verdicts, which needs a real sandbox to produce them.
+      Stubbing the execution service would leave the mapping tested against outcomes a
+      stub was told to return, which is exactly the set the code already believes in.
+
+      At runtime the worker has no Docker code and no Docker client: it reaches the
+      execution service over HTTP through RemoteExecutionService. This dependency does
+      not ship in the worker image.
+    -->
+    <dependency>
+      <groupId>com.codearena</groupId>
+      <artifactId>codearena-executor</artifactId>
+      <version>${project.version}</version>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
 
   <build>

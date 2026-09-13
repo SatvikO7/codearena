@@ -1,0 +1,104 @@
+# =============================================================================
+# CodeArena execution service
+#
+# The only process that holds Docker control. Everything here is either a security
+# ceiling or the plumbing needed to serve four endpoints; there is deliberately no
+# datasource, no Redis and no session configuration, because this service has no
+# business touching any of them.
+# =============================================================================
+spring:
+  application:
+    name: codearena-executor
+
+  # A request carrying a program plus a test's input. Well under the source ceiling
+  # below, but bounded so a caller cannot make this process buffer something enormous.
+  servlet:
+    multipart:
+      enabled: false
+
+  mvc:
+    # A wrong URL should not be answered by a static-resource handler in a service whose
+    # entire surface is four JSON endpoints.
+    throw-exception-if-no-handler-found: true
+
+  web:
+    resources:
+      add-mappings: false
+
+  lifecycle:
+    # Executions are bounded by their own wall-clock limits, so the drain window only has
+    # to outlast the in-flight ones it is worth waiting for.
+    timeout-per-shutdown-phase: 30s
+
+server:
+  port: ${EXECUTOR_PORT:8082}
+  shutdown: graceful
+  error:
+    # A daemon error can name images, paths and host configuration. It is logged, never
+    # returned: the caller is one step removed from untrusted code.
+    include-stacktrace: never
+    include-message: never
+
+codearena:
+  executor:
+    # No default, deliberately. The service refuses to start without it rather than
+    # coming up unauthenticated.
+    token: ${EXECUTOR_TOKEN:}
+
+  sandbox:
+    docker-binary: ${DOCKER_BINARY:docker}
+
+    # --- the security ceilings a caller cannot exceed -------------------------------
+    # Requested limits are clamped to these. A compromised worker asking for a
+    # twelve-hour, sixty-four-gigabyte run gets these numbers instead.
+    max-wall-clock-ms: ${SANDBOX_MAX_WALL_CLOCK_MS:60000}
+    max-memory-mb: ${SANDBOX_MAX_MEMORY_MB:1024}
+    max-cpus: ${SANDBOX_MAX_CPUS:2.0}
+    max-pids: ${SANDBOX_MAX_PIDS:128}
+    max-output-bytes: ${SANDBOX_MAX_OUTPUT_BYTES:1048576}
+    max-source-bytes: ${SANDBOX_MAX_SOURCE_BYTES:262144}
+
+    # --- per-container hardening ----------------------------------------------------
+    # The writable tmpfs. Charged to the container's memory cgroup, so filling it is an
+    # OOM kill rather than a full host disk.
+    tmpfs-mb: ${SANDBOX_TMPFS_MB:64}
+    # RLIMIT_FSIZE. The one per-execution disk bound this daemon actually enforces:
+    # --storage-opt is accepted and ignored on overlayfs without project quotas.
+    max-file-bytes: ${SANDBOX_MAX_FILE_BYTES:67108864}
+    max-open-files: ${SANDBOX_MAX_OPEN_FILES:256}
+
+    seccomp-profile: ${SANDBOX_SECCOMP_PROFILE:/app/seccomp/codearena.json}
+    # Empty unless the host actually has a profile loaded. Naming one the host does not
+    # have makes every container fail to start; naming none is honest about what this
+    # platform provides. Docker Desktop reports no AppArmor at all.
+    apparmor-profile: ${SANDBOX_APPARMOR_PROFILE:}
+
+    # --- capacity and cleanup -------------------------------------------------------
+    # Bounded concurrency: a hard ceiling on how much this machine will be asked to run
+    # at once. Per-user quotas are Phase 9 and need identity this service does not have.
+    max-open-workspaces: ${SANDBOX_MAX_OPEN_WORKSPACES:16}
+    workspace-idle-timeout: ${SANDBOX_WORKSPACE_IDLE_TIMEOUT:PT10M}
+    idle-sweep-ms: 60000
+    reaper-interval-ms: ${SANDBOX_REAPER_INTERVAL_MS:300000}
+    # Long enough to cover the window where a live workspace is legitimately unattached:
+    # between creating its volume and starting the first container that mounts it.
+    reaper-grace-minutes: ${SANDBOX_REAPER_GRACE_MINUTES:15}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        # Health only. This process is not a place to expose env, heapdump or loggers.
+        include: health
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: never
+
+logging:
+  level:
+    root: INFO
+    com.codearena: INFO
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n"

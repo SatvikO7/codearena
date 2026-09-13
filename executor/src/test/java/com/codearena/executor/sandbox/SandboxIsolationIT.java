@@ -1,6 +1,9 @@
-package com.codearena.worker.execution;
+package com.codearena.executor.sandbox;
 
 import com.codearena.shared.Language;
+import com.codearena.shared.execution.ExecutionLimits;
+import com.codearena.shared.execution.ExecutionOutcome;
+import com.codearena.shared.execution.ExecutionResult;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -21,23 +24,54 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  * <p>Requires the language images to be present. They are pulled once in {@link #pullImages}
  * rather than during a timed test, so a slow download cannot be mistaken for a slow program.
  */
-class DockerExecutionIT {
+class SandboxIsolationIT {
 
     private static final int DOCKER_AVAILABLE_TIMEOUT_SECONDS = 30;
 
-    private final DockerExecutionService executionService = new DockerExecutionService("docker", 64);
+    private final DockerSandboxService executionService = new DockerSandboxService(
+            new SandboxPolicy(64, 67_108_864L, 256, seccompProfilePath(), ""),
+            new SandboxMetrics(),
+            "docker");
+
+    /**
+     * The seccomp profile, as an absolute path the Docker CLI can read. The CLI reads the
+     * file itself and embeds the JSON in the container configuration, so this resolves
+     * against the working tree rather than against anything inside a container.
+     */
+    static String seccompProfilePath() {
+        return java.nio.file.Path.of(System.getProperty("user.dir"))
+                .toAbsolutePath().getParent()
+                .resolve("sandbox").resolve("seccomp").resolve("codearena.json")
+                .toString();
+    }
 
     /** Generous limits, so a test that fails does so for its own reason rather than on time. */
     private static final ExecutionLimits LIMITS = new ExecutionLimits(10_000, 256, 1.0, 64, 65_536);
 
+    /**
+     * Sandbox images are built by {@code sandbox/build-images.sh}, never pulled: containers
+     * are created with {@code --pull never} so that judging cannot reach a registry. A
+     * missing image is therefore a setup error, and saying so beats a cascade of failures
+     * that look like sandbox bugs.
+     */
     @BeforeAll
-    static void pullImages() throws Exception {
+    static void requireSandboxImages() {
         assumeTrue(dockerAvailable(), "Docker daemon is not available");
         for (String image : LanguageSpec.allImages()) {
-            new ProcessBuilder("docker", "pull", image)
+            assumeTrue(imagePresent(image),
+                    "Sandbox image " + image + " is missing. Run sandbox/build-images.sh");
+        }
+    }
+
+    private static boolean imagePresent(String image) {
+        try {
+            Process process = new ProcessBuilder("docker", "image", "inspect", image)
                     .redirectErrorStream(true)
-                    .start()
-                    .waitFor(10, TimeUnit.MINUTES);
+                    .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+                    .start();
+            return process.waitFor(30, TimeUnit.SECONDS) && process.exitValue() == 0;
+        } catch (Exception e) {
+            return false;
         }
     }
 
@@ -46,7 +80,7 @@ class DockerExecutionIT {
     @Test
     @Timeout(120)
     void runsAPythonProgramAndCapturesItsOutput() {
-        try (ExecutionService.Workspace workspace = executionService.prepare(
+        try (SandboxService.Workspace workspace = executionService.prepare(
                 "test-py", Language.PYTHON, "print(sum(int(x) for x in input().split()))")) {
 
             assertThat(workspace.compile(LIMITS).succeeded()).isTrue();
@@ -66,8 +100,15 @@ class DockerExecutionIT {
                 int main() { int a, b; std::cin >> a >> b; std::cout << a + b << std::endl; }
                 """;
 
-        try (ExecutionService.Workspace workspace = executionService.prepare("test-cpp", Language.CPP, source)) {
-            assertThat(workspace.compile(LIMITS.forCompilation(60_000, 512)).succeeded()).isTrue();
+        try (SandboxService.Workspace workspace = executionService.prepare("test-cpp", Language.CPP, source)) {
+            ExecutionResult compilation = workspace.compile(LIMITS.forCompilation(60_000, 512));
+            // A failing compile must say why: "expected true but was false" sends the
+            // reader to the sandbox looking for a bug that is in the source or the image.
+            assertThat(compilation.succeeded())
+                    .as("compilation failed: outcome=%s exit=%d stdout=%s stderr=%s detail=%s",
+                        compilation.outcome(), compilation.exitCode(),
+                        compilation.stdout(), compilation.stderr(), compilation.detail())
+                    .isTrue();
 
             ExecutionResult result = workspace.run("7 8\n", LIMITS);
 
@@ -89,8 +130,15 @@ class DockerExecutionIT {
                 }
                 """;
 
-        try (ExecutionService.Workspace workspace = executionService.prepare("test-java", Language.JAVA, source)) {
-            assertThat(workspace.compile(LIMITS.forCompilation(60_000, 512)).succeeded()).isTrue();
+        try (SandboxService.Workspace workspace = executionService.prepare("test-java", Language.JAVA, source)) {
+            ExecutionResult compilation = workspace.compile(LIMITS.forCompilation(60_000, 512));
+            // A failing compile must say why: "expected true but was false" sends the
+            // reader to the sandbox looking for a bug that is in the source or the image.
+            assertThat(compilation.succeeded())
+                    .as("compilation failed: outcome=%s exit=%d stdout=%s stderr=%s detail=%s",
+                        compilation.outcome(), compilation.exitCode(),
+                        compilation.stdout(), compilation.stderr(), compilation.detail())
+                    .isTrue();
 
             ExecutionResult result = workspace.run("6 7\n", LIMITS);
 
@@ -104,7 +152,7 @@ class DockerExecutionIT {
     @Test
     @Timeout(180)
     void reportsACompilationFailureWithoutTreatingItAsAJudgeError() {
-        try (ExecutionService.Workspace workspace = executionService.prepare(
+        try (SandboxService.Workspace workspace = executionService.prepare(
                 "test-badcpp", Language.CPP, "int main() { this is not c++ }")) {
 
             ExecutionResult result = workspace.compile(LIMITS.forCompilation(60_000, 512));
@@ -119,7 +167,7 @@ class DockerExecutionIT {
     @Test
     @Timeout(120)
     void reportsANonZeroExitAsARuntimeFailure() {
-        try (ExecutionService.Workspace workspace = executionService.prepare(
+        try (SandboxService.Workspace workspace = executionService.prepare(
                 "test-crash", Language.PYTHON, "raise SystemExit(3)")) {
 
             ExecutionResult result = workspace.run("", LIMITS);
@@ -135,7 +183,7 @@ class DockerExecutionIT {
     void killsAProgramThatExceedsItsWallClockBudget() {
         ExecutionLimits oneSecond = new ExecutionLimits(1_000, 256, 1.0, 64, 65_536);
 
-        try (ExecutionService.Workspace workspace = executionService.prepare(
+        try (SandboxService.Workspace workspace = executionService.prepare(
                 "test-loop", Language.PYTHON, "while True: pass")) {
 
             ExecutionResult result = workspace.run("", oneSecond);
@@ -150,7 +198,7 @@ class DockerExecutionIT {
     void killsAProgramThatExceedsItsMemoryLimit() {
         ExecutionLimits small = new ExecutionLimits(15_000, 32, 1.0, 64, 65_536);
 
-        try (ExecutionService.Workspace workspace = executionService.prepare(
+        try (SandboxService.Workspace workspace = executionService.prepare(
                 "test-memory", Language.PYTHON, "x = bytearray(512 * 1024 * 1024)")) {
 
             ExecutionResult result = workspace.run("", small);
@@ -167,7 +215,7 @@ class DockerExecutionIT {
     void stopsAProgramThatFloodsItsOutput() {
         ExecutionLimits tinyOutput = new ExecutionLimits(15_000, 256, 1.0, 64, 4_096);
 
-        try (ExecutionService.Workspace workspace = executionService.prepare(
+        try (SandboxService.Workspace workspace = executionService.prepare(
                 "test-flood", Language.PYTHON, "while True: print('x' * 1000)")) {
 
             ExecutionResult result = workspace.run("", tinyOutput);
@@ -194,7 +242,7 @@ class DockerExecutionIT {
                         pass
                 """;
 
-        try (ExecutionService.Workspace workspace = executionService.prepare("test-fork", Language.PYTHON, source)) {
+        try (SandboxService.Workspace workspace = executionService.prepare("test-fork", Language.PYTHON, source)) {
             ExecutionResult result = workspace.run("", fewPids);
 
             // Contained one way or another; what matters is that it ended.
@@ -214,7 +262,7 @@ class DockerExecutionIT {
                     print("NETWORK-BLOCKED")
                 """;
 
-        try (ExecutionService.Workspace workspace = executionService.prepare("test-net", Language.PYTHON, source)) {
+        try (SandboxService.Workspace workspace = executionService.prepare("test-net", Language.PYTHON, source)) {
             ExecutionResult result = workspace.run("", LIMITS);
 
             assertThat(result.stdout()).contains("NETWORK-BLOCKED");
@@ -230,7 +278,7 @@ class DockerExecutionIT {
                 print("SOCKET-PRESENT" if os.path.exists("/var/run/docker.sock") else "SOCKET-ABSENT")
                 """;
 
-        try (ExecutionService.Workspace workspace = executionService.prepare("test-sock", Language.PYTHON, source)) {
+        try (SandboxService.Workspace workspace = executionService.prepare("test-sock", Language.PYTHON, source)) {
             ExecutionResult result = workspace.run("", LIMITS);
 
             assertThat(result.stdout()).contains("SOCKET-ABSENT");
@@ -249,7 +297,7 @@ class DockerExecutionIT {
                     print("ROOTFS-READONLY")
                 """;
 
-        try (ExecutionService.Workspace workspace = executionService.prepare("test-ro", Language.PYTHON, source)) {
+        try (SandboxService.Workspace workspace = executionService.prepare("test-ro", Language.PYTHON, source)) {
             ExecutionResult result = workspace.run("", LIMITS);
 
             assertThat(result.stdout()).contains("ROOTFS-READONLY");
@@ -259,7 +307,7 @@ class DockerExecutionIT {
     @Test
     @Timeout(120)
     void runsAsAnUnprivilegedUser() {
-        try (ExecutionService.Workspace workspace = executionService.prepare(
+        try (SandboxService.Workspace workspace = executionService.prepare(
                 "test-uid", Language.PYTHON, "import os; print(os.getuid())")) {
 
             ExecutionResult result = workspace.run("", LIMITS);
@@ -274,7 +322,7 @@ class DockerExecutionIT {
     void removesItsVolumeOnClose() throws Exception {
         long before = countJudgeVolumes();
 
-        try (ExecutionService.Workspace workspace = executionService.prepare(
+        try (SandboxService.Workspace workspace = executionService.prepare(
                 "test-cleanup", Language.PYTHON, "raise SystemExit(1)")) {
             workspace.run("", LIMITS);
         }

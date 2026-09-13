@@ -100,6 +100,9 @@ services:
       # The backend owns the Flyway migrations, so the worker waits for the schema.
       backend:
         condition: service_healthy
+      # Nothing can be judged until the execution service is answering.
+      executor:
+        condition: service_healthy
     environment:
       SPRING_PROFILES_ACTIVE: ${SPRING_PROFILES_ACTIVE:-docker}
       DATABASE_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-codearena}
@@ -109,46 +112,14 @@ services:
       REDIS_PORT: 6379
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
       WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
-    volumes:
-      # =====================================================================
-      # The Docker socket. Read the following before changing it.
-      #
-      # WHY IT IS HERE
-      #   The worker's job is to run untrusted code inside disposable containers. To
-      #   create those containers it must talk to a container runtime, and the socket is
-      #   how it does so. No socket, no sandbox - the alternative would be running user
-      #   code in the worker's own JVM, which is the thing this whole design exists to
-      #   avoid.
-      #
-      # WHAT IT DOES NOT DO
-      #   The socket is never passed to a sandbox. Containers created for user code get
-      #   `--network none`, no volume from the host, and no socket of their own; a
-      #   submitted program has no path to the daemon. This mount widens the blast radius
-      #   of a compromised *worker*, not of a compromised *submission*.
-      #
-      # THE RISK, PLAINLY
-      #   Access to the Docker socket is equivalent to root on the host: anything holding
-      #   it can start a privileged container that mounts the host filesystem. The worker
-      #   runs only code from this repository and never evaluates user input as a command,
-      #   but "the process is trusted" is a weaker guarantee than "the process cannot".
-      #   This is the single largest piece of un-hardened surface in the system.
-      #
-      # WHAT WOULD FIX IT (Phase 12)
-      #   A rootless or remote daemon dedicated to judging, so the socket grants control
-      #   over an isolated runtime rather than the host; or a sandbox runtime with its own
-      #   kernel boundary (gVisor, Kata, Firecracker) so a container escape is not a host
-      #   escape. Both are deliberately out of scope here and documented in
-      #   docs/security.md rather than quietly left for someone to discover.
-      #
-      # Deliberately NOT granted to the backend or frontend containers.
-      # =====================================================================
-      - /var/run/docker.sock:/var/run/docker.sock
-    # The worker process runs as an unprivileged user, so it needs the socket's owning group
-    # to open it. That gid is a property of the host, not of the image: 0 on Docker Desktop's
-    # VM, usually the `docker` group on a Linux host. Set DOCKER_SOCKET_GID in .env if
-    # `docker compose exec worker docker version` reports a permission error.
-    group_add:
-      - "${DOCKER_SOCKET_GID:-0}"
+      EXECUTOR_URL: http://executor:8082
+      # Shared secret for the execution service. Both sides read the same variable and
+      # both refuse to start without it.
+      EXECUTOR_TOKEN: ${EXECUTOR_TOKEN:?EXECUTOR_TOKEN must be set in .env}
+    # No volumes. In particular, no Docker socket: as of Phase 6 the worker cannot
+    # reach a container runtime at all, and the image has no Docker client in it. It
+    # asks the `executor` service to run things, over a contract that cannot express a
+    # mount, an image, a capability or a network. See ADR-028 and docs/threat-model.md.
     # No published ports: the worker serves no public traffic. The health check below
     # runs inside the container itself, so the endpoint never has to be exposed.
     healthcheck:
@@ -159,6 +130,61 @@ services:
       start_period: 40s
     networks:
       - internal
+      - sandbox
+
+  # ---------------------------------------------------------------------------
+  # The execution service.
+  #
+  # This is the ONLY container that receives the Docker socket, and it is the reason
+  # the worker no longer does. Read docs/threat-model.md before changing anything here.
+  #
+  # WHY IT HAS THE SOCKET
+  #   Running untrusted code in disposable containers requires talking to a container
+  #   runtime. Something must hold that authority. The question is only which process,
+  #   and how much else that process does.
+  #
+  # WHY THAT IS BETTER THAN THE WORKER HOLDING IT
+  #   This service has no database, no queue, no user model and four endpoints, none of
+  #   which can name an image, a mount, a capability or a network. The worker — which
+  #   parses untrusted program output and talks to PostgreSQL and Redis — now holds only
+  #   a token for that contract. A compromise of the worker no longer implies host
+  #   control; it implies "can ask for a sandboxed program to be run".
+  #
+  # WHAT IS STILL TRUE
+  #   Whatever holds the socket is host-equivalent if IT is compromised. That is now
+  #   this container. The attack surface has been made much smaller, not zero, and the
+  #   real fixes — a rootless daemon, or a runtime with its own kernel boundary such as
+  #   gVisor or Kata — remain future work. This is stated in docs/security.md rather
+  #   than quietly left for someone to discover.
+  #
+  # Deliberately NOT granted to the backend, the worker or the frontend.
+  # ---------------------------------------------------------------------------
+  executor:
+    build:
+      context: .
+      dockerfile: executor/Dockerfile
+    restart: unless-stopped
+    environment:
+      EXECUTOR_TOKEN: ${EXECUTOR_TOKEN:?EXECUTOR_TOKEN must be set in .env}
+      SANDBOX_MAX_OPEN_WORKSPACES: ${SANDBOX_MAX_OPEN_WORKSPACES:-16}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    # The socket's owning group is a property of the host, not of the image: gid 0 on
+    # Docker Desktop's VM, usually the `docker` group on a Linux host. Set
+    # DOCKER_SOCKET_GID in .env if the executor reports a permission error.
+    group_add:
+      - "${DOCKER_SOCKET_GID:-0}"
+    # No published ports: only the worker talks to it, over the `sandbox` network.
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8082/actuator/health/readiness"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+    # `sandbox` ONLY. The executor has no reason to reach PostgreSQL or Redis, and
+    # nothing it holds should be usable to go looking for them.
+    networks:
+      - sandbox
 
   frontend:
     build:
@@ -189,6 +215,10 @@ volumes:
 
 networks:
   edge:
+  # Carries exactly one conversation: worker -> executor. Internal, so a compromise of
+  # either cannot reach the internet from it.
+  sandbox:
+    internal: true
   internal:
     # Cuts this network off from the host's external network: containers attached to
     # it get no default route, so a compromised component cannot phone home.

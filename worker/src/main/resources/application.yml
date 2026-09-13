@@ -55,10 +55,21 @@ codearena:
     # this is the number of sandboxes this worker contributes to the host.
     concurrency: ${WORKER_CONCURRENCY:2}
 
+  executor:
+    # The execution service. As of Phase 6 the worker does NOT hold the Docker socket and
+    # has no Docker client installed; it asks this service to run things, over a contract
+    # that cannot express a mount, an image or a capability. See ADR-028.
+    url: ${EXECUTOR_URL:http://executor:8082}
+    # No default. The worker will not start without it, because a worker that cannot
+    # authenticate to the executor cannot judge anything and should say so at boot rather
+    # than turn every submission into a system error.
+    token: ${EXECUTOR_TOKEN:}
+    connect-timeout: ${EXECUTOR_CONNECT_TIMEOUT:PT5S}
+    # Must outlast the slowest execution the executor permits, or a legitimately slow
+    # compile would be reported as an infrastructure failure.
+    read-timeout: ${EXECUTOR_READ_TIMEOUT:PT2M}
+
   execution:
-    # Path to the Docker client. The worker talks to the daemon through the socket mounted
-    # into its container; user code never sees either.
-    docker-binary: ${DOCKER_BINARY:docker}
     # Compilation gets its own budget: a problem's 1s run limit says nothing about how long
     # g++ may take, and a compiler is itself a resource-exhaustion surface.
     compile-timeout-ms: ${COMPILE_TIMEOUT_MS:20000}

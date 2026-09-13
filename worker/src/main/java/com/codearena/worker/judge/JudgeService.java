@@ -1,8 +1,8 @@
 package com.codearena.worker.judge;
 
 import com.codearena.shared.SubmissionStatus;
-import com.codearena.worker.execution.ExecutionLimits;
-import com.codearena.worker.execution.ExecutionResult;
+import com.codearena.shared.execution.ExecutionLimits;
+import com.codearena.shared.execution.ExecutionResult;
 import com.codearena.worker.execution.ExecutionService;
 import com.codearena.worker.judge.JudgeRepository.ClaimedSubmission;
 import com.codearena.worker.judge.JudgeRepository.JudgeResult;
@@ -94,6 +94,13 @@ public class JudgeService {
 
             return runTests(submission, workspace, testCases, runLimits);
 
+        } catch (ExecutionService.ExecutionUnavailableException e) {
+            // Transient. Deliberately NOT turned into a verdict: rethrowing leaves the
+            // submission unfinished so the recovery sweeper judges it again, rather than
+            // failing somebody's code because the machine was briefly busy.
+            log.warn("event=EXECUTOR_UNAVAILABLE submission={} reason={}",
+                    submission.publicId(), e.getMessage());
+            throw e;
         } catch (RuntimeException e) {
             // The judge broke, not the submission. Says so, and says nothing about the code.
             log.error("event=JUDGE_FAILED submission={} reason={}",
@@ -130,6 +137,13 @@ public class JudgeService {
             case OUTPUT_LIMIT_EXCEEDED -> {
                 return JudgeResult.withoutTestDetail(SubmissionStatus.COMPILATION_ERROR,
                         testCount, 0, "Compilation produced too much output.");
+            }
+            case FILE_LIMIT_EXCEEDED -> {
+                // The compiler was killed writing a file past the sandbox's size ceiling.
+                // Source can do that -- an enormous static array, say -- so it is the
+                // submission's problem to fix and not an infrastructure failure.
+                return JudgeResult.withoutTestDetail(SubmissionStatus.COMPILATION_ERROR,
+                        testCount, 0, "Compilation tried to write a file larger than allowed.");
             }
             case INFRASTRUCTURE_FAILURE -> {
                 log.error("event=COMPILATION_INFRA_FAILURE submission={} detail={}",
@@ -219,6 +233,12 @@ public class JudgeService {
                 return verdict(SubmissionStatus.RUNTIME_ERROR, total, passedSoFar,
                         testCase.position(), slowestMs,
                         "Program produced more output than allowed on test %d.".formatted(testCase.position() + 1));
+            }
+            case FILE_LIMIT_EXCEEDED -> {
+                return verdict(SubmissionStatus.RUNTIME_ERROR, total, passedSoFar,
+                        testCase.position(), slowestMs,
+                        "Program tried to write a file larger than allowed on test %d."
+                                .formatted(testCase.position() + 1));
             }
             case NON_ZERO_EXIT -> {
                 return verdict(SubmissionStatus.RUNTIME_ERROR, total, passedSoFar,

@@ -1,4 +1,4 @@
-package com.codearena.worker.execution;
+package com.codearena.shared.execution;
 
 /**
  * How a sandboxed run ended.
@@ -23,6 +23,15 @@ public enum ExecutionOutcome {
 
     /** Killed because it wrote more output than the limit allows. */
     OUTPUT_LIMIT_EXCEEDED,
+
+    /**
+     * Killed by SIGXFSZ: it tried to write a file larger than {@code RLIMIT_FSIZE}.
+     *
+     * <p>Kept distinct from a plain crash because the cause is specific and worth telling
+     * the submitter — a program that dies this way is writing far more to disk than any
+     * solution needs, and "exited with signal 25" explains nothing.
+     */
+    FILE_LIMIT_EXCEEDED,
 
     /** The judge itself failed: Docker unreachable, image missing, workspace unusable. */
     INFRASTRUCTURE_FAILURE

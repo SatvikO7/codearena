@@ -1,6 +1,8 @@
 package com.codearena.worker.execution;
 
 import com.codearena.shared.Language;
+import com.codearena.shared.execution.ExecutionLimits;
+import com.codearena.shared.execution.ExecutionResult;
 
 /**
  * Runs untrusted code somewhere it cannot do harm.
@@ -48,5 +50,26 @@ public interface ExecutionService {
         /** Releases every resource. Safe to call more than once. */
         @Override
         void close();
+    }
+
+    /**
+     * The sandbox could not be obtained, and trying again later is likely to work.
+     *
+     * <p>Distinct from every other failure because the right response is different. A
+     * program that crashes has been judged; a sandbox that could not be created has not.
+     * The execution service refuses work when it is already running as much as it is
+     * configured to run, and a machine being briefly busy must not permanently fail
+     * somebody's submission.
+     *
+     * <p>Throwing this leaves the submission claimed but unfinished, so the existing
+     * recovery sweeper reclaims it once the lease expires and it is judged again — bounded
+     * by {@code attempts}, which was incremented when it was claimed. After the last attempt
+     * the sweeper records SYSTEM_ERROR, so a genuinely broken executor still terminates
+     * rather than looping for ever.
+     */
+    class ExecutionUnavailableException extends RuntimeException {
+        public ExecutionUnavailableException(String message) {
+            super(message);
+        }
     }
 }

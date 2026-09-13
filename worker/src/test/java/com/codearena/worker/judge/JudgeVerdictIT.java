@@ -2,7 +2,9 @@ package com.codearena.worker.judge;
 
 import com.codearena.shared.Language;
 import com.codearena.shared.SubmissionStatus;
-import com.codearena.worker.execution.DockerExecutionService;
+import com.codearena.executor.sandbox.DockerSandboxService;
+import com.codearena.executor.sandbox.SandboxMetrics;
+import com.codearena.executor.sandbox.SandboxPolicy;
 import com.codearena.worker.judge.JudgeRepository.ClaimedSubmission;
 import com.codearena.worker.judge.JudgeRepository.JudgeResult;
 import com.codearena.worker.judge.JudgeRepository.JudgeTestCase;
@@ -31,7 +33,11 @@ class JudgeVerdictIT {
     private static final int MEMORY_LIMIT_MB = 128;
 
     private final JudgeService judge = new JudgeService(
-            new DockerExecutionService("docker", 64),
+            new SandboxBackedExecutionService(new DockerSandboxService(
+                    new SandboxPolicy(64, 67_108_864L, 256,
+                            SandboxBackedExecutionService.seccompProfilePath(), ""),
+                    new SandboxMetrics(),
+                    "docker")),
             new OutputComparator(),
             60_000,     // compile timeout: generous, so a cold g++ is not mistaken for a hang
             512,        // compile memory

@@ -1,4 +1,4 @@
-package com.codearena.worker.execution;
+package com.codearena.executor.sandbox;
 
 import com.codearena.shared.Language;
 import org.junit.jupiter.api.Test;

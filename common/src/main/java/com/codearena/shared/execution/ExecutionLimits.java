@@ -1,4 +1,4 @@
-package com.codearena.worker.execution;
+package com.codearena.shared.execution;
 
 /**
  * The budget a single sandboxed run is allowed.
@@ -37,5 +37,23 @@ public record ExecutionLimits(
      */
     public ExecutionLimits forCompilation(long compileMillis, int compileMemoryMb) {
         return new ExecutionLimits(compileMillis, compileMemoryMb, cpus, pids, outputBytes);
+    }
+
+    /**
+     * Narrows every limit to at most the given ceiling.
+     *
+     * <p>Applied by the execution service to whatever a caller asks for, because the caller
+     * is across a trust boundary. A worker that has been taken over can request a
+     * twelve-hour, sixty-four-gigabyte run; it gets the configured maximum instead. Limits
+     * are only ever reduced here, never raised, so a caller asking for less than the ceiling
+     * keeps what it asked for.
+     */
+    public ExecutionLimits clampedTo(ExecutionLimits ceiling) {
+        return new ExecutionLimits(
+                Math.min(wallClockMillis, ceiling.wallClockMillis()),
+                Math.min(memoryMb, ceiling.memoryMb()),
+                Math.min(cpus, ceiling.cpus()),
+                Math.min(pids, ceiling.pids()),
+                Math.min(outputBytes, ceiling.outputBytes()));
     }
 }

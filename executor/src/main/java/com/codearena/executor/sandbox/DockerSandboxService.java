@@ -1,6 +1,9 @@
-package com.codearena.worker.execution;
+package com.codearena.executor.sandbox;
 
 import com.codearena.shared.Language;
+import com.codearena.shared.execution.ExecutionLimits;
+import com.codearena.shared.execution.ExecutionOutcome;
+import com.codearena.shared.execution.ExecutionResult;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -12,7 +15,6 @@ import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Locale;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -20,69 +22,63 @@ import java.util.concurrent.TimeUnit;
 /**
  * Runs untrusted code in disposable Docker containers.
  *
- * <h2>How isolation is achieved</h2>
- * Every run is a fresh container created with, and only with, arguments this class
- * constructs:
- * <ul>
- *   <li>{@code --network none} — no interface but loopback. The program cannot reach
- *       PostgreSQL, Redis, the internet, or anything else on the host.</li>
- *   <li>{@code --memory} with {@code --memory-swap} set equal to it — no swap, so the
- *       limit is real rather than something the kernel pages around.</li>
- *   <li>{@code --cpus} — a fractional quota, so a busy loop cannot starve the host.</li>
- *   <li>{@code --pids-limit} — the defence against fork bombs, which no timeout catches
- *       because the shell never returns.</li>
- *   <li>{@code --cap-drop ALL} and {@code --security-opt no-new-privileges} — no
- *       capabilities, and no way to regain any through setuid.</li>
- *   <li>{@code --read-only} with a small {@code tmpfs} for the working directory — nothing
- *       the program writes survives, and it cannot fill a disk.</li>
- *   <li>{@code --user 65534:65534} — runs as nobody, never root, even inside the container.</li>
- *   <li>No volume from the host, and emphatically no Docker socket. The program has no
- *       path to the daemon that is running it.</li>
- * </ul>
+ * <p>Every security decision lives in {@link SandboxPolicy}; this class is the mechanism
+ * that applies it and collects what happened. The split matters: reviewing the boundary
+ * should not mean reading process plumbing.
  *
  * <h2>How source and artefacts move</h2>
  * A per-submission Docker <em>volume</em> holds the source and any compiled binary. Host
- * bind mounts are deliberately not used: the worker is itself a container, so a path it
+ * bind mounts are deliberately not used: this service is itself a container, so a path it
  * writes to is not the path the daemon would resolve, and making them agree means mounting
- * host directories into the worker — more coupling and more blast radius. A named volume
- * has neither problem, is scoped to one submission, and is deleted with it.
+ * host directories in — more coupling and more blast radius. A named volume has neither
+ * problem, is scoped to one submission, and is deleted with it.
+ *
+ * <p>The source reaches the volume through {@code docker cp} reading a tar stream from
+ * stdin, never through a command line or a shell redirect, so its contents can never be
+ * interpreted as anything but bytes in a file.
+ *
+ * <h2>Why containers are not created with {@code --rm}</h2>
+ * Exit code 137 means "killed by SIGKILL", which for a memory-capped container is usually
+ * the OOM killer but is also what a timeout kill looks like. Telling them apart requires
+ * asking the daemon, and {@code --rm} races the answer away. So containers are removed
+ * explicitly in a {@code finally}, and {@link SandboxReaper} is the backstop for the case
+ * where this process dies between the two.
  *
  * <h2>What this is not</h2>
- * This is a competent sandbox, not a hardened one. Containers share the host kernel, so a
- * kernel exploit escapes. The worker holds the Docker socket and is therefore
- * host-equivalent if the worker itself is compromised. Both are documented in
- * docs/security.md with the hardening that Phase 12 should bring.
+ * This is a hardened sandbox, not a virtual machine. Containers share the host kernel, so a
+ * kernel exploit still escapes. See docs/threat-model.md, which says so in more detail
+ * rather than implying otherwise.
  */
 @Component
-public class DockerExecutionService implements ExecutionService {
+public class DockerSandboxService implements SandboxService {
 
-    private static final Logger log = LoggerFactory.getLogger(DockerExecutionService.class);
+    private static final Logger log = LoggerFactory.getLogger(DockerSandboxService.class);
 
     /** How long a docker CLI call itself may take before we conclude the daemon is wedged. */
     private static final long DAEMON_CALL_TIMEOUT_SECONDS = 60;
 
-    /**
-     * The uid:gid every sandbox runs as — {@code nobody}, which exists in all three language
-     * images and owns nothing. Never root, even inside a container that is already isolated:
-     * defence in depth costs nothing here and a container escape starting from uid 0 is
-     * considerably more useful to an attacker than one starting from 65534.
-     */
-    private static final String SANDBOX_USER = "65534:65534";
+    /** 128 + SIGKILL(9). Ambiguous on its own, which is why {@code OOMKilled} is consulted. */
+    private static final int EXIT_SIGKILL = 137;
 
+    /** 128 + SIGXFSZ(25): the kernel refused a write past {@code RLIMIT_FSIZE}. */
+    private static final int EXIT_FILE_TOO_LARGE = 153;
+
+    private final SandboxPolicy policy;
+    private final SandboxMetrics metrics;
     private final String dockerBinary;
-    private final int workspaceTmpfsMb;
 
-    public DockerExecutionService(
-            @Value("${codearena.execution.docker-binary:docker}") String dockerBinary,
-            @Value("${codearena.execution.workspace-tmpfs-mb:64}") int workspaceTmpfsMb) {
+    public DockerSandboxService(SandboxPolicy policy,
+                                SandboxMetrics metrics,
+                                @Value("${codearena.sandbox.docker-binary:docker}") String dockerBinary) {
+        this.policy = policy;
+        this.metrics = metrics;
         this.dockerBinary = dockerBinary;
-        this.workspaceTmpfsMb = workspaceTmpfsMb;
     }
 
     @Override
     public Workspace prepare(String submissionId, Language language, String source) {
         LanguageSpec spec = LanguageSpec.forLanguage(language);
-        // The volume name is generated here, never derived from user input.
+        // The volume name is generated here, never derived from a caller's input.
         String volume = "codearena-ws-" + UUID.randomUUID();
         DockerWorkspace workspace = new DockerWorkspace(submissionId, spec, volume);
         try {
@@ -90,6 +86,7 @@ public class DockerExecutionService implements ExecutionService {
             return workspace;
         } catch (RuntimeException e) {
             // A half-built workspace still owns a volume; do not leak it.
+            metrics.sandboxCreationFailed();
             workspace.close();
             throw e;
         }
@@ -113,10 +110,6 @@ public class DockerExecutionService implements ExecutionService {
         /**
          * Creates the volume, seeds it with the source, and hands it to the sandbox user.
          *
-         * <p>The source reaches the container through {@code docker cp} on a stopped
-         * container, not through a command line or a shell redirect, so its contents can
-         * never be interpreted as anything but bytes in a file.
-         *
          * <p>The ownership step is not cosmetic. A fresh volume is root-owned and mode 755,
          * so a compiler running as {@code nobody} cannot write its output there and every
          * compiled language fails with a confusing "no such file" from deep inside the
@@ -125,22 +118,24 @@ public class DockerExecutionService implements ExecutionService {
          * what this class is for.
          *
          * <p>The {@code chown} runs as root, but it runs <em>our</em> fixed argv against a
-         * fixed path, before any user code exists in the workspace.
+         * fixed path, in a container with no network and no user code in it, before any
+         * user code exists in the workspace.
          */
         private void create(String source) {
-            runDaemonCommand(List.of(dockerBinary, "volume", "create", volume));
+            runDaemonCommand(List.of(dockerBinary, "volume", "create",
+                    "--label", SandboxPolicy.OWNER_LABEL + "=true", volume));
 
-            // A short-lived helper container: it gives `docker cp` a destination that maps
-            // onto the volume, and then fixes the ownership. It never runs the user's code.
             String seedContainer = "codearena-seed-" + UUID.randomUUID();
             try {
                 runDaemonCommand(List.of(dockerBinary, "create",
                         "--name", seedContainer,
+                        "--label", SandboxPolicy.OWNER_LABEL + "=true",
+                        "--pull", "never",
                         "--network", "none",
                         "-v", volume + ":" + LanguageSpec.WORKDIR,
                         "--entrypoint", "chown",
                         spec.image(),
-                        "-R", SANDBOX_USER, LanguageSpec.WORKDIR));
+                        "-R", SandboxPolicy.SANDBOX_USER, LanguageSpec.WORKDIR));
 
                 copyIntoContainer(seedContainer, spec.sourceFileName(), source);
 
@@ -168,43 +163,16 @@ public class DockerExecutionService implements ExecutionService {
         /**
          * The single place a container carrying user code is created and started.
          *
-         * <p>Every argument in {@code argv} comes from {@link LanguageSpec}; every flag
-         * comes from {@link ExecutionLimits}. No element of this list originates in a
+         * <p>Every argument in {@code argv} comes from {@link LanguageSpec}; every isolation
+         * flag comes from {@link SandboxPolicy}. No element of this list originates in a
          * request, which is why there is no shell and no quoting to get wrong.
          */
         private ExecutionResult runInContainer(List<String> argv, String stdin,
                                                ExecutionLimits limits, boolean readOnlyWorkspace) {
             String container = "codearena-run-" + UUID.randomUUID();
-            List<String> command = new ArrayList<>(List.of(
-                    dockerBinary, "run",
-                    "--name", container,
-                    "--rm",
-                    "-i",
-
-                    // --- isolation ---
-                    "--network", "none",
-                    "--cap-drop", "ALL",
-                    "--security-opt", "no-new-privileges",
-                    "--user", SANDBOX_USER,
-
-                    // --- resource ceilings, enforced by the kernel ---
-                    "--memory", limits.memoryMb() + "m",
-                    "--memory-swap", limits.memoryMb() + "m",
-                    "--cpus", formatCpus(limits.cpus()),
-                    "--pids-limit", String.valueOf(limits.pids()),
-
-                    // --- filesystem ---
-                    "--read-only",
-                    "--tmpfs", "/tmp:rw,noexec,nosuid,size=" + workspaceTmpfsMb + "m",
-                    "-v", volume + ":" + LanguageSpec.WORKDIR + (readOnlyWorkspace ? ":ro" : ""),
-                    "-w", LanguageSpec.WORKDIR,
-
-                    // --- environment ---
-                    // The sandbox inherits nothing. Without this the container would carry
-                    // the image's own variables, and any future worker secret alongside them.
-                    "--env", "HOME=/tmp",
-                    "--entrypoint", argv.getFirst(),
-                    spec.image()));
+            List<String> command = new ArrayList<>(List.of(dockerBinary, "run", "--name", container, "-i"));
+            command.addAll(policy.containerArguments(limits, volume, readOnlyWorkspace, spec.path()));
+            command.addAll(List.of("--entrypoint", argv.getFirst(), spec.image()));
             command.addAll(argv.subList(1, argv.size()));
 
             try {
@@ -213,8 +181,14 @@ public class DockerExecutionService implements ExecutionService {
                 if (e instanceof InterruptedException) {
                     Thread.currentThread().interrupt();
                 }
-                forceKillQuietly(container);
-                return ExecutionResult.infrastructureFailure("Container execution failed: " + e.getClass().getSimpleName());
+                metrics.dockerError();
+                return ExecutionResult.infrastructureFailure(
+                        "Container execution failed: " + e.getClass().getSimpleName());
+            } finally {
+                // Unconditional. Every verdict, every exception, every interruption leaves
+                // through here, which is what makes "no orphaned containers" a property of
+                // the code rather than of the happy path.
+                forceRemoveQuietly(container);
             }
         }
 
@@ -224,20 +198,18 @@ public class DockerExecutionService implements ExecutionService {
                 return;
             }
             closed = true;
-            // Volume removal can fail if a container still holds it; --force is not
-            // available for volumes, so this is best-effort and logged rather than thrown,
-            // because cleanup must never mask the verdict.
             try {
                 runDaemonCommand(List.of(dockerBinary, "volume", "rm", "--force", volume));
             } catch (RuntimeException e) {
+                // Cleanup must never mask a verdict, so this is logged rather than thrown.
+                // The reaper will collect the volume on its next sweep.
+                metrics.cleanupFailed();
                 log.warn("event=WORKSPACE_CLEANUP_FAILED submission={} volume={} reason={}",
                         submissionId, volume, e.toString());
             }
         }
 
         private void copyIntoContainer(String container, String fileName, String content) {
-            // `docker cp -` reads a tar stream from stdin, which keeps the file's contents
-            // entirely off the command line.
             List<String> command = List.of(dockerBinary, "cp", "-",
                     container + ":" + LanguageSpec.WORKDIR);
             try {
@@ -248,16 +220,16 @@ public class DockerExecutionService implements ExecutionService {
                 String output = readAll(process.getInputStream(), 8192);
                 if (!process.waitFor(DAEMON_CALL_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
                     process.destroyForcibly();
-                    throw new ExecutionInfrastructureException("Timed out copying source into the sandbox");
+                    throw new SandboxInfrastructureException("Timed out copying source into the sandbox");
                 }
                 if (process.exitValue() != 0) {
-                    throw new ExecutionInfrastructureException("Could not stage source: " + output);
+                    throw new SandboxInfrastructureException("Could not stage source: " + output);
                 }
             } catch (IOException e) {
-                throw new ExecutionInfrastructureException("Could not stage source: " + e.getClass().getSimpleName());
+                throw new SandboxInfrastructureException("Could not stage source: " + e.getClass().getSimpleName());
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                throw new ExecutionInfrastructureException("Interrupted while staging source");
+                throw new SandboxInfrastructureException("Interrupted while staging source");
             }
         }
     }
@@ -268,8 +240,8 @@ public class DockerExecutionService implements ExecutionService {
      * Runs the container and collects its output under both a time and a size ceiling.
      *
      * <p>stdout and stderr are drained on separate threads. That is not tidiness: a
-     * container whose output fills the pipe buffer blocks forever if nobody is reading,
-     * and the program would hang rather than be judged.
+     * container whose output fills the pipe buffer blocks forever if nobody is reading, and
+     * the program would hang rather than be judged.
      */
     private ExecutionResult execute(List<String> command, String stdin,
                                     ExecutionLimits limits, String containerName)
@@ -298,8 +270,11 @@ public class DockerExecutionService implements ExecutionService {
 
         if (!exited) {
             // The wall-clock budget is the outer bound. Kill the container itself, not just
-            // the CLI client: killing the client would leave the workload running.
-            forceKillQuietly(containerName);
+            // the CLI client: killing the client would leave the workload running. Removing
+            // the container kills every process in its cgroup, so a child that outlived its
+            // parent dies with it.
+            metrics.timedOut();
+            forceRemoveQuietly(containerName);
             process.destroyForcibly();
             return ExecutionResult.killed(ExecutionOutcome.TIMED_OUT,
                     stdout.join().text(), stderr.join().text(), durationMs);
@@ -309,25 +284,57 @@ public class DockerExecutionService implements ExecutionService {
         BoundedOutput err = stderr.join();
 
         if (out.truncated() || err.truncated()) {
-            forceKillQuietly(containerName);
+            metrics.outputLimitExceeded();
+            forceRemoveQuietly(containerName);
             return ExecutionResult.killed(ExecutionOutcome.OUTPUT_LIMIT_EXCEEDED,
                     out.text(), err.text(), durationMs);
         }
 
         int exitCode = process.exitValue();
-        // 137 is 128 + SIGKILL. For a container with a memory ceiling that is
-        // overwhelmingly the OOM killer, which is how memory exhaustion is detected without
-        // a second round trip to `docker inspect` on every single run.
-        if (exitCode == 137) {
-            return ExecutionResult.killed(ExecutionOutcome.OUT_OF_MEMORY,
+
+        if (exitCode == EXIT_SIGKILL) {
+            // Ask rather than assume. A SIGKILL here is usually the OOM killer, but it is
+            // also what a concurrent teardown looks like, and reporting MEMORY_LIMIT_EXCEEDED
+            // for an infrastructure kill would blame the submitter for our own behaviour.
+            if (wasOomKilled(containerName)) {
+                metrics.outOfMemory();
+                return ExecutionResult.killed(ExecutionOutcome.OUT_OF_MEMORY,
+                        out.text(), err.text(), durationMs);
+            }
+        }
+        if (exitCode == EXIT_FILE_TOO_LARGE) {
+            metrics.fileLimitExceeded();
+            return ExecutionResult.killed(ExecutionOutcome.FILE_LIMIT_EXCEEDED,
                     out.text(), err.text(), durationMs);
         }
         return ExecutionResult.completed(exitCode, out.text(), err.text(), durationMs);
     }
 
-    /** Docker wants a plain decimal; the platform's locale must not turn it into a comma. */
-    private String formatCpus(double cpus) {
-        return String.format(Locale.ROOT, "%.2f", cpus);
+    /**
+     * Asks the daemon whether the kernel's OOM killer ended this container.
+     *
+     * <p>A best-effort question: if the container has already gone, or the daemon will not
+     * answer, the caller falls back to reporting a plain non-zero exit. Guessing "out of
+     * memory" from an unavailable answer would be worse than reporting what is certain.
+     */
+    private boolean wasOomKilled(String container) {
+        try {
+            Process process = new ProcessBuilder(List.of(
+                    dockerBinary, "inspect", "--format", "{{.State.OOMKilled}}", container))
+                    .redirectErrorStream(true)
+                    .start();
+            String output = readAll(process.getInputStream(), 256).strip();
+            if (!process.waitFor(DAEMON_CALL_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                process.destroyForcibly();
+                return false;
+            }
+            return process.exitValue() == 0 && "true".equalsIgnoreCase(output);
+        } catch (IOException e) {
+            return false;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
     }
 
     private void runDaemonCommand(List<String> command) {
@@ -336,35 +343,40 @@ public class DockerExecutionService implements ExecutionService {
             String output = readAll(process.getInputStream(), 8192);
             if (!process.waitFor(DAEMON_CALL_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
                 process.destroyForcibly();
-                throw new ExecutionInfrastructureException("Docker command timed out");
+                throw new SandboxInfrastructureException("Docker command timed out");
             }
             if (process.exitValue() != 0) {
-                throw new ExecutionInfrastructureException("Docker command failed: " + output.strip());
+                throw new SandboxInfrastructureException("Docker command failed: " + output.strip());
             }
         } catch (IOException e) {
-            throw new ExecutionInfrastructureException("Docker is unreachable: " + e.getMessage());
+            throw new SandboxInfrastructureException("Docker is unreachable: " + e.getMessage());
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            throw new ExecutionInfrastructureException("Interrupted waiting for Docker");
+            throw new SandboxInfrastructureException("Interrupted waiting for Docker");
         }
     }
 
     /** Best-effort teardown; a failure here must never change a verdict. */
-    private void forceKillQuietly(String container) {
+    private void forceRemoveQuietly(String container) {
         try {
-            new ProcessBuilder(List.of(dockerBinary, "rm", "--force", container))
+            Process process = new ProcessBuilder(List.of(dockerBinary, "rm", "--force", "--volumes", container))
                     .redirectErrorStream(true)
-                    .start()
-                    .waitFor(30, TimeUnit.SECONDS);
+                    .start();
+            if (!process.waitFor(30, TimeUnit.SECONDS)) {
+                process.destroyForcibly();
+                metrics.cleanupFailed();
+                log.warn("event=CONTAINER_CLEANUP_TIMEOUT container={}", container);
+            }
         } catch (IOException e) {
-            log.warn("could not remove container {}: {}", container, e.getMessage());
+            metrics.cleanupFailed();
+            log.warn("event=CONTAINER_CLEANUP_FAILED container={} reason={}", container, e.getMessage());
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
     }
 
     private void removeContainerQuietly(String container) {
-        forceKillQuietly(container);
+        forceRemoveQuietly(container);
     }
 
     private static String readAll(InputStream stream, int limit) {
@@ -375,7 +387,7 @@ public class DockerExecutionService implements ExecutionService {
      * Reads a stream, stopping once the limit is passed.
      *
      * <p>Stopping is the point. A program printing an endless stream would otherwise fill
-     * the worker's heap long before any timeout fired.
+     * this process's heap long before any timeout fired.
      */
     private static BoundedOutput readBounded(InputStream stream, int limit) {
         byte[] buffer = new byte[8192];
@@ -399,12 +411,5 @@ public class DockerExecutionService implements ExecutionService {
     }
 
     private record BoundedOutput(String text, boolean truncated) {
-    }
-
-    /** The judge could not run the code. Distinct from the code running and failing. */
-    public static class ExecutionInfrastructureException extends RuntimeException {
-        public ExecutionInfrastructureException(String message) {
-            super(message);
-        }
     }
 }

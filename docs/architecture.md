@@ -6,14 +6,16 @@
 
 ## Components
 
-CodeArena is deliberately split into four runtime processes rather than one, because
-they have incompatible risk profiles and scaling characteristics.
+CodeArena is deliberately split into five runtime processes rather than one, because they
+have incompatible risk profiles and scaling characteristics — and, in one case, incompatible
+*authority*.
 
 ```mermaid
 flowchart TD
     Browser["Browser<br/>React + TypeScript"]
     API["API server<br/>Spring Boot"]
     Worker["Judge worker<br/>Spring Boot"]
+    Executor["Execution service<br/>holds the Docker socket"]
     PG[("PostgreSQL")]
     Redis[("Redis")]
     Sandbox["Execution sandbox<br/>disposable container"]
@@ -23,12 +25,14 @@ flowchart TD
     API -->|enqueue job| Redis
     Redis -->|dequeue job| Worker
     Worker --> PG
-    Worker -->|create, run, destroy| Sandbox
+    Worker -->|"compile / run<br/>(typed contract, shared secret)"| Executor
+    Executor -->|create, run, destroy| Sandbox
 
     subgraph private["Private network - no internet access"]
         PG
         Redis
         Worker
+        Executor
         Sandbox
     end
 ```
@@ -37,24 +41,38 @@ flowchart TD
 |---|---|---|
 | **Frontend** | Rendering and client-side routing | Static assets; scales and deploys independently of the API |
 | **API server** | REST API, authentication, persistence, enqueuing jobs | Must stay responsive; **never** executes user code |
-| **Judge worker** | Consumes jobs, drives sandboxed execution, records results | CPU-heavy and untrusted-adjacent; scaled by queue depth, not by request rate |
+| **Judge worker** | Consumes jobs, compares output, records verdicts | CPU-light but untrusted-adjacent: it parses program output. Scaled by queue depth, not request rate |
+| **Execution service** | Creates, limits, runs and destroys sandboxes | **Holds the Docker socket.** Separated so that the authority to create containers is not held by anything that also touches the database, the queue or untrusted output |
 | **PostgreSQL** | System of record | Relational, transactional data |
-| **Redis** | Queue, cache, rate-limit counters | Low-latency, non-authoritative state |
+| **Redis** | Queue, notifications | Low-latency, non-authoritative state |
 
-The central architectural rule: **the API server never runs user-submitted code.** A
-submission request writes a row, pushes a job and returns. Everything expensive and
-everything dangerous happens in a worker, behind a queue.
+Two architectural rules hold this together.
+
+**The API server never runs user-submitted code.** A submission request writes a row, pushes
+a job and returns. Everything expensive and everything dangerous happens behind a queue.
+
+**Only one process can create a container.** A Docker socket is host-equivalent, so the
+process holding it does as little as possible: no database, no queue, no user model, four
+typed endpoints, one caller. The worker asks it to "compile and run this source in one of
+three languages within these limits" and cannot express anything else — no image, no mount,
+no capability, no network. A compromised worker therefore inherits that narrow authority
+rather than control of the host. See ADR-028 and
+[threat-model.md](threat-model.md), which also states plainly what this does **not** fix.
 
 ## Networking
 
-`docker-compose.yml` defines two networks:
+`docker-compose.yml` defines three networks:
 
 - `edge` — the frontend and the API server. Ports published to the host come from here.
 - `internal` — PostgreSQL, Redis and the worker, declared `internal: true` so Docker
   attaches no gateway. Containers on it cannot reach the internet and cannot be reached
   from outside the compose project.
+- `sandbox` — also `internal: true`, and carrying exactly one conversation: worker to
+  execution service. The executor is on this network **only**, so the process holding the
+  Docker socket has no route to PostgreSQL or Redis and nothing it holds can be used to go
+  looking for them.
 
-The worker sits only on `internal` and publishes no ports.
+Neither the worker nor the executor publishes a port.
 
 PostgreSQL and Redis publish **no** host ports at all. This is a property of the
 network, not just a policy: Docker cannot set up port publishing for a container whose
@@ -164,15 +182,15 @@ flowchart TD
     Sweeper --> PG
     Redis -->|"BLMOVE"| Worker["Judge worker"]
     Worker -->|"atomic claim"| PG
-    Worker --> Exec["ExecutionService"]
-    Exec --> Sandbox["Sandbox container<br/>network none · caps dropped<br/>cpu · memory · pids capped"]
+    Worker -->|"HTTP + shared secret"| Exec["Execution service<br/>(the only holder of<br/>the Docker socket)"]
+    Exec --> Sandbox["Sandbox container<br/>network none · caps dropped · seccomp<br/>cpu · memory · pids · fsize capped<br/>read-only · nobody · no host mount"]
     Worker -->|"verdict"| PG
     Worker -->|"PUBLISH (notification)"| Events[("Redis: pub/sub")]
     Events --> API
     API -->|"re-read, then SSE"| Browser["Browser"]
 ```
 
-Three properties hold this together:
+Four properties hold this together:
 
 - **The submission row is the outbox.** Creating a submission and recording that it needs
   queueing are one INSERT, so there is no state in which one exists without the other.
@@ -180,6 +198,25 @@ Three properties hold this together:
   so duplicate delivery is a no-op rather than a double execution.
 - **Terminal is terminal.** Nothing leaves a verdict, so a straggling worker cannot
   overwrite a newer result.
+- **The worker cannot create a container.** It asks the execution service to, over a contract
+  with no field for an image, a mount, a capability or a network, and with limits clamped on
+  arrival. The worker image contains no Docker client at all.
+
+### The sandbox boundary
+
+Everything about a sandbox container is decided in one class, `SandboxPolicy`, so that the
+security boundary can be read on one screen rather than reconstructed from the middle of
+process-handling code. `SandboxPolicyTest` asserts the argument list; `SandboxSecurityIT`
+asserts the behaviour by running real malicious programs — a fork bomb, an allocation storm,
+a network probe, an environment dump, a privilege-escalation attempt — and checking what
+actually happened. Only the second kind is evidence: a flag in a list proves nothing about
+the kernel.
+
+Cleanup is layered, because a `finally` cannot cover a process that is killed. Containers and
+volumes are removed on every path out of an execution; `WorkspaceRegistry` closes workspaces
+whose caller vanished and closes all of them on shutdown; `SandboxReaper` sweeps strays by
+label at startup and on a timer, constructed so that it can never remove a live execution's
+resources.
 
 The worker uses plain JDBC rather than the API's JPA entities (ADR-022), and the two
 services share only `Language`, `SubmissionStatus` and the event record — the rules both

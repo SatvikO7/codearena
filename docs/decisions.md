@@ -803,3 +803,197 @@ container's async bookkeeping, which is not worth the coupling.
 completes every registered emitter, and that the registry's phase sits strictly above
 `WebServerGracefulShutdownLifecycle.SMART_LIFECYCLE_PHASE` — so a Spring Boot upgrade that
 moves that constant fails the build rather than silently restoring the stall.
+
+---
+
+## ADR-028 — A separate execution service holds the Docker socket
+
+**Problem.** Running untrusted code in disposable containers requires talking to a container
+runtime, and a Docker socket is host-equivalent: anything holding one can start a privileged
+container that mounts the host filesystem. Until Phase 6 the holder was the judge worker —
+the same process that parses untrusted program output, connects to PostgreSQL and Redis, and
+carries the judging logic. Any remote-code-execution bug anywhere in the worker was therefore
+a host compromise. ADR-020 named this as the largest piece of unhardened surface in the
+system and deferred it.
+
+**Options.**
+
+1. Leave it, and document the risk again.
+2. A Docker socket proxy restricting the HTTP API surface.
+3. Rootless Docker.
+4. A dedicated execution service exposing a narrow, typed contract.
+
+**Chosen.** Option 4. A new `executor` module holds the socket and exposes four operations:
+prepare a workspace for one of three languages, compile it, run it, discard it.
+
+**Why.** The question is not whether *something* holds the socket — something must — but how
+much else that something does, and what authority a caller inherits by compromising the
+caller.
+
+A **socket proxy** (option 2) was considered seriously and rejected on the merits. Proxies of
+this kind filter by endpoint and method, not by request body, and the worker genuinely needs
+`POST /containers/create`. A caller that can create containers can create one with a bind
+mount of `/`, so the proxy would block image builds and `exec` while leaving the actual
+escape route open. It looks like a fix and is not one.
+
+**Rootless Docker** (option 3) is a genuine fix and remains the right long-term answer, but
+it is a deployment change that breaks the standard Docker Desktop setup this project is
+developed against. It is named in the threat model as future work rather than quietly
+skipped.
+
+The contract is what makes option 4 worth the extra service:
+
+```java
+record PrepareRequest(String submissionId, Language language, String source)
+record CompileRequest(ExecutionLimits limits)
+record RunRequest(String stdin, ExecutionLimits limits)
+```
+
+There is no field for an image, a mount, a capability, a network, a user, an entrypoint or a
+device. `Language` is an enum, so the image is chosen by the executor from a fixed table.
+Limits are clamped server-side, so a caller asking for a twelve-hour, sixty-four-gigabyte run
+gets the configured maximum. A worker compromised completely inherits *this*, which is "can
+ask for a sandboxed program to be run" — not host control.
+
+The executor is kept deliberately dull for the same reason: no database driver, no Redis
+client, no security starter, no user model, one caller, one shared secret. The less it does,
+the less there is to take. Its dependency list is short on purpose and each absence is noted
+in the pom.
+
+**Trade-off.** One more service to deploy, one more hop per execution, one more shared secret
+to manage, and a stateful HTTP contract (prepare/compile/run/close) that needs idle-timeout
+and shutdown handling so a vanished caller cannot strand a volume. Measured overhead is a few
+milliseconds per call against executions that take hundreds; the cost is real but small
+against what it buys.
+
+**What this does NOT fix, stated plainly.** Whatever holds the socket is host-equivalent if
+*it* is compromised. That is now the executor. The surface has been made much smaller, not
+zero. See docs/threat-model.md §7.1.
+
+---
+
+## ADR-029 — A custom seccomp allowlist, built from observed requirements
+
+**Problem.** Docker's default seccomp profile is good but general: it is designed for
+arbitrary workloads, and permits syscalls a judge has no use for. `ptrace` is the clearest
+example — it is not capability-gated between processes of the same user, so dropping
+capabilities does not block it.
+
+**Options.** Keep the default; add a denylist; replace it with an allowlist.
+
+**Chosen.** Replace it with a narrower allowlist (`sandbox/seccomp/codearena.json`).
+
+**Why an allowlist.** Docker has no notion of layering profiles — supplying one replaces the
+default entirely — so the choice is really allowlist versus denylist. A denylist lets a
+syscall added by a future kernel through by default, which is exactly the failure mode that
+matters for a sandbox. An allowlist fails closed.
+
+**How it was built.** From observed requirements, as the only way that works: an allowlist
+assembled from intuition breaks real programs in ways that look like judge bugs. The list was
+validated by compiling and running real C++, Java and Python workloads under it, and the
+language tests keep validating it — remove a needed syscall and the build fails rather than
+the submissions.
+
+**Evidence it is doing something.** `seccompDeniesSyscallsTheDefaultProfileAllows` asserts
+`ptrace` returns `EPERM`. Under the daemon default the same call returns 0 (measured). So the
+test fails if the profile is ever silently not applied — which is the failure worth catching,
+since a missing profile degrades quietly by design.
+
+**Why networking syscalls are allowed.** `socket`, `connect`, `sendto` and the rest are in
+the allowlist. Network isolation comes from `--network none`, which gives the container no
+interface to use — a stronger and far less brittle control than syscall filtering, since both
+the JVM and CPython create sockets during ordinary startup. A `connect()` in this sandbox
+fails because there is nowhere to connect to, and a test proves it by trying.
+
+**Trade-off.** An allowlist can break a future program that needs a syscall nobody thought
+to include, and the symptom (`EPERM` from deep inside a runtime) is confusing. The mitigation
+is that the profile path is configurable and the language tests exercise all three
+toolchains. If the file cannot be read the sandbox falls back to the daemon default — weaker
+than ours, but still an allowlist, never "no filtering" — and logs a warning and reports it
+on the health endpoint rather than degrading in silence.
+
+---
+
+## ADR-030 — Sandbox images are built here, pinned by digest, and stripped
+
+**Problem.** The sandbox images were upstream tags — `gcc:13-bookworm`,
+`eclipse-temurin:21-jdk-alpine`, `python:3.12-alpine` — pulled at need. Three problems: tags
+move, so the environment submissions run in changed without anyone deciding; the images carry
+a great deal that a judge has no use for; and pulling at judging time means judging depends
+on a registry.
+
+**Chosen.** Build our own from `sandbox/*.Dockerfile`, pin the bases **by digest**, strip
+what a compiler does not need, and create containers with `--pull never`.
+
+**Why by digest.** A tag is a moving target: the same `gcc:13-bookworm` is rebuilt with new
+package versions. An image that changes underneath the judge changes what programs are
+compiled against, which is a verdict-affecting change nobody reviewed. Updating a digest is a
+deliberate edit.
+
+**What is stripped, and why it is worth doing.** Package managers, network and remote-access
+tooling, account-management tooling, documentation and caches — and **every setuid/setgid
+bit**. The Debian gcc base ships thirteen setuid binaries including `su`, `mount`, `passwd`
+and `ssh-keysign`.
+
+`no-new-privileges` already prevents a setuid binary from raising privilege, so this is
+defence in depth rather than the only control. It is still worth doing: a sandbox has no use
+for any of them, and the cheapest way to not be exploited through a program is to not ship
+the program.
+
+The build **asserts** rather than hopes. Each Dockerfile fails if any setuid bit survives,
+and each exercises its toolchain afterwards — so an image stripped past the point of working
+fails to build instead of failing every submission.
+
+**Why `--pull never`.** Judging must not reach a registry: it is a network dependency in the
+one path that is supposed to have no network, and a slow or hostile registry becomes a
+judging outage. A missing image is therefore a hard failure, which the health indicator
+reports at startup so somebody who forgets `sandbox/build-images.sh` finds out immediately
+rather than through a run of failed submissions.
+
+**Trade-off.** A build step before a fresh clone can judge anything, and three image
+definitions to maintain and update. The C++ image is still large (~2 GB) because a full GCC
+toolchain is large; splitting compile and run images would shrink the run image
+substantially, and is not done here.
+
+---
+
+## ADR-031 — Disk is bounded by what the kernel actually enforces
+
+**Problem.** A submission that writes until the disk is full denies the judge to everybody.
+Phase 4 bounded `/tmp` with a sized tmpfs, but the workspace volume had no bound at all.
+
+**Options.** `--storage-opt size`; a filesystem quota; `RLIMIT_FSIZE`; accounting after the
+fact.
+
+**Chosen.** A read-only workspace during runs, a size-capped tmpfs as the only writable
+filesystem, and `RLIMIT_FSIZE` as a hard per-file ceiling. Explicitly **not**
+`--storage-opt`.
+
+**Why not `--storage-opt size`.** It is the obvious control and it does not work here. This
+daemon accepts the flag and silently does not enforce it: a container capped at 64 MB wrote a
+100 MB file successfully, because overlayfs on this host has no project quota. Configuring it
+would produce something that reads like a disk limit in every review and is nothing of the
+kind — worse than leaving it out, because it stops anyone looking further.
+
+**What actually holds.** At run time the workspace is mounted read-only and the only writable
+filesystem is a tmpfs whose pages are charged to the container's memory cgroup — so filling
+it is an OOM kill, and the host disk is never touched at all. During compilation the
+workspace must be writable, and there the bound is `RLIMIT_FSIZE` per file plus the compile
+timeout.
+
+`RLIMIT_FSIZE` is a real kernel limit: exceeding it raises SIGXFSZ. That produces exit code
+153, which is mapped to its own execution outcome and then to a `RUNTIME_ERROR` (or a
+`COMPILATION_ERROR`) explaining what happened — "exited with signal 25" explains nothing to
+the person who has to fix it.
+
+**Why `--ulimit nproc` is not set, while `--pids-limit` is.** RLIMIT_NPROC counts processes
+per *uid across the whole host*, and every sandbox runs as the same uid 65534. Setting it
+would let one submission's processes count against a concurrent submission's budget — two
+runs interfering with each other, which is the exact opposite of what the isolation is for.
+`--pids-limit` is the correct control because it is per-cgroup.
+
+**Trade-off, stated rather than hidden.** Total bytes written during compilation is bounded
+only indirectly. A filesystem with project quotas (XFS with `prjquota`, btrfs, ZFS) would
+allow a real per-container limit; that is a deployment property rather than a code change,
+and it is recorded in docs/threat-model.md §7.3 as a residual limitation rather than a solved
+problem.

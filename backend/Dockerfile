@@ -12,6 +12,7 @@ COPY pom.xml ./
 COPY common/pom.xml common/
 COPY backend/pom.xml backend/
 COPY worker/pom.xml worker/
+COPY executor/pom.xml executor/
 # Warms the dependency cache so a source-only change does not re-download the world.
 # Deliberately non-fatal: go-offline also tries to resolve optional artefacts from
 # third-party repositories, and a transient failure there must not break the build -
@@ -20,6 +21,10 @@ RUN mvn -B -pl backend -am dependency:go-offline || true
 
 COPY common/src common/src
 COPY backend/src backend/src
+# The executor's sources are copied because the reactor builds it: the worker
+# test-depends on it (JudgeVerdictIT drives a real sandbox). Nothing from it ends up in
+# this image -- only the worker jar is copied into the runtime stage below.
+COPY executor/src executor/src
 RUN mvn -B -pl backend -am clean package -DskipTests
 
 # -----------------------------------------------------------------------------
