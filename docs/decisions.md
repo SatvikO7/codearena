@@ -1130,3 +1130,151 @@ is one nobody has taken part in.
 **Trade-off.** Cancelled contests accumulate. They are cheap, they are visible to the people
 who registered for them, and a platform that quietly erases a contest somebody competed in is
 worse than one with a few dead rows.
+
+---
+
+## ADR-036 — An audit log, not an event store
+
+**Problem.** Phase 3 deferred a formal audit log, leaving only `createdBy`/`updatedBy`
+attribution on a few entities. That answers "who last touched this" and nothing else: it
+cannot say what changed, when, who tried and failed, or who was refused.
+
+**Options.** Extend attribution columns; adopt event sourcing, with domain state derived from
+an event stream; or add a separate append-only table of recorded events.
+
+**Chosen.** A separate `audit_events` table. Domain state stays exactly where it is.
+
+**Why not event sourcing.** It is the tempting answer and it is the wrong one here. Making
+the event stream authoritative would mean rewriting every aggregate in the system — users,
+problems, contests, submissions, scoring — replacing direct state with projections, and
+inheriting the whole apparatus of snapshots, replay, versioned events and schema evolution.
+The brief rules it out explicitly, but it would be wrong even without that: the existing
+model is not the problem being solved. Nothing about "who published this contest" requires
+the contest itself to be a fold over events.
+
+So the direction of dependency is one-way, and stated in the migration: **audit events
+describe changes; they never define them.** Deleting every row would lose the history of who
+did what and change no password, no problem's status and no verdict.
+
+**What follows from that.** Audit rows carry no foreign keys. Both `actor_user_id` and
+`entity_id` are plain values, because a record must outlive the thing it describes — a
+foreign key has to do *something* when its target is deleted, and CASCADE erases exactly the
+history worth keeping. `actor_username` is denormalised for the same reason: a join that
+returns nothing is not an answer to "who did this".
+
+**Taxonomy.** Actions are business events, not method calls. Reads are absent entirely: they
+are the bulk of traffic, they change nothing, and auditing them produces a log so noisy the
+events that matter cannot be found. That failure mode — an audit log nobody can use — is more
+likely than the one where a missing read event mattered.
+
+**Trade-off.** The log is not a complete record of everything that happened, and cannot
+reconstruct state. Both are deliberate.
+
+---
+
+## ADR-037 — Audit consistency: success in the transaction, failure outside it
+
+**Problem.** When should an audit event be written relative to the change it describes, and
+what happens if the audit write itself fails?
+
+**Options.** Write before the mutation; write after commit; publish asynchronously; write
+inside the mutation's transaction.
+
+**Chosen.** Two modes, chosen per event kind.
+
+**Administrative mutations join the caller's transaction** (`Propagation.MANDATORY`). The
+event and the change commit together or not at all, which buys both directions:
+
+- A rolled-back mutation leaves no record claiming it happened. Writing beforehand, or
+  publishing asynchronously, produces a log that confidently describes changes which never
+  occurred — worse than no log, because it is believed.
+- A mutation cannot commit without its audit row. If the audit write fails, the transaction
+  fails. For a security-critical administrative change, "it succeeded but we cannot say who
+  did it" is not acceptable, so the audit write is allowed to veto the mutation.
+
+The second direction is the deliberate one. Swallowing the failure would give a system that
+*appears* audited and is not, which is the worst of the available outcomes.
+
+`MANDATORY` rather than `REQUIRED` so that calling it outside a transaction fails
+immediately and loudly, rather than committing a lone row that survives a rollback — a
+mistake that would otherwise be discovered during an incident.
+
+**Failures and denials use their own transaction** (`REQUIRES_NEW`). A failed login changes
+nothing and ends in a 401 thrown from a controller; a denied request is refused by a servlet
+filter before any transaction exists. Joining a rolling-back transaction would discard
+precisely the record worth keeping, since a burst of failed logins is the clearest attack
+signal this system produces.
+
+There a database failure is logged at ERROR and swallowed. The alternative turns a failed
+login into a 500 and hands an attacker an oracle: a real account and an imaginary one would
+fail differently.
+
+> **The trade, stated rather than assumed: a lost failure-audit row is possible; a lost
+> success-audit row is not.**
+
+**No message bus.** Kafka or an outbox would add a second durability story and a window in
+which a mutation is committed and its event is not. The transactional write has neither, and
+this system already uses the one-row-one-truth pattern for submissions (ADR-018).
+
+**Immutability is enforced three times**: the entity is `@Immutable`, no repository method or
+endpoint mutates, and a database trigger raises on UPDATE and DELETE. The third matters
+because the row most worth tampering with is the one recording the tamperer, and "the code
+does not do that" is a weaker guarantee than "the database refuses".
+
+That trigger also settles a question the design would otherwise have to answer badly: it is
+what made a foreign key on the actor impossible, since `ON DELETE SET NULL` is an UPDATE. The
+constraint and the invariant could not both exist, and the invariant is worth more.
+
+**Trade-off.** An administrative mutation now depends on a second insert succeeding, so a
+database at its connection limit fails the mutation rather than proceeding unaudited. That is
+the intended behaviour and worth stating plainly.
+
+---
+
+## ADR-038 — A curated operational endpoint, not an Actuator dump
+
+**Problem.** An administrator needs to know whether the system is working: are the
+dependencies up, is the queue draining, what is deployed. Spring Actuator already exposes
+far more than that.
+
+**Options.** Expose Actuator broadly and rely on role checks; expose a filtered subset of
+Actuator; write a curated endpoint.
+
+**Chosen.** A hand-written `GET /api/admin/system/status`, with Actuator kept to `health` and
+`info`.
+
+**Why.** Actuator's endpoints are a superset of what an administrator needs and of what is
+safe to show. `/env` and `/configprops` list every property, including the database password
+and the executor token; `/heapdump` hands over process memory. Restricting them to ADMIN is
+necessary but not sufficient — "an administrator could read the database password from a web
+page" is a poor default, and a filter is a rule somebody can forget to update when a new
+endpoint appears.
+
+A curated endpoint inverts that: adding a field is a deliberate act. It reports whether each
+dependency answered and how quickly, the queue depths, the version and the audit count — and
+carries no credentials, no connection strings, no environment variables and no paths, because
+none were put in.
+
+**A finding this produced.** `management.endpoint.health.show-details` was `always`, and
+`/actuator/health` is unauthenticated by necessity — health checks have no credentials. Any
+caller could read the Redis version (`7.4.11`), the database engine, the container's
+filesystem path and the host's free disk space. A precise dependency version is a gift to
+somebody matching CVEs against a target. It is now `when-authorized` with `roles: ADMIN`: the
+bare status stays public, which is all the compose probes read, and the breakdown needs a
+session.
+
+**Three kinds of health, kept distinct.** Liveness answers "should this be restarted",
+readiness answers "can it serve traffic", and both must stay unauthenticated for an
+orchestrator to use them. The operational view answers "what is going on" for a human, is
+authenticated, and is deliberately *not* wired into any health check — a view an orchestrator
+depends on stops being free to change.
+
+**What it does not report, and why.** Worker liveness. The API server has no network route to
+the worker, which sits on `internal` and `sandbox`. Reporting "unknown" would be honest but
+useless; reporting "up" without checking would be worse. The queue depths are the honest
+proxy — a rising pending count against a static processing count is what a stopped worker
+looks like from here — and a real heartbeat means workers writing to a shared store, which
+belongs with queue observability rather than here.
+
+**Trade-off.** The endpoint must be extended by hand as the system grows, and will lag behind
+what Actuator would have offered automatically. That lag is the feature.

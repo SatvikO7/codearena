@@ -1,6 +1,11 @@
 package com.codearena.problem;
 
 import com.codearena.common.ConflictException;
+import com.codearena.audit.AuditAction;
+import com.codearena.audit.AuditEntityType;
+import com.codearena.audit.AuditMetadata;
+import com.codearena.audit.AuditOutcome;
+import com.codearena.audit.AuditService;
 import com.codearena.common.PageResponse;
 import com.codearena.common.ResourceNotFoundException;
 import com.codearena.common.ValidationException;
@@ -46,10 +51,14 @@ public class ProblemAdminService {
 
     private final ProblemRepository problemRepository;
     private final UserRepository userRepository;
+    private final AuditService auditService;
 
-    public ProblemAdminService(ProblemRepository problemRepository, UserRepository userRepository) {
+    public ProblemAdminService(ProblemRepository problemRepository,
+                               UserRepository userRepository,
+                               AuditService auditService) {
         this.problemRepository = problemRepository;
         this.userRepository = userRepository;
+        this.auditService = auditService;
     }
 
     // ------------------------------------------------------------------- queries
@@ -85,6 +94,19 @@ public class ProblemAdminService {
         applyContent(problem, request, actor);
 
         Problem saved = persist(problem, slug);
+
+        // In this method's transaction, so the problem and the record of its creation
+        // commit together. Metadata is curated: identifiers and the difficulty, never the
+        // statement and emphatically never the test cases.
+        auditService.record(AuditAction.PROBLEM_CREATE, AuditOutcome.SUCCESS,
+                AuditEntityType.PROBLEM, saved.getPublicId().toString(),
+                AuditMetadata.of()
+                        .put("slug", saved.getSlug())
+                        .put("title", saved.getTitle())
+                        .put("difficulty", saved.getDifficulty())
+                        .put("status", saved.getStatus())
+                        .build());
+
         log.info("admin action=PROBLEM_CREATED actor={} problem={} slug={}",
                 actor.getUsername(), saved.getPublicId(), saved.getSlug());
         return AdminProblemDetailResponse.from(saved);
@@ -110,6 +132,14 @@ public class ProblemAdminService {
         applyContent(problem, request, actor);
 
         Problem saved = persist(problem, problem.getSlug());
+
+        auditService.record(AuditAction.PROBLEM_UPDATE, AuditOutcome.SUCCESS,
+                AuditEntityType.PROBLEM, saved.getPublicId().toString(),
+                AuditMetadata.of()
+                        .put("slug", saved.getSlug())
+                        .put("status", saved.getStatus())
+                        .build());
+
         log.info("admin action=PROBLEM_UPDATED actor={} problem={} status={}",
                 actor.getUsername(), saved.getPublicId(), saved.getStatus());
         return AdminProblemDetailResponse.from(saved);
@@ -118,29 +148,39 @@ public class ProblemAdminService {
     // ----------------------------------------------------------------- lifecycle
 
     public AdminProblemDetailResponse publish(UUID problemId, UUID actorPublicId) {
-        return transition(problemId, actorPublicId, "PROBLEM_PUBLISHED", Problem::publish);
+        return transition(problemId, actorPublicId, AuditAction.PROBLEM_PUBLISH, Problem::publish);
     }
 
     public AdminProblemDetailResponse unpublish(UUID problemId, UUID actorPublicId) {
-        return transition(problemId, actorPublicId, "PROBLEM_UNPUBLISHED", Problem::unpublish);
+        return transition(problemId, actorPublicId, AuditAction.PROBLEM_UNPUBLISH, Problem::unpublish);
     }
 
     public AdminProblemDetailResponse archive(UUID problemId, UUID actorPublicId) {
-        return transition(problemId, actorPublicId, "PROBLEM_ARCHIVED", Problem::archive);
+        return transition(problemId, actorPublicId, AuditAction.PROBLEM_ARCHIVE, Problem::archive);
     }
 
     public AdminProblemDetailResponse restore(UUID problemId, UUID actorPublicId) {
-        return transition(problemId, actorPublicId, "PROBLEM_RESTORED", Problem::restoreToDraft);
+        return transition(problemId, actorPublicId, AuditAction.PROBLEM_RESTORE, Problem::restoreToDraft);
     }
 
     private AdminProblemDetailResponse transition(UUID problemId, UUID actorPublicId,
-                                                  String action, LifecycleOperation operation) {
+                                                  AuditAction action, LifecycleOperation operation) {
         User actor = requireActor(actorPublicId);
         Problem problem = require(problemId);
+        ProblemStatus previous = problem.getStatus();
 
         // The entity enforces which moves are legal and, for publication, whether the
         // content is complete. This method only records who asked.
         operation.apply(problem, actor);
+
+        // The transition itself is the whole point of the record: a problem's visibility
+        // changing is what somebody would later want to account for.
+        auditService.record(action, AuditOutcome.SUCCESS,
+                AuditEntityType.PROBLEM, problem.getPublicId().toString(),
+                AuditMetadata.of()
+                        .put("slug", problem.getSlug())
+                        .transition(previous, problem.getStatus())
+                        .build());
 
         log.info("admin action={} actor={} problem={} status={}",
                 action, actor.getUsername(), problem.getPublicId(), problem.getStatus());
@@ -300,9 +340,4 @@ public class ProblemAdminService {
         return text.toString();
     }
 
-    /** Exposed for tests that assert the transition vocabulary stays in step with the enum. */
-    public static List<String> auditedActions() {
-        return List.of("PROBLEM_CREATED", "PROBLEM_UPDATED", "PROBLEM_PUBLISHED",
-                "PROBLEM_UNPUBLISHED", "PROBLEM_ARCHIVED", "PROBLEM_RESTORED");
-    }
 }

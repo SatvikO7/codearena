@@ -18,6 +18,8 @@ import { AdminProblemsPage } from './pages/admin/AdminProblemsPage';
 import { AdminProblemFormPage } from './pages/admin/AdminProblemFormPage';
 import { AdminContestsPage } from './pages/admin/AdminContestsPage';
 import { AdminContestDetailPage } from './pages/admin/AdminContestDetailPage';
+import { AdminAuditPage } from './pages/admin/AdminAuditPage';
+import { AdminSystemPage } from './pages/admin/AdminSystemPage';
 import { NotFoundPage } from './pages/NotFoundPage';
 
 export default function App() {
@@ -57,6 +59,11 @@ export default function App() {
               <Route path="admin/problems/:problemId" element={<AdminProblemFormPage />} />
               <Route path="admin/contests" element={<AdminContestsPage />} />
               <Route path="admin/contests/:contestId" element={<AdminContestDetailPage />} />
+              {/* Administrative-only, and reachable only from the admin navigation:
+                  the audit log and the operational view are not part of the normal
+                  user surface. The server authorises independently. */}
+              <Route path="admin/audit" element={<AdminAuditPage />} />
+              <Route path="admin/system" element={<AdminSystemPage />} />
             </Route>
 
             <Route path="*" element={<NotFoundPage />} />

@@ -1,9 +1,14 @@
 package com.codearena.auth;
 
+import com.codearena.audit.AuditAction;
+import com.codearena.audit.AuditMetadata;
+import com.codearena.audit.AuditOutcome;
+import com.codearena.audit.AuditService;
 import com.codearena.common.ApiErrorResponse;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.http.MediaType;
 import org.springframework.security.access.AccessDeniedException;
 import org.springframework.security.core.AuthenticationException;
@@ -32,10 +37,23 @@ public class SecurityErrorResponder implements AuthenticationEntryPoint, AccessD
     public static final String AUTHENTICATION_REQUIRED = "AUTHENTICATION_REQUIRED";
     public static final String ACCESS_DENIED = "ACCESS_DENIED";
 
-    private final ObjectMapper objectMapper;
+    /** Only denials on this prefix are audited; see {@link #handle}. */
+    private static final String ADMIN_PREFIX = "/api/admin/";
 
-    public SecurityErrorResponder(ObjectMapper objectMapper) {
+    private final ObjectMapper objectMapper;
+    private final ObjectProvider<AuditService> auditService;
+
+    /**
+     * The audit service is injected lazily.
+     *
+     * <p>This component is part of the security filter chain, which Spring builds early;
+     * asking for a transactional service directly creates a dependency cycle between the
+     * security configuration and the persistence layer. An {@link ObjectProvider} defers
+     * the lookup to the moment a denial actually happens.
+     */
+    public SecurityErrorResponder(ObjectMapper objectMapper, ObjectProvider<AuditService> auditService) {
         this.objectMapper = objectMapper;
+        this.auditService = auditService;
     }
 
     /** No credentials, or credentials that did not establish a session. */
@@ -46,10 +64,32 @@ public class SecurityErrorResponder implements AuthenticationEntryPoint, AccessD
                 "Authentication is required to access this resource");
     }
 
-    /** Authenticated, but the role does not permit this operation. */
+    /**
+     * Authenticated, but the role does not permit this operation.
+     *
+     * <p>Denials on the <b>administrative</b> surface are audited. One is a misclick; a
+     * pattern of them is somebody probing what they can reach, and that is precisely what
+     * the audit log exists to make visible.
+     *
+     * <p>Denials elsewhere are not audited. They are ordinary authorisation working as
+     * designed on the normal API, and recording every one of them would bury the
+     * administrative denials that matter under noise — the failure mode that makes an audit
+     * log unusable rather than merely large.
+     *
+     * <p>Recorded in its own transaction: this runs in a servlet filter, before any
+     * transaction exists, and the request is about to end in a 403 regardless.
+     */
     @Override
     public void handle(HttpServletRequest request, HttpServletResponse response,
                        AccessDeniedException accessDeniedException) throws IOException {
+        if (request.getRequestURI() != null && request.getRequestURI().startsWith(ADMIN_PREFIX)) {
+            auditService.ifAvailable(service -> service.recordIndependently(
+                    AuditAction.ADMIN_ACCESS_DENIED, AuditOutcome.DENIED, null, null,
+                    AuditMetadata.of()
+                            .put("method", request.getMethod())
+                            .put("path", request.getRequestURI())
+                            .build()));
+        }
         write(request, response, HttpServletResponse.SC_FORBIDDEN, ACCESS_DENIED,
                 "You do not have permission to access this resource");
     }

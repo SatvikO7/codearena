@@ -1,5 +1,11 @@
 package com.codearena.user;
 
+import com.codearena.audit.ActorType;
+import com.codearena.audit.AuditAction;
+import com.codearena.audit.AuditEntityType;
+import com.codearena.audit.AuditMetadata;
+import com.codearena.audit.AuditOutcome;
+import com.codearena.audit.AuditService;
 import com.codearena.auth.PasswordPolicy;
 import com.codearena.auth.dto.RegistrationRequest;
 import com.codearena.common.ConflictException;
@@ -34,13 +40,16 @@ public class UserRegistrationService {
     private final UserRepository userRepository;
     private final PasswordEncoder passwordEncoder;
     private final PasswordPolicy passwordPolicy;
+    private final AuditService auditService;
 
     public UserRegistrationService(UserRepository userRepository,
                                    PasswordEncoder passwordEncoder,
-                                   PasswordPolicy passwordPolicy) {
+                                   PasswordPolicy passwordPolicy,
+                                   AuditService auditService) {
         this.userRepository = userRepository;
         this.passwordEncoder = passwordEncoder;
         this.passwordPolicy = passwordPolicy;
+        this.auditService = auditService;
     }
 
     @Transactional
@@ -67,6 +76,19 @@ public class UserRegistrationService {
 
         try {
             User saved = userRepository.saveAndFlush(user);
+
+            // Inside the same transaction as the insert: an account cannot come into
+            // existence without the record of its creation, and a registration that rolls
+            // back cannot leave behind a record claiming it happened.
+            //
+            // The actor is the new account itself, passed explicitly because there is no
+            // session yet -- registration deliberately does not log anybody in. The id is
+            // one the server has just generated, never anything from the request.
+            auditService.recordFor(saved.getPublicId(), saved.getUsername(), ActorType.USER,
+                    AuditAction.AUTH_REGISTER, AuditOutcome.SUCCESS,
+                    AuditEntityType.USER, saved.getPublicId().toString(),
+                    AuditMetadata.of().put("role", saved.getRole()).build());
+
             log.info("Registered user publicId={} role={}", saved.getPublicId(), saved.getRole());
             return saved;
         } catch (DataIntegrityViolationException e) {

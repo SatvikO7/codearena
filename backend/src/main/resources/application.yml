@@ -90,12 +90,26 @@ management:
   endpoints:
     web:
       exposure:
-        # Only health and info are exposed. Actuator is further restricted to
-        # administrators once Spring Security is introduced in Phase 2.
+        # Health and info only. Everything else -- env, configprops, heapdump, loggers --
+        # stays unexposed: the security rules restrict /actuator/** to ADMIN, but an
+        # endpoint that can print the database password should not be reachable at all.
+        # The curated admin view is /api/admin/system/status instead.
         include: health,info
   endpoint:
     health:
-      show-details: always
+      # Details for administrators only.
+      #
+      # `always` was disclosing the Redis version, the database engine, the container's
+      # filesystem path and the host's free disk space to ANY caller -- /actuator/health is
+      # unauthenticated by necessity, because container health checks and orchestrators
+      # have no credentials. A precise dependency version is a gift to somebody matching
+      # CVEs against a target.
+      #
+      # `when-authorized` keeps the bare status public, which is all a health check reads
+      # (the compose probes use wget --spider and look only at the status code), while the
+      # component breakdown needs an administrator session.
+      show-details: when-authorized
+      roles: ADMIN
       probes:
         enabled: true
   health:

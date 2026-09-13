@@ -1,5 +1,10 @@
 package com.codearena.contest;
 
+import com.codearena.audit.AuditAction;
+import com.codearena.audit.AuditEntityType;
+import com.codearena.audit.AuditMetadata;
+import com.codearena.audit.AuditOutcome;
+import com.codearena.audit.AuditService;
 import com.codearena.common.ConflictException;
 import com.codearena.common.PageResponse;
 import com.codearena.common.ResourceNotFoundException;
@@ -55,6 +60,7 @@ public class ContestAdminService {
     private final ProblemRepository problemRepository;
     private final SubmissionRepository submissionRepository;
     private final UserRepository userRepository;
+    private final AuditService auditService;
     private final Clock clock;
 
     public ContestAdminService(ContestRepository contestRepository,
@@ -63,6 +69,7 @@ public class ContestAdminService {
                                ProblemRepository problemRepository,
                                SubmissionRepository submissionRepository,
                                UserRepository userRepository,
+                               AuditService auditService,
                                Clock clock) {
         this.contestRepository = contestRepository;
         this.contestProblemRepository = contestProblemRepository;
@@ -70,6 +77,7 @@ public class ContestAdminService {
         this.problemRepository = problemRepository;
         this.submissionRepository = submissionRepository;
         this.userRepository = userRepository;
+        this.auditService = auditService;
         this.clock = clock;
     }
 
@@ -88,6 +96,16 @@ public class ContestAdminService {
         Contest contest = contestRepository.saveAndFlush(Contest.create(
                 request.title(), request.slug(), request.description(),
                 request.startAt(), request.endAt(), admin));
+
+        // In this transaction: a contest cannot exist without the record of who created it.
+        auditService.record(AuditAction.CONTEST_CREATE, AuditOutcome.SUCCESS,
+                AuditEntityType.CONTEST, contest.getPublicId().toString(),
+                AuditMetadata.of()
+                        .put("slug", contest.getSlug())
+                        .put("title", contest.getTitle())
+                        .put("startAt", contest.getStartAt())
+                        .put("endAt", contest.getEndAt())
+                        .build());
 
         log.info("event=CONTEST_CREATED contest={} slug={} startAt={} endAt={} by={}",
                 contest.getPublicId(), contest.getSlug(),
@@ -109,6 +127,14 @@ public class ContestAdminService {
         contest.updateDetails(request.title(), request.slug(), request.description(), now);
         contest.reschedule(request.startAt(), request.endAt(), now);
 
+        auditService.record(AuditAction.CONTEST_UPDATE, AuditOutcome.SUCCESS,
+                AuditEntityType.CONTEST, contestId.toString(),
+                AuditMetadata.of()
+                        .put("slug", contest.getSlug())
+                        .put("startAt", contest.getStartAt())
+                        .put("endAt", contest.getEndAt())
+                        .build());
+
         log.info("event=CONTEST_UPDATED contest={} startAt={} endAt={}",
                 contestId, contest.getStartAt(), contest.getEndAt());
         return detail(contestId);
@@ -117,7 +143,17 @@ public class ContestAdminService {
     @Transactional
     public ContestDetailResponse publish(UUID contestId) {
         Contest contest = require(contestId);
+        ContestStatus previous = contest.statusAt(clock.instant());
         contest.publish(clock.instant());
+
+        auditService.record(AuditAction.CONTEST_PUBLISH, AuditOutcome.SUCCESS,
+                AuditEntityType.CONTEST, contestId.toString(),
+                AuditMetadata.of()
+                        .put("slug", contest.getSlug())
+                        .put("problemCount", contest.getProblems().size())
+                        .transition(previous, contest.statusAt(clock.instant()))
+                        .build());
+
         log.info("event=CONTEST_PUBLISHED contest={} startAt={}", contestId, contest.getStartAt());
         return detail(contestId);
     }
@@ -129,6 +165,17 @@ public class ContestAdminService {
         contest.cancel(clock.instant());
         // Worth a WARN: cancelling a contest people are competing in is a significant event
         // and somebody reading the logs afterwards should not have to hunt for it.
+        // The most consequential administrative act in the system: stopping a contest
+        // people may be competing in. The participant count is recorded because it is what
+        // makes the decision significant.
+        auditService.record(AuditAction.CONTEST_CANCEL, AuditOutcome.SUCCESS,
+                AuditEntityType.CONTEST, contestId.toString(),
+                AuditMetadata.of()
+                        .put("slug", contest.getSlug())
+                        .put("participants", participantRepository.countByContestPublicId(contestId))
+                        .transition(before, ContestStatus.CANCELLED)
+                        .build());
+
         log.warn("event=CONTEST_CANCELLED contest={} previousStatus={} participants={}",
                 contestId, before, participantRepository.countByContestPublicId(contestId));
         return detail(contestId);
@@ -161,6 +208,16 @@ public class ContestAdminService {
             throw new ConflictException("CONTEST_NOT_DELETABLE",
                     "This contest has submissions and cannot be deleted");
         }
+
+        // Recorded before the delete, while the contest can still be described. The row
+        // outlives the contest deliberately: entity_id is text rather than a foreign key,
+        // so the record of a deletion is not itself deleted by it.
+        auditService.record(AuditAction.CONTEST_DELETE, AuditOutcome.SUCCESS,
+                AuditEntityType.CONTEST, contestId.toString(),
+                AuditMetadata.of()
+                        .put("slug", contest.getSlug())
+                        .put("title", contest.getTitle())
+                        .build());
 
         contestRepository.delete(contest);
         log.info("event=CONTEST_DELETED contest={}", contestId);
@@ -196,6 +253,15 @@ public class ContestAdminService {
                 ContestProblem.of(contest, problem, nextOrder, request.pointsOrDefault()), now);
         contestRepository.saveAndFlush(contest);
 
+        auditService.record(AuditAction.CONTEST_PROBLEM_ADD, AuditOutcome.SUCCESS,
+                AuditEntityType.CONTEST, contestId.toString(),
+                AuditMetadata.of()
+                        .put("problemId", request.problemId())
+                        .put("problemSlug", problem.getSlug())
+                        .put("displayOrder", nextOrder)
+                        .put("points", request.pointsOrDefault())
+                        .build());
+
         log.info("event=CONTEST_PROBLEM_ADDED contest={} problem={} order={} points={}",
                 contestId, request.problemId(), nextOrder, request.pointsOrDefault());
         return detail(contestId);
@@ -212,6 +278,9 @@ public class ContestAdminService {
                 .orElseThrow(() -> new ResourceNotFoundException(
                         "CONTEST_PROBLEM_NOT_FOUND", "This problem is not part of this contest"));
 
+        int previousPoints = entry.getPoints();
+        int previousOrder = entry.getDisplayOrder();
+
         if (request.points() != null) {
             entry.repoint(request.points());
         }
@@ -219,6 +288,18 @@ public class ContestAdminService {
             reorder(contest, entry, request.displayOrder());
         }
         contestRepository.saveAndFlush(contest);
+
+        // Points and ordering decide what the contest is worth, so a change to either is
+        // recorded with both the old and new values.
+        auditService.record(AuditAction.CONTEST_PROBLEM_UPDATE, AuditOutcome.SUCCESS,
+                AuditEntityType.CONTEST, contestId.toString(),
+                AuditMetadata.of()
+                        .put("problemId", problemId)
+                        .put("previousPoints", previousPoints)
+                        .put("points", entry.getPoints())
+                        .put("previousDisplayOrder", previousOrder)
+                        .put("displayOrder", entry.getDisplayOrder())
+                        .build());
 
         log.info("event=CONTEST_PROBLEM_UPDATED contest={} problem={} points={} order={}",
                 contestId, problemId, entry.getPoints(), entry.getDisplayOrder());
@@ -276,6 +357,10 @@ public class ContestAdminService {
             remaining.get(position).moveTo(position);
         }
         contestRepository.saveAndFlush(contest);
+
+        auditService.record(AuditAction.CONTEST_PROBLEM_REMOVE, AuditOutcome.SUCCESS,
+                AuditEntityType.CONTEST, contestId.toString(),
+                AuditMetadata.of().put("problemId", problemId).build());
 
         log.info("event=CONTEST_PROBLEM_REMOVED contest={} problem={}", contestId, problemId);
         return detail(contestId);

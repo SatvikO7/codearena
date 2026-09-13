@@ -239,7 +239,7 @@ snapshot on connect, a convergent client reducer that ignores anything not stric
 and a bounded fallback poll armed only when the stream fails. See
 [submission-lifecycle.md](submission-lifecycle.md) and ADR-023/ADR-024.
 
-## Current state (Phase 7 — complete and verified)
+## Current state (Phase 8 — complete and verified)
 
 Implemented:
 
@@ -326,12 +326,40 @@ Added in Phase 7:
 - Contest, contest-solve, standings and admin contest pages, with a server-corrected
   countdown
 
+Added in Phase 8:
+
+- `audit_events` (`V7`): an append-only record of security-sensitive and administrative
+  events, with a database trigger that refuses UPDATE and DELETE outright
+- Audit events for authentication, problem and contest lifecycle, contest registration,
+  submission creation and denied administrative requests — and deliberately **not** for
+  reads, which are the bulk of traffic and change nothing
+- Administrative mutations record in the caller's transaction, so a success event cannot
+  outlive a rolled-back change and a change cannot commit unaudited (ADR-037)
+- Curated metadata with redaction, truncation and bounds, so an audit row cannot become
+  a credential leak
+- A request id linking application logs to audit events, sanitised because a client may
+  supply it
+- An ADMIN-only audit search with a closed sort whitelist, and a curated operational
+  status endpoint that is deliberately not an Actuator dump (ADR-038)
+- Actuator health details restricted to administrators: they were disclosing the Redis
+  version, the database engine, the container path and host disk figures to anonymous
+  callers
+
 Verified by execution, not assumed: `./mvnw clean verify` passes against real PostgreSQL,
 Redis and **real Docker containers**, alongside the frontend suite; every compose service
 reaches `healthy` with zero restarts; Flyway records `V1` through `V6` as applied; a draft answers 404 rather than 403 to a normal user; the raw catalogue response is
 asserted to contain neither a hidden test case's input nor its expected output; a `status`
 field added to an update payload is ignored; and every admin mutation returns 403 to a USER
 and 401 to an anonymous caller.
+
+Phase 8 adds to that: an audit event cannot be updated or deleted, including by a blanket
+DELETE; a success event written in a transaction that rolls back does not survive;
+a failure event written independently does survive its caller's rollback; recording
+outside a transaction fails loudly; a password never reaches the audit table; a failed
+login records the same reason for a real account and an imaginary one; ordinary reads
+produce no events; the audit API answers 401 to anonymous callers and 403 to users; every
+sort outside the whitelist is refused; injection attempts in filters are treated as
+ordinary values; and the status endpoint mentions no credential, path or configuration.
 
 Phase 7 adds to that: a draft contest answers 404 to a normal user on both the detail and
 the standings endpoints; registration is refused once a contest starts; a submission is
@@ -351,7 +379,14 @@ with a contest attached: same table, same status machine, same queue, same worke
 sandbox. A second engine for contests would be a second place for a judging bug to live,
 and the one that ran less often would be the one nobody noticed was broken.
 
-**Not implemented, and not claimed:** there is **no plagiarism detection and no anti-cheat
+**Auditing is a record, not a source of truth.** Domain state stays in the domain tables;
+audit events describe changes and never define them. Nothing is reconstructed from the
+log, and CodeArena is not an event-sourced system (ADR-036).
+
+**Not implemented, and not claimed:** there is no client IP in audit records, no worker
+heartbeat, no user administration, no audit retention tooling and no tamper-evidence
+beyond access control; no alerting on suspicious patterns; and **no plagiarism detection
+and no anti-cheat
 of any kind** — nothing compares submissions between contestants; there is no scoreboard
 freeze, no late registration, no team contests and no ratings; there is no submission rate
 limiting; the SSE connection cap is global rather than per user; memory is enforced but

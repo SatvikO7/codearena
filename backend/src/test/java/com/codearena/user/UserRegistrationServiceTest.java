@@ -24,12 +24,18 @@ class UserRegistrationServiceTest {
 
     private UserRepository userRepository;
     private UserRegistrationService service;
+    private com.codearena.audit.AuditService auditService;
     private final PasswordEncoder passwordEncoder = new BCryptPasswordEncoder(4);
 
     @BeforeEach
     void setUp() {
         userRepository = mock(UserRepository.class);
-        service = new UserRegistrationService(userRepository, passwordEncoder, new PasswordPolicy());
+        // Mocked: this suite is about password handling and uniqueness. That registration
+        // writes an audit row in the same transaction is asserted by AuditApiIT, where a
+        // real transaction exists to make the claim meaningful.
+        auditService = mock(com.codearena.audit.AuditService.class);
+        service = new UserRegistrationService(userRepository, passwordEncoder,
+                new PasswordPolicy(), auditService);
         when(userRepository.saveAndFlush(any(User.class)))
                 .thenAnswer(invocation -> invocation.getArgument(0));
     }

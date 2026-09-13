@@ -1,5 +1,10 @@
 package com.codearena.contest;
 
+import com.codearena.audit.AuditAction;
+import com.codearena.audit.AuditEntityType;
+import com.codearena.audit.AuditMetadata;
+import com.codearena.audit.AuditOutcome;
+import com.codearena.audit.AuditService;
 import com.codearena.common.ConflictException;
 import com.codearena.common.PageResponse;
 import com.codearena.common.ResourceNotFoundException;
@@ -58,17 +63,20 @@ public class ContestService {
     private final ContestParticipantRepository participantRepository;
     private final SubmissionRepository submissionRepository;
     private final UserRepository userRepository;
+    private final AuditService auditService;
     private final Clock clock;
 
     public ContestService(ContestRepository contestRepository,
                           ContestParticipantRepository participantRepository,
                           SubmissionRepository submissionRepository,
                           UserRepository userRepository,
+                          AuditService auditService,
                           Clock clock) {
         this.contestRepository = contestRepository;
         this.participantRepository = participantRepository;
         this.submissionRepository = submissionRepository;
         this.userRepository = userRepository;
+        this.auditService = auditService;
         this.clock = clock;
     }
 
@@ -221,6 +229,12 @@ public class ContestService {
         try {
             ContestParticipant participant = participantRepository.saveAndFlush(
                     ContestParticipant.of(contest, user));
+            // In the registration transaction: eligibility to compete is exactly the kind
+            // of fact a disputed result turns on.
+            auditService.record(AuditAction.CONTEST_REGISTER, AuditOutcome.SUCCESS,
+                    AuditEntityType.CONTEST, contestId.toString(),
+                    AuditMetadata.of().put("contestSlug", contest.getSlug()).build());
+
             log.info("event=CONTEST_REGISTERED contest={} user={}", contestId, userId);
             return new ContestRegistrationResponse(contestId, status, participant.getRegisteredAt(), false);
         } catch (DataIntegrityViolationException e) {

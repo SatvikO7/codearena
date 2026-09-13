@@ -1,5 +1,10 @@
 package com.codearena.submission;
 
+import com.codearena.audit.AuditAction;
+import com.codearena.audit.AuditEntityType;
+import com.codearena.audit.AuditMetadata;
+import com.codearena.audit.AuditOutcome;
+import com.codearena.audit.AuditService;
 import com.codearena.common.ConflictException;
 import com.codearena.common.PageResponse;
 import com.codearena.common.ResourceNotFoundException;
@@ -60,6 +65,7 @@ public class SubmissionService {
     private final ContestParticipantRepository participantRepository;
     private final ContestProblemRepository contestProblemRepository;
     private final ContestRepository contestRepository;
+    private final AuditService auditService;
     private final Clock clock;
     private final int maxSourceBytes;
 
@@ -71,6 +77,7 @@ public class SubmissionService {
                              ContestParticipantRepository participantRepository,
                              ContestProblemRepository contestProblemRepository,
                              ContestRepository contestRepository,
+                             AuditService auditService,
                              Clock clock,
                              @Value("${codearena.submission.max-source-bytes:65536}") int maxSourceBytes) {
         this.submissionRepository = submissionRepository;
@@ -81,6 +88,7 @@ public class SubmissionService {
         this.participantRepository = participantRepository;
         this.contestProblemRepository = contestProblemRepository;
         this.contestRepository = contestRepository;
+        this.auditService = auditService;
         this.clock = clock;
         this.maxSourceBytes = maxSourceBytes;
     }
@@ -221,6 +229,19 @@ public class SubmissionService {
 
         eventPublisher.publishEvent(
                 new SubmissionQueuePublisher.SubmissionCreatedEvent(submission.getPublicId()));
+
+        // Recorded here rather than in each caller, so the practice and contest paths
+        // cannot drift apart. The event says that somebody submitted, never WHAT they
+        // submitted: the source code is the one thing that must never reach an audit row.
+        auditService.record(AuditAction.SUBMISSION_CREATE, AuditOutcome.SUCCESS,
+                AuditEntityType.SUBMISSION, submission.getPublicId().toString(),
+                AuditMetadata.of()
+                        .put("problemId", problem.getPublicId())
+                        .put("language", request.language())
+                        .put("sourceBytes", sourceBytes)
+                        .put("contestId", contest == null ? null : contest.getPublicId())
+                        .build());
+
         return submission;
     }
     /**

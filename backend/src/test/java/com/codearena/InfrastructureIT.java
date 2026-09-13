@@ -37,7 +37,7 @@ class InfrastructureIT extends AbstractIntegrationTest {
                 "SELECT version FROM flyway_schema_history WHERE success = true ORDER BY installed_rank",
                 String.class);
 
-        assertThat(applied).containsExactly("1", "2", "3", "4", "5", "6");
+        assertThat(applied).containsExactly("1", "2", "3", "4", "5", "6", "7");
 
         // V1 installs citext. V2 ended up not using it (see the note in that migration),
         // but V1 is already applied everywhere and migrations are immutable, so the
@@ -199,12 +199,33 @@ class InfrastructureIT extends AbstractIntegrationTest {
     }
 
     @Test
-    void healthEndpointReportsDatabaseAndRedisUp() throws Exception {
+    void healthEndpointReportsUpWithoutDisclosingComponentDetail() throws Exception {
+        // The status stays public: container health checks and orchestrators have no
+        // credentials, and a probe that needed a session would be useless.
+        //
+        // The component breakdown does NOT. With show-details: always this endpoint was
+        // handing any anonymous caller the Redis version, the database engine, the
+        // container's filesystem path and the host's free disk space -- reconnaissance,
+        // and a precise dependency version is a gift to somebody matching CVEs. It is now
+        // when-authorized with roles: ADMIN. See ADR-038.
         mockMvc.perform(get("/actuator/health"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.status").value("UP"))
-                .andExpect(jsonPath("$.components.db.status").value("UP"))
-                .andExpect(jsonPath("$.components.redis.status").value("UP"));
+                .andExpect(jsonPath("$.components").doesNotExist());
+    }
+
+    /**
+     * The probes the compose health checks actually poll must keep answering anonymously,
+     * or startup ordering breaks and containers are restarted as unhealthy.
+     */
+    @Test
+    void livenessAndReadinessProbesRemainPublic() throws Exception {
+        mockMvc.perform(get("/actuator/health/liveness"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("UP"));
+        mockMvc.perform(get("/actuator/health/readiness"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("UP"));
     }
 
     @Test

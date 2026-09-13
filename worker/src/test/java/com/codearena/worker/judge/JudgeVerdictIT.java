@@ -222,7 +222,14 @@ class JudgeVerdictIT {
     @Timeout(300)
     void reportsAMemoryOrRuntimeFailureForARunawayAllocation() {
         JudgeResult result = judge.judge(
-                submission(Language.PYTHON, "x = bytearray(1024 * 1024 * 1024)"), ADDITION_TESTS);
+                // A generous wall clock on purpose, so the MEMORY limit is the binding
+                // constraint. With the default two seconds this test becomes a race between
+                // the timeout and the OOM killer, and under a loaded machine the timeout
+                // wins -- producing TIME_LIMIT_EXCEEDED and a failure that says nothing
+                // about memory. Widening the assertion instead would have let the test pass
+                // even if memory limiting were broken entirely.
+                submission(Language.PYTHON, "x = bytearray(1024 * 1024 * 1024)", 30_000),
+                ADDITION_TESTS);
 
         // The kernel's OOM kill surfaces as either a kill signal or the interpreter's own
         // MemoryError depending on where the allocation fails; both are correct refusals,
@@ -247,8 +254,19 @@ class JudgeVerdictIT {
     // ------------------------------------------------------------------- helpers
 
     private ClaimedSubmission submission(Language language, String source) {
+        return submission(language, source, TIME_LIMIT_MS);
+    }
+
+    /**
+     * A submission with an explicit wall-clock budget.
+     *
+     * <p>Used where the test is about a limit <em>other</em> than time, and the default
+     * two-second budget would race it. Under a loaded machine the wall clock can fire
+     * before the kernel's OOM killer does, which turns a memory test into a timing test.
+     */
+    private ClaimedSubmission submission(Language language, String source, int timeLimitMs) {
         return new ClaimedSubmission(
-                1L, UUID.randomUUID(), language, source, 1, 1L, TIME_LIMIT_MS, MEMORY_LIMIT_MB);
+                1L, UUID.randomUUID(), language, source, 1, 1L, timeLimitMs, MEMORY_LIMIT_MB);
     }
 
     private static boolean dockerAvailable() {

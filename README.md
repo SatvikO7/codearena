@@ -8,7 +8,7 @@ The interesting part of this project is not the CRUD. It is everything around it
 asynchronous job processing, sandboxed execution of untrusted code, queue reliability,
 idempotency and concurrency control.
 
-> **Project status: Phase 7 of 16 complete and verified.** The judge works end to end: a
+> **Project status: Phase 8 of 16 complete and verified.** The judge works end to end: a
 > submission is queued, claimed by a worker, compiled and run inside a hardened sandbox,
 > given a verdict, and the result appears on the page without a reload — in practice and in
 > timed contests, on a live scoreboard. C++, Java and Python. This README describes what
@@ -96,7 +96,7 @@ codearena/
 ├── sandbox/            Sandbox image definitions, the seccomp profile, and the
 │                       script that builds the images
 ├── frontend/           React + TypeScript client
-├── docs/               Architecture, threat model, contests and decision records
+├── docs/               Architecture, threat model, contests, auditing and decisions
 ├── pom.xml             Maven aggregator
 ├── docker-compose.yml  Full local stack
 └── .env.example        Configuration template
@@ -710,6 +710,142 @@ Full detail is in [docs/contests.md](docs/contests.md).
 
 ---
 
+## Auditing and administration
+
+Security-sensitive and administrative events are recorded in an **append-only** log:
+who did what, to what, when, and whether it worked.
+
+It is not an event store. Authoritative state stays in the domain tables; audit events
+*describe* changes and never define them. Deleting every row would lose the history of who
+did what and change no password, no problem's status and no verdict. ADR-036.
+
+### Immutability
+
+Enforced three times, because the row most worth tampering with is the one recording the
+tamperer:
+
+1. The entity is `@Immutable` with no setters, so Hibernate will not issue an UPDATE.
+2. No repository method or endpoint modifies or removes an event — the API is one GET.
+3. **A database trigger refuses UPDATE and DELETE outright.** "The code does not do that"
+   is a weaker guarantee than "the database refuses".
+
+A blanket `DELETE FROM audit_events` fails, and a test asserts it.
+
+### Transaction semantics
+
+| Event kind | How it is written | Why |
+|---|---|---|
+| Administrative mutation | **In the caller's transaction** (`MANDATORY`) | The event and the change commit together or not at all |
+| Failed login, denied request | **Its own transaction** (`REQUIRES_NEW`) | Nothing was changed, and the request is about to roll back |
+
+The first buys both directions: a rolled-back mutation leaves no record claiming it
+happened, **and** a mutation cannot commit without its audit row — if the audit write fails,
+the transaction fails. For a security-critical change, "it succeeded but we cannot say who
+did it" is not an acceptable outcome.
+
+For failures the write is independent and a database error is logged and swallowed, because
+turning a failed login into a 500 would hand an attacker an oracle: a real account and an
+imaginary one would fail differently.
+
+> **The trade, stated plainly: a lost failure-audit row is possible; a lost success-audit
+> row is not.** ADR-037.
+
+### What is recorded, and what deliberately is not
+
+Authentication (register, login, failed login, logout), problem lifecycle, contest
+lifecycle and problem association, contest registration, submission creation, and denied
+administrative requests.
+
+**Not** recorded: reads of any kind, ordinary validation failures, non-admin authorisation
+denials, judging outcomes. `GET /api/contests` produces no audit event, and a test asserts
+it — an audit log full of browsing noise is one in which the events that matter cannot be
+found.
+
+### Metadata is curated, never captured
+
+Built field by field. Nothing serialises a request body, a DTO or an entity: a problem
+publication records `{problemId, slug, previousStatus, newStatus}`, not the problem — which
+would carry its statement and its test cases.
+
+That is structural, and `AuditMetadata` adds a second line: keys that look like secrets are
+redacted, values are truncated at 500 characters, the map is capped at 20 entries, and a
+database constraint caps its serialised size.
+
+**Never stored:** passwords or hashes, session ids, CSRF tokens, the executor token, source
+code, hidden test inputs or expected outputs. A failed login records the attempted
+identifier and a coarse reason — never the password, and never anything revealing whether
+the account exists, because login itself is carefully designed not to be an enumeration
+oracle and the audit log must not hand that back.
+
+### The API
+
+| Endpoint | Auth | Purpose |
+|---|---|---|
+| `GET /api/admin/audit-events` | ADMIN | Search: actor, action, outcome, actor type, entity, time range |
+| `GET /api/admin/audit-events/actions` | ADMIN | The action vocabulary, so a UI need not hard-code one |
+| `GET /api/admin/system/status` | ADMIN | Curated operational status |
+
+Anonymous callers get 401, normal users 403 — and that 403 is itself audited.
+
+**Sorting accepts only `occurredAt`, `action` or `outcome`**; anything else is a 400. An
+open sort parameter would let a caller order by fields the API never exposes and make the
+database sort an unindexed column. Page size is capped at 200, and the time range is
+half-open so consecutive ranges neither overlap nor leave a gap.
+
+### Request correlation
+
+Every request carries an id linking the application log to the audit event. A client may
+supply `X-Request-Id`, which is **sanitised** — letters, digits, hyphens and underscores,
+bounded at 64 characters — because the value lands in log files and in a table that is never
+deleted, and a newline would otherwise let a caller forge log lines.
+
+### Operational status
+
+`GET /api/admin/system/status` reports whether PostgreSQL and Redis answer and how quickly,
+the judging queue depths, the build version and the audit event count. It is **curated**,
+not an Actuator dump: `/env` and `/configprops` list the database password and the executor
+token, and `/heapdump` hands over process memory, so none of them are exposed at all.
+
+Three kinds of health stay distinct: **liveness** and **readiness** remain unauthenticated
+(a health check has no credentials) and return a bare status; this endpoint is for a human
+and is deliberately not wired into any probe.
+
+**A finding from this phase:** `/actuator/health` was returning full component details to
+any anonymous caller — the Redis version, the database engine, the container's filesystem
+path and the host's free disk space. A precise dependency version is a gift to somebody
+matching CVEs. `show-details` is now `when-authorized` with `roles: ADMIN`; the probes keep
+working because they only read the status.
+
+### Retention, stated honestly
+
+**Append-only, retention indefinite.** Nothing prunes the log and no automatic cleanup
+exists. A retention policy would be a separately governed operation — drop the trigger,
+prune under supervision, restore it — not an ordinary DELETE that happens to be permitted.
+
+> No compliance claim is made. CodeArena does not implement GDPR erasure, data-subject
+> export, legal hold, or tamper-evident signing. The log is append-only and
+> access-controlled; it is not a certified audit trail.
+
+### Known gaps
+
+- **No client IP.** Behind nginx, `getRemoteAddr()` returns the proxy, and `X-Forwarded-For`
+  is client-settable — trusting it means an attacker chooses what the log says about them.
+  Doing it properly needs a configured trusted-proxy chain. An absent field is more honest
+  than a forgeable one.
+- **No worker heartbeat.** The API server has no route to the worker's network; the queue
+  depths are the honest proxy.
+- **No user administration.** No endpoint changes a role, disables an account or deletes a
+  user, so there is nothing of that kind to audit. Deferred: it would need
+  privilege-escalation guards and a safeguard against removing the last administrator.
+- **No tamper-evidence beyond access control** — no hash chaining, no signing. A database
+  superuser could disable the trigger.
+- **No alerting.** A burst of failed logins is visible to somebody who looks; nothing raises
+  it. Rate limiting and abuse controls are Phase 9.
+
+Full detail is in [docs/audit.md](docs/audit.md).
+
+---
+
 ## Configuration
 
 No secret is committed and none is hardcoded. Every environment-specific value is read
@@ -846,8 +982,8 @@ as it lands, never before.
 | 5 | Submission history, per-test results, real-time status | **Complete** |
 | 6 | Secure execution, sandbox hardening, execution-service separation | **Complete** |
 | 7 | Contests, participation and contest scoring | **Complete** |
-| 8 | Worker scaling, caching, user profiles and statistics | Next |
-| 9 | Rate limiting and abuse controls | Planned |
+| 8 | Admin operations, audit logging and system governance | **Complete** |
+| 9 | Rate limiting and abuse controls | Next |
 | 10 | Contests, scoring, leaderboards | Planned |
 | 11 | Full frontend | Planned |
 | 12 | Kernel-level sandbox isolation (gVisor / rootless daemon) | Planned |

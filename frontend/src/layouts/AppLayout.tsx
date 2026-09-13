@@ -16,6 +16,8 @@ const NAV_ITEMS: { to: string; label: string; end?: boolean }[] = [
 const ADMIN_NAV_ITEMS: { to: string; label: string }[] = [
   { to: '/admin/problems', label: 'Manage problems' },
   { to: '/admin/contests', label: 'Manage contests' },
+  { to: '/admin/audit', label: 'Audit log' },
+  { to: '/admin/system', label: 'System' },
 ];
 
 /** Shared chrome: masthead, primary navigation, account controls and the routed page. */

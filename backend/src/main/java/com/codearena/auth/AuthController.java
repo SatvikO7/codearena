@@ -1,5 +1,11 @@
 package com.codearena.auth;
 
+import com.codearena.audit.ActorType;
+import com.codearena.audit.AuditAction;
+import com.codearena.audit.AuditEntityType;
+import com.codearena.audit.AuditMetadata;
+import com.codearena.audit.AuditOutcome;
+import com.codearena.audit.AuditService;
 import com.codearena.auth.dto.LoginRequest;
 import com.codearena.auth.dto.RegistrationRequest;
 import com.codearena.auth.dto.UserProfileResponse;
@@ -54,15 +60,18 @@ public class AuthController {
     private final AuthenticationManager authenticationManager;
     private final SecurityContextRepository securityContextRepository;
     private final UserRepository userRepository;
+    private final AuditService auditService;
 
     public AuthController(UserRegistrationService registrationService,
                           AuthenticationManager authenticationManager,
                           SecurityContextRepository securityContextRepository,
-                          UserRepository userRepository) {
+                          UserRepository userRepository,
+                          AuditService auditService) {
         this.registrationService = registrationService;
         this.authenticationManager = authenticationManager;
         this.securityContextRepository = securityContextRepository;
         this.userRepository = userRepository;
+        this.auditService = auditService;
     }
 
     @PostMapping("/register")
@@ -119,6 +128,12 @@ public class AuthController {
         // session, and Redis, only because it is saved here.
         securityContextRepository.saveContext(context, httpRequest, httpResponse);
 
+        // Independent of any transaction: nothing was changed in the domain, and there is
+        // no mutation for this record to be consistent with.
+        auditService.recordIndependently(AuditAction.AUTH_LOGIN, AuditOutcome.SUCCESS,
+                AuditEntityType.USER, principal.getPublicId().toString(),
+                AuditMetadata.of().put("role", principal.getRole()).build());
+
         log.info("Login succeeded for publicId={}", principal.getPublicId());
 
         return ResponseEntity.ok(loadProfile(principal));
@@ -129,6 +144,7 @@ public class AuthController {
             return authenticationManager.authenticate(
                     UsernamePasswordAuthenticationToken.unauthenticated(request.identifier(), request.password()));
         } catch (DisabledException e) {
+            auditLoginFailure(request.identifier(), "ACCOUNT_DISABLED");
             // Distinguished from bad credentials deliberately: telling a suspended user
             // that their account is disabled is far better than letting them believe they
             // have forgotten their password. Registration already reveals which usernames
@@ -137,12 +153,44 @@ public class AuthController {
             throw new AuthenticationFailedException(
                     ACCOUNT_DISABLED, HttpStatus.FORBIDDEN, "This account has been disabled");
         } catch (org.springframework.security.core.AuthenticationException e) {
+            auditLoginFailure(request.identifier(), "INVALID_CREDENTIALS");
             // One message for "no such user" and "wrong password" so that login cannot be
             // used to enumerate accounts.
             log.info("Login failed: bad credentials");
             throw new AuthenticationFailedException(
                     INVALID_CREDENTIALS, HttpStatus.UNAUTHORIZED, "Invalid username or password");
         }
+    }
+
+    /**
+     * Records a rejected login.
+     *
+     * <p>The most security-relevant event the system produces: a run of these against one
+     * account, or from one source, is what credential stuffing looks like.
+     *
+     * <p><b>What goes in, and what deliberately does not.</b> The identifier that was tried
+     * and a coarse reason. Never the password, obviously — but also nothing that would say
+     * whether the account exists. Login itself answers identically for "no such user" and
+     * "wrong password" precisely so it cannot be used to enumerate accounts, and an audit
+     * record that distinguished them would hand back the same oracle to anyone who could
+     * read the log. ACCOUNT_DISABLED is the one exception, and only because login already
+     * discloses that state to the caller.
+     *
+     * <p>The identifier is attacker-controlled text. It is bounded and redaction-checked by
+     * AuditMetadata like any other value, and it is recorded as <em>what was attempted</em>
+     * rather than as an actor. The actor is whoever made the request, which for the usual
+     * case -- a signed-out caller guessing a password -- is ANONYMOUS. It is deliberately
+     * not forced to ANONYMOUS: an attempt made from an existing session really was made by
+     * that session, and recording the identity behind a failed attempt on somebody else's
+     * account is worth more than a uniform field.
+     */
+    private void auditLoginFailure(String identifier, String reason) {
+        auditService.recordIndependently(AuditAction.AUTH_LOGIN_FAILURE, AuditOutcome.FAILURE,
+                null, null,
+                AuditMetadata.of()
+                        .put("attemptedIdentifier", identifier)
+                        .put("reason", reason)
+                        .build());
     }
 
     @PostMapping("/logout")
@@ -155,6 +203,10 @@ public class AuthController {
     @ApiResponse(responseCode = "204", description = "Session ended")
     public ResponseEntity<Void> logout(HttpServletRequest request, HttpServletResponse response) {
         Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
+        AuthenticatedUser actor = authentication != null
+                && authentication.getPrincipal() instanceof AuthenticatedUser principal
+                ? principal
+                : null;
 
         // Invalidates the HttpSession (removing it from Redis), clears the context and
         // clears the context holder. Deleting the cookie alone would leave a usable
@@ -163,6 +215,18 @@ public class AuthController {
         logoutHandler.setInvalidateHttpSession(true);
         logoutHandler.setClearAuthentication(true);
         logoutHandler.logout(request, response, authentication);
+
+        // After the handler, so the event is only recorded once the session is genuinely
+        // gone. The actor was captured above, while it still existed -- by this point there
+        // is nobody left in the security context to attribute it to.
+        //
+        // Independent of any transaction: nothing in the domain changed.
+        if (actor != null) {
+            auditService.recordIndependentlyFor(actor.getPublicId(), actor.getUsername(),
+                    actor.getRole() == com.codearena.user.Role.ADMIN ? ActorType.ADMIN : ActorType.USER,
+                    AuditAction.AUTH_LOGOUT, AuditOutcome.SUCCESS,
+                    AuditEntityType.USER, actor.getPublicId().toString(), java.util.Map.of());
+        }
 
         return ResponseEntity.noContent().build();
     }
