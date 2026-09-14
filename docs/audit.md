@@ -204,11 +204,14 @@ The id is **not a security control** and authorises nothing.
 
 **Not recorded.** A deliberate omission rather than an oversight.
 
-The deployment puts the API behind nginx, so `request.getRemoteAddr()` yields the proxy's
-address, not the client's — a value that looks like evidence and is not. The real address
-would have to come from `X-Forwarded-For`, which is a client-settable header: trusting it
-blindly means an attacker chooses what the audit log says about them, which is worse than
-recording nothing.
+There is no reverse proxy in front of the API: nginx serves the built frontend and does
+not proxy `/api`, so the browser talks to the backend directly. `request.getRemoteAddr()`
+is therefore the peer socket — which, behind Docker's published port, is usually the bridge
+gateway rather than the client. A value that looks like evidence and is not.
+
+The real address would have to come from `X-Forwarded-For`, which is a client-settable
+header: trusting it blindly means an attacker chooses what the audit log says about them,
+which is worse than recording nothing.
 
 Doing it properly needs a configured chain of trusted proxies and a documented deployment
 topology. Until that exists, an absent field is more honest than a forgeable one. Personal
@@ -302,9 +305,11 @@ is unremarkable, and the event count on the status page is the number to watch.
 ## Known limitations
 
 - **No client IP.** See above — deliberate, and documented rather than faked.
-- **No worker heartbeat.** The API server has no network route to the worker; the queue
-  depths are the honest proxy. A real heartbeat means workers writing to a shared store,
-  which belongs with queue observability.
+- ~~No worker heartbeat.~~ **Added in Phase 10.** Workers publish a record to Redis every
+  ten seconds and the admin status view reads it back as healthy, stale or gone — see
+  [observability.md](observability.md). The reasoning here was right about the constraint
+  (the API has no network route to a worker) and the answer turned out to be the shared
+  store this note anticipated, not an HTTP call.
 - **No user administration.** There is no endpoint to change a role, disable an account or
   delete a user, so there is nothing of that kind to audit. Adding role management would need
   privilege-escalation guards and a safeguard against removing the last administrator; it is

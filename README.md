@@ -105,6 +105,30 @@ codearena/
 
 ---
 
+## Verifying everything
+
+One command, from a clean checkout:
+
+```bash
+./scripts/verify-all.sh
+```
+
+It starts what it needs, waits for it properly, and checks the whole system against a
+real stack — the build, both test suites, migrations, every service's health, the full
+user journey through a real Docker sandbox, the security rejections, auditing, rate
+limiting, observability and fault recovery. A final `PASS` means every mandatory stage
+actually passed.
+
+```bash
+./scripts/verify-all.sh --quick     # skips the fault-injection suites (~20 min)
+./scripts/verify-all.sh --keep-up   # leave the stack running afterwards
+```
+
+It never destroys your database or Redis volumes. Full detail, including what each of
+the thirteen stages checks, is in [docs/verification.md](docs/verification.md).
+
+---
+
 ## Running the stack
 
 ### Prerequisites
@@ -829,19 +853,21 @@ prune under supervision, restore it — not an ordinary DELETE that happens to b
 
 ### Known gaps
 
-- **No client IP.** Behind nginx, `getRemoteAddr()` returns the proxy, and `X-Forwarded-For`
-  is client-settable — trusting it means an attacker chooses what the log says about them.
+- **No client IP.** There is no reverse proxy in front of the API — nginx serves the
+  frontend and does not proxy `/api` — so `getRemoteAddr()` is the peer socket, which behind
+  Docker's published port is usually the bridge gateway. `X-Forwarded-For` is
+  client-settable, so trusting it means an attacker chooses what the log says about them.
   Doing it properly needs a configured trusted-proxy chain. An absent field is more honest
   than a forgeable one.
-- **No worker heartbeat.** The API server has no route to the worker's network; the queue
-  depths are the honest proxy.
 - **No user administration.** No endpoint changes a role, disables an account or deletes a
   user, so there is nothing of that kind to audit. Deferred: it would need
   privilege-escalation guards and a safeguard against removing the last administrator.
 - **No tamper-evidence beyond access control** — no hash chaining, no signing. A database
   superuser could disable the trigger.
-- **No alerting.** A burst of failed logins is visible to somebody who looks; nothing raises
-  it. Rate limiting and abuse controls are Phase 9.
+- **No alerting.** A burst of failed logins is visible to somebody who looks; nothing
+  raises it. Phase 10 documents ten alerts with their metric and threshold
+  ([operations.md](docs/operations.md)); nothing evaluates them. Rate limiting and abuse
+  controls shipped in Phase 9 — see [rate-limiting.md](docs/rate-limiting.md).
 
 Full detail is in [docs/audit.md](docs/audit.md).
 

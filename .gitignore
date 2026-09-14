@@ -48,7 +48,17 @@ desktop.ini
 # ---- Runtime / build artifacts ----
 logs/
 *.log
+# Bounded logs written by scripts/verify-all.sh so a failing stage can be
+# diagnosed without dumping everything to the terminal.
+.verify-logs/
 coverage/
 .tmp/
 tmp/
 judge-workspace/
+
+# ---- Local developer notes ----
+# A local orientation document describing the whole project. Deliberately not
+# tracked: it is a working aid that is regenerated from the repository whenever
+# it is useful, and a second copy of the documentation in git would be one more
+# thing to keep in step with the code.
+docs/project-context.local.md
