@@ -75,6 +75,31 @@ services:
       # HTTP, and a Secure cookie would simply never be sent.
       SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-false}
       SESSION_TIMEOUT: ${SESSION_TIMEOUT:-PT2H}
+      # Abuse controls. Every default here matches application.yml, so leaving them
+      # unset changes nothing; they are listed so a deployment can be tuned without
+      # rebuilding an image. The reasoning behind each number, and what each one is
+      # protecting, is in docs/rate-limiting.md.
+      #
+      # TRUST_FORWARDED stays false here: nginx in this stack serves the built frontend
+      # and does not proxy the API, so there is no proxy overwriting X-Forwarded-For and
+      # trusting it would let a client choose its own rate-limit bucket.
+      RATE_LIMIT_ENABLED: ${RATE_LIMIT_ENABLED:-true}
+      RATE_LIMIT_TRUST_FORWARDED: ${RATE_LIMIT_TRUST_FORWARDED:-false}
+      RATE_LIMIT_AUDIT_COOLDOWN: ${RATE_LIMIT_AUDIT_COOLDOWN:-PT10M}
+      RATE_LIMIT_LOGIN_ORIGIN_BURST: ${RATE_LIMIT_LOGIN_ORIGIN_BURST:-30}
+      RATE_LIMIT_LOGIN_ORIGIN_INTERVAL: ${RATE_LIMIT_LOGIN_ORIGIN_INTERVAL:-PT2S}
+      RATE_LIMIT_LOGIN_ACCOUNT_BURST: ${RATE_LIMIT_LOGIN_ACCOUNT_BURST:-10}
+      RATE_LIMIT_LOGIN_ACCOUNT_INTERVAL: ${RATE_LIMIT_LOGIN_ACCOUNT_INTERVAL:-PT30S}
+      RATE_LIMIT_REGISTRATION_BURST: ${RATE_LIMIT_REGISTRATION_BURST:-10}
+      RATE_LIMIT_REGISTRATION_INTERVAL: ${RATE_LIMIT_REGISTRATION_INTERVAL:-PT2M}
+      RATE_LIMIT_SUBMISSION_BURST: ${RATE_LIMIT_SUBMISSION_BURST:-10}
+      RATE_LIMIT_SUBMISSION_INTERVAL: ${RATE_LIMIT_SUBMISSION_INTERVAL:-PT10S}
+      RATE_LIMIT_STANDINGS_BURST: ${RATE_LIMIT_STANDINGS_BURST:-60}
+      RATE_LIMIT_STANDINGS_INTERVAL: ${RATE_LIMIT_STANDINGS_INTERVAL:-PT2S}
+      RATE_LIMIT_PROBLEM_SEARCH_BURST: ${RATE_LIMIT_PROBLEM_SEARCH_BURST:-60}
+      RATE_LIMIT_PROBLEM_SEARCH_INTERVAL: ${RATE_LIMIT_PROBLEM_SEARCH_INTERVAL:-PT2S}
+      RATE_LIMIT_ADMIN_READ_BURST: ${RATE_LIMIT_ADMIN_READ_BURST:-120}
+      RATE_LIMIT_ADMIN_READ_INTERVAL: ${RATE_LIMIT_ADMIN_READ_INTERVAL:-PT1S}
     ports:
       - "${BACKEND_PORT:-8080}:8080"
     healthcheck:

@@ -1,5 +1,6 @@
 package com.codearena;
 
+import org.junit.jupiter.api.BeforeEach;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
@@ -30,12 +31,68 @@ public abstract class AbstractIntegrationTest {
     static final PostgreSQLContainer<?> POSTGRES =
             new PostgreSQLContainer<>(DockerImageName.parse("postgres:16-alpine"));
 
-    static final GenericContainer<?> REDIS =
+    /**
+     * Protected rather than package-private: the rate-limit outage suite lives in another
+     * package and needs the container's address to put a breakable proxy in front of it.
+     */
+    protected static final GenericContainer<?> REDIS =
             new GenericContainer<>(DockerImageName.parse("redis:7-alpine")).withExposedPorts(6379);
 
     static {
         POSTGRES.start();
         REDIS.start();
+    }
+
+    /**
+     * Empties the rate-limit buckets before every test in every suite.
+     *
+     * <p>Rate limiting stays <b>switched on</b> throughout the test run, so the interceptor,
+     * the Lua script and the 429 path are exercised by the whole suite rather than only by
+     * the tests written for them. What is removed is the interference: buckets are shared by
+     * identity, every test signs in from the same loopback address, and a suite that ran a
+     * hundred logins would otherwise start failing somewhere in the middle for reasons that
+     * have nothing to do with what it is testing — and would fail differently depending on
+     * which tests ran first.
+     *
+     * <p>Deleting only the limiter's own keys, not {@code FLUSHALL}: sessions, the submission
+     * queue and the event channel also live in this Redis, and a blunt flush would make the
+     * reset itself the cause of mysterious failures.
+     *
+     * <p>Runs before the subclass's own setup, which is where sign-in happens, because JUnit
+     * runs superclass lifecycle methods first.
+     */
+    @BeforeEach
+    void clearRateLimitBuckets() throws Exception {
+        REDIS.execInContainer("redis-cli", "EVAL",
+                "local keys = redis.call('KEYS', ARGV[1]);"
+                        + " for i = 1, #keys do redis.call('DEL', keys[i]) end;"
+                        + " return #keys",
+                "0", "codearena:rl*");
+    }
+
+    /**
+     * Where the application under test should look for Redis, when that is not the shared
+     * container.
+     *
+     * <p>Exists for one suite: the rate-limit outage tests, which need to break the
+     * connection on purpose and so put a proxy in front of a Redis of their own. Without a
+     * hook here, a subclass declaring its own {@code @DynamicPropertySource} would be racing
+     * this one for the same two keys — and losing quietly, which would leave those tests
+     * passing against a perfectly healthy Redis while claiming to have broken it.
+     */
+    private static volatile String redisHostOverride;
+    private static volatile Integer redisPortOverride;
+
+    /** Called from a subclass's static initialiser, before its context is built. */
+    protected static void redirectRedisTo(String host, int port) {
+        redisHostOverride = host;
+        redisPortOverride = port;
+    }
+
+    /** Called once the redirecting suite is finished, so later suites are unaffected. */
+    protected static void stopRedirectingRedis() {
+        redisHostOverride = null;
+        redisPortOverride = null;
     }
 
     @DynamicPropertySource
@@ -44,8 +101,10 @@ public abstract class AbstractIntegrationTest {
         registry.add("spring.datasource.username", POSTGRES::getUsername);
         registry.add("spring.datasource.password", POSTGRES::getPassword);
 
-        registry.add("spring.data.redis.host", REDIS::getHost);
-        registry.add("spring.data.redis.port", () -> REDIS.getMappedPort(6379));
+        registry.add("spring.data.redis.host",
+                () -> redisHostOverride != null ? redisHostOverride : REDIS.getHost());
+        registry.add("spring.data.redis.port",
+                () -> redisPortOverride != null ? redisPortOverride : REDIS.getMappedPort(6379));
 
         // Cost 12 is right for production and far too slow to pay on every test login.
         // The encoder under test is the same DelegatingPasswordEncoder either way; only

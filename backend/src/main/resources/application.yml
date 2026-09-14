@@ -140,6 +140,78 @@ codearena:
     # it cannot be used to push megabytes into the database one POST at a time.
     max-source-bytes: ${MAX_SOURCE_BYTES:65536}
 
+  # ---------------------------------------------------------------------------
+  # Abuse protection. Every number here is a policy decision, not an implementation
+  # detail, which is why none of them live in Java. The reasoning behind each one is in
+  # docs/rate-limiting.md; the short version is in the comments below.
+  #
+  # `capacity` is the burst -- a bucket starts full, so an idle caller may spend all of
+  # it at once. `refill-interval` is how long one request takes to come back, which is
+  # the sustained rate. State lives in Redis, so these are the limits for the system as a
+  # whole however many API instances are running.
+  # ---------------------------------------------------------------------------
+  rate-limit:
+    # Off only for local experiments and for tests that are about something else. On by
+    # default, so forgetting to set it is not a way to ship with no protection.
+    enabled: ${RATE_LIMIT_ENABLED:true}
+
+    # Whether X-Forwarded-For may be believed. FALSE unless a reverse proxy in front of
+    # this API overwrites the header -- any client can send it, so trusting it without
+    # that guarantee lets an attacker choose a fresh bucket per request. The shipped
+    # compose deployment has no proxy in front of the API (nginx serves the frontend
+    # only), so it stays off there.
+    trust-forwarded-headers: ${RATE_LIMIT_TRUST_FORWARDED:false}
+
+    # How long one identity's rejections collapse into a single audit event and a single
+    # log line. Bounds what a rejected caller can write into an append-only table.
+    violation-audit-cooldown: ${RATE_LIMIT_AUDIT_COOLDOWN:PT10M}
+
+    # Login, per calling client: a flood cap, not the anti-guessing control. Generous
+    # because this key can be shared by many honest users behind one address, and a tight
+    # limit on a shared identity is a denial of service against all of them.
+    login-origin:
+      capacity: ${RATE_LIMIT_LOGIN_ORIGIN_BURST:30}
+      refill-interval: ${RATE_LIMIT_LOGIN_ORIGIN_INTERVAL:PT2S}      # 30/minute sustained
+
+    # Login, per account being attempted, counting only failures. This is the control that
+    # actually stops password guessing, because it holds no matter how many sources the
+    # attempts come from. Ten wrong answers up front, then one every thirty seconds; a
+    # correct password clears it outright, so a legitimate user never accumulates.
+    login-account:
+      capacity: ${RATE_LIMIT_LOGIN_ACCOUNT_BURST:10}
+      refill-interval: ${RATE_LIMIT_LOGIN_ACCOUNT_INTERVAL:PT30S}    # 2/minute sustained
+
+    # Account creation, per client. Ten to begin with, then one every two minutes. Loose
+    # enough that a developer seeding accounts or a classroom signing up together is not
+    # obstructed, tight enough that scripted registration is not free.
+    registration:
+      capacity: ${RATE_LIMIT_REGISTRATION_BURST:10}
+      refill-interval: ${RATE_LIMIT_REGISTRATION_INTERVAL:PT2M}      # 30/hour sustained
+
+    # Submissions, per user, shared by practice and contests. Sized for a competitor
+    # working quickly -- ten queued at once, then one every ten seconds -- because a human
+    # who has just found a bug submits again within a minute, not within a second.
+    submission:
+      capacity: ${RATE_LIMIT_SUBMISSION_BURST:10}
+      refill-interval: ${RATE_LIMIT_SUBMISSION_INTERVAL:PT10S}       # 6/minute sustained
+
+    # Standings, per user. The page refreshes every 15 seconds; this allows 30 a minute,
+    # so a browser -- even with several contests open -- is nowhere near it.
+    standings:
+      capacity: ${RATE_LIMIT_STANDINGS_BURST:60}
+      refill-interval: ${RATE_LIMIT_STANDINGS_INTERVAL:PT2S}         # 30/minute sustained
+
+    # Catalogue search, per user. Only applies when a search term is present.
+    problem-search:
+      capacity: ${RATE_LIMIT_PROBLEM_SEARCH_BURST:60}
+      refill-interval: ${RATE_LIMIT_PROBLEM_SEARCH_INTERVAL:PT2S}    # 30/minute sustained
+
+    # Administrative reads, per administrator. The system dashboard polls every 10
+    # seconds and the audit page pages on demand; 60 a minute leaves both far clear.
+    admin-read:
+      capacity: ${RATE_LIMIT_ADMIN_READ_BURST:120}
+      refill-interval: ${RATE_LIMIT_ADMIN_READ_INTERVAL:PT1S}        # 60/minute sustained
+
   queue:
     # How often the recovery sweeper looks for lost or stranded submissions.
     sweep-interval-ms: ${QUEUE_SWEEP_INTERVAL_MS:30000}

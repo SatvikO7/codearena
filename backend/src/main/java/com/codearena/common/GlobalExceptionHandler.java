@@ -2,6 +2,8 @@ package com.codearena.common;
 
 import com.codearena.auth.AuthenticationFailedException;
 import com.codearena.problem.Problem;
+import com.codearena.ratelimit.RateLimitExceededException;
+import com.codearena.ratelimit.RateLimitHeaders;
 import jakarta.servlet.http.HttpServletRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -45,6 +47,29 @@ public class GlobalExceptionHandler {
             AuthenticationFailedException ex, HttpServletRequest request) {
         return ResponseEntity.status(ex.getStatus()).body(ApiErrorResponse.of(
                 ex.getStatus().value(), ex.getErrorCode(), ex.getMessage(), request.getRequestURI()));
+    }
+
+    /**
+     * A limit enforced inside a controller rather than by the interceptor.
+     *
+     * <p>Only the per-account login throttle arrives here, because it is keyed on the
+     * identifier in the request body. The response is byte-for-byte what
+     * {@code RateLimitInterceptor} writes: the same status, the same error code, the same
+     * fixed message and the same headers. A client must not be able to tell which control
+     * refused it — in particular, a throttled login and a throttled registration look
+     * identical, so a 429 can never be read as evidence that an account exists.
+     */
+    @ExceptionHandler(RateLimitExceededException.class)
+    public ResponseEntity<ApiErrorResponse> handleRateLimited(
+            RateLimitExceededException ex, HttpServletRequest request) {
+
+        ResponseEntity.BodyBuilder response = ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS);
+        RateLimitHeaders.apply(response::header, ex.decision());
+        return response.body(ApiErrorResponse.of(
+                HttpStatus.TOO_MANY_REQUESTS.value(),
+                RateLimitHeaders.ERROR_CODE,
+                RateLimitHeaders.MESSAGE,
+                request.getRequestURI()));
     }
 
     /** A duplicate username or email. */

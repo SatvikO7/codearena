@@ -8,7 +8,7 @@ The interesting part of this project is not the CRUD. It is everything around it
 asynchronous job processing, sandboxed execution of untrusted code, queue reliability,
 idempotency and concurrency control.
 
-> **Project status: Phase 8 of 16 complete and verified.** The judge works end to end: a
+> **Project status: Phase 9 of 16 complete and verified.** The judge works end to end: a
 > submission is queued, claimed by a worker, compiled and run inside a hardened sandbox,
 > given a verdict, and the result appears on the page without a reload — in practice and in
 > timed contests, on a live scoreboard. C++, Java and Python. This README describes what
@@ -96,7 +96,7 @@ codearena/
 ├── sandbox/            Sandbox image definitions, the seccomp profile, and the
 │                       script that builds the images
 ├── frontend/           React + TypeScript client
-├── docs/               Architecture, threat model, contests, auditing and decisions
+├── docs/               Architecture, threat model, contests, auditing, limits, decisions
 ├── pom.xml             Maven aggregator
 ├── docker-compose.yml  Full local stack
 └── .env.example        Configuration template
@@ -846,6 +846,140 @@ Full detail is in [docs/audit.md](docs/audit.md).
 
 ---
 
+## Rate limiting and abuse controls
+
+One caller can no longer make the system do unbounded work. A **token bucket in Redis**,
+evaluated as a single Lua script, decides whether a request may proceed; everything above
+it asks a question and reads an answer.
+
+### Where it sits
+
+```
+authentication → authorisation → rate limit → validation → handler
+     401             403            429
+```
+
+**Rate limiting is not authorisation and never runs in its place.** An anonymous caller is
+answered 401 and a caller without the role 403 — neither ever reaches the limiter. Only a
+request that is authenticated *and* permitted can be refused with 429. Tests assert it.
+
+Limits are attached to handler methods with `@RateLimited`, not to path patterns. Spring has
+already resolved the request to a handler, so a trailing slash, an encoded path segment, a
+method change or a second route to the same code all spend the same allowance — every
+classic bypass is drift between a route and a rule written about it, and there is no rule
+written about a route here.
+
+### The policies
+
+| Policy | Keyed on | Burst | Sustained | Redis down |
+|---|---|---|---|---|
+| Login (per caller) | client | 30 | 30/min | closed |
+| Login (per account, failures only) | account | 10 | 2/min | closed |
+| Registration | client | 10 | 30/hour | closed |
+| Submissions (practice **and** contest) | user | 10 | 6/min | closed |
+| Standings | user | 60 | 30/min | open |
+| Catalogue search | user | 60 | 30/min | open |
+| Administrative reads | administrator | 120 | 60/min | open |
+
+Every number is configuration. Ordinary browsing — listings, contest pages, submission
+history — is **not** limited: those are indexed, paginated queries whose cost is what a
+database is for, and limiting them would break somebody with six tabs open in order to
+guard against a nuisance.
+
+### Why a token bucket, in Redis, in one script
+
+The entire decision — refill, test, consume, expire — is one Lua script. A read-then-write
+from Java lets every concurrent caller observe the same remaining count and all be
+admitted, which is a bypass that appears precisely under load. A test fires twenty
+simultaneous submissions at a capacity of three and asserts that three pass.
+
+State is in Redis, so the limit is the limit however many API instances are running.
+**There is no in-memory fallback**: a local counter would make the enforced limit silently
+proportional to instance count while this page went on claiming one number.
+
+Each key's TTL is exactly the time its bucket needs to refill, so an expired bucket and a
+full bucket are the same thing — memory tracks recent activity rather than every identity
+ever seen, and a Redis restart needs no recovery code.
+
+### Login: throttled, never locked
+
+Two dimensions, because they answer different attacks. A per-caller cap does nothing about
+credential stuffing, which is distributed by nature; a per-account cap does.
+
+The per-account bucket counts **only failures**, and a correct password empties it
+outright. It is deliberately not a lockout: *N failures and the account is locked* hands an
+attacker a denial of service against any user whose name they can guess, which is worse
+than the bug it fixes. A bucket cannot lock — it refills continuously, so the worst an
+attacker achieves is to make the owner wait.
+
+> The residual weakness, stated rather than glossed: during a sustained attack the
+> account's owner competes for each newly regenerated token. They are **delayed, not locked
+> out**, the delay is bounded by the refill interval, and it ends when the attack does.
+
+The check runs *before* BCrypt, which is the point — cost 12 is a quarter-second of CPU,
+and a control applied afterwards has already paid for the attack. And a throttled login is
+byte-for-byte a throttled registration: same status, same code, same sentence, for a real
+account and an imaginary one alike. Login is built not to be an enumeration oracle, and the
+limiter must not give that back.
+
+### Identity, and an honest limitation
+
+Authenticated requests are keyed on the user, taken from the server-side session — the same
+source authorisation reads, so no body field, header or parameter can name somebody else.
+Addresses and attempted usernames are hashed before they become keys: the limiter needs to
+tell identities apart, and never needs to read them back.
+
+`X-Forwarded-For` is **ignored by default**, because any client can send it, and trusting
+it without a proxy that overwrites it means the attacker picks their own bucket.
+
+> **Known limitation.** The shipped deployment has no reverse proxy in front of the API —
+> nginx serves the frontend only. Behind Docker's published port the peer is often the
+> bridge gateway, so anonymous callers can collapse into one shared identity. This is
+> exactly why the per-caller login limit is a generous flood cap and the per-account
+> throttle carries the protection.
+
+### 429 semantics
+
+`RateLimit-Limit`, `RateLimit-Remaining` and `RateLimit-Reset` on every limited response;
+`Retry-After` only on a 429, where it is exact — a bucket refills at a known rate, so the
+wait is arithmetic rather than a guess. `Reset` is the wait for the *next* token, not for a
+full bucket, because that is the number the algorithm can actually guarantee.
+
+The body is the standard error envelope with `RATE_LIMITED`, and one fixed sentence that
+names no policy, no bucket, no key and no Redis.
+
+### When Redis is unavailable
+
+Login, registration and submissions **fail closed**; reads **fail open**. The trade is
+cheaper than it sounds, for one specific reason: **Redis already holds every session**, so
+for authenticated traffic "Redis is down" and "the API is down" are nearly the same
+sentence. Registration is the one real availability cost — it needs no session — and it is
+taken deliberately, because an outage is exactly when unlimited account creation would be
+worth having.
+
+Tests break the connection for real, with a proxy in front of a private Redis, and assert
+both modes and the recovery.
+
+### Rejections do not become a second attack surface
+
+A rejection is **not** audited one for one. The audit table is append-only with no
+retention tooling, so a row per rejection would let any rate-limited caller grow a table
+nobody can prune — using the requests the limiter just refused. One event and one log line
+per identity per cooldown instead, and policies keyed on caller-supplied text are excluded
+from auditing entirely. Metric labels are policy, outcome and identity *kind*: never a
+username, never an address.
+
+### In the browser
+
+A 429 is reported with the server's own wait — *try again in 30 seconds* — and the submit
+button is held closed for the duration with a countdown. **Nothing retries automatically.**
+An automatic retry is how a rate limit becomes a retry storm: every throttled client waking
+at once and resending the load the limit existed to shed.
+
+Full detail is in [docs/rate-limiting.md](docs/rate-limiting.md).
+
+---
+
 ## Configuration
 
 No secret is committed and none is hardcoded. Every environment-specific value is read
@@ -983,8 +1117,8 @@ as it lands, never before.
 | 6 | Secure execution, sandbox hardening, execution-service separation | **Complete** |
 | 7 | Contests, participation and contest scoring | **Complete** |
 | 8 | Admin operations, audit logging and system governance | **Complete** |
-| 9 | Rate limiting and abuse controls | Next |
-| 10 | Contests, scoring, leaderboards | Planned |
+| 9 | Rate limiting, quotas and abuse controls | **Complete** |
+| 10 | Observability, reliability and production readiness | Next |
 | 11 | Full frontend | Planned |
 | 12 | Kernel-level sandbox isolation (gVisor / rootless daemon) | Planned |
 | 13–16 | Testing, CI/CD, docs, deployment | Planned |

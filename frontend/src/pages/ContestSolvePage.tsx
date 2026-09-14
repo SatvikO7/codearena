@@ -5,6 +5,7 @@ import { getContest, submitToContest } from '../services/contestService';
 import { formatDuration } from '../services/contestClock';
 import { useContestClock } from '../hooks/useContestClock';
 import { apiErrorCode, describeApiError } from '../services/apiClient';
+import { useRateLimitCooldown } from '../hooks/useRateLimitCooldown';
 import { useSubmissionStream } from '../hooks/useSubmissionStream';
 import { SubmissionVerdict } from '../components/SubmissionVerdict';
 import { ContestStatusPill } from '../components/ContestStatusPill';
@@ -61,6 +62,7 @@ function ContestSolveView({ contestId, problemId }: { contestId: string; problem
   const [source, setSource] = useState<string>(() => loadDraft(contestId, problemId, 'PYTHON'));
 
   const [submitting, setSubmitting] = useState(false);
+  const { remainingSeconds, cooling, startIfRateLimited } = useRateLimitCooldown();
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [submissionId, setSubmissionId] = useState<string | null>(null);
 
@@ -131,7 +133,7 @@ function ContestSolveView({ contestId, problemId }: { contestId: string; problem
   }
 
   async function submit() {
-    if (submitting) {
+    if (submitting || cooling) {
       return;
     }
     setSubmitting(true);
@@ -142,6 +144,7 @@ function ContestSolveView({ contestId, problemId }: { contestId: string; problem
     } catch (caught) {
       // A rejection here is usually the deadline, and the server's message says which side
       // of it the submission landed on. Re-fetch so the page stops showing a live contest.
+      startIfRateLimited(caught);
       setSubmitError(describeApiError(caught));
       await loadContest();
     } finally {
@@ -293,8 +296,13 @@ function ContestSolveView({ contestId, problemId }: { contestId: string; problem
         />
 
         <div className="form-actions">
-          <button type="button" className="button" onClick={submit} disabled={!canSubmit || submitting}>
-            {submitting ? 'Submitting…' : 'Submit'}
+          <button
+            type="button"
+            className="button"
+            onClick={submit}
+            disabled={!canSubmit || submitting || cooling}
+          >
+            {submitting ? 'Submitting…' : cooling ? `Wait ${remainingSeconds}s` : 'Submit'}
           </button>
         </div>
 

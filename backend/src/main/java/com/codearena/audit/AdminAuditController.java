@@ -5,6 +5,8 @@ import com.codearena.common.PageResponse;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.media.Content;
+import com.codearena.ratelimit.RateLimitPolicy;
+import com.codearena.ratelimit.RateLimited;
 import io.swagger.v3.oas.annotations.responses.ApiResponse;
 import io.swagger.v3.oas.annotations.responses.ApiResponses;
 import io.swagger.v3.oas.annotations.tags.Tag;
@@ -76,7 +78,16 @@ public class AdminAuditController {
                        the schema. `entityType` is one of USER, PROBLEM, CONTEST,
                        CONTEST_PROBLEM or SUBMISSION.
                        """)
-    @ApiResponses(@ApiResponse(responseCode = "200", description = "A page of audit events"))
+    @ApiResponses({
+            @ApiResponse(responseCode = "200", description = "A page of audit events"),
+            @ApiResponse(responseCode = "429", description = "Searching the audit log too often",
+                         content = @Content)
+    })
+    // Administrators are limited too. "Trusted users are exempt" is how a control ends up
+    // protecting only the people who were never the threat -- and an admin session is the
+    // one with the most reach if it is stolen. The allowance is generous enough that the
+    // admin page cannot reach it by paging or refreshing; it is here to bound a script.
+    @RateLimited(RateLimitPolicy.ADMIN_READ)
     public PageResponse<AuditEventResponse> search(
             @Parameter(description = "The acting user's public id.")
             @RequestParam(required = false) UUID actorUserId,

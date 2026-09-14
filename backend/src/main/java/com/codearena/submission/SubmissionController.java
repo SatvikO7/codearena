@@ -3,6 +3,8 @@ package com.codearena.submission;
 import com.codearena.auth.AuthenticatedUser;
 import com.codearena.common.PageResponse;
 import com.codearena.common.PageRequests;
+import com.codearena.ratelimit.RateLimitPolicy;
+import com.codearena.ratelimit.RateLimited;
 import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Sort;
 import com.codearena.shared.Language;
@@ -66,8 +68,10 @@ public class SubmissionController {
     @ApiResponses({
             @ApiResponse(responseCode = "202", description = "Accepted into the queue"),
             @ApiResponse(responseCode = "400", description = "Unsupported language, empty source, or source too large", content = @Content),
-            @ApiResponse(responseCode = "404", description = "No published problem with that id", content = @Content)
+            @ApiResponse(responseCode = "404", description = "No published problem with that id", content = @Content),
+            @ApiResponse(responseCode = "429", description = "Submitting faster than the judge can be asked to work", content = @Content)
     })
+    @RateLimited(RateLimitPolicy.SUBMISSION)
     public ResponseEntity<SubmissionAcceptedResponse> submit(
             @PathVariable UUID problemId,
             @Valid @RequestBody SubmissionRequest request,

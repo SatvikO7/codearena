@@ -1,5 +1,7 @@
 package com.codearena.config;
 
+import com.codearena.ratelimit.RateLimitInterceptor;
+import com.codearena.ratelimit.RateLimitProperties;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -7,6 +9,8 @@ import org.springframework.data.jpa.repository.config.EnableJpaAuditing;
 import org.springframework.web.cors.CorsConfiguration;
 import org.springframework.web.cors.CorsConfigurationSource;
 import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
+import org.springframework.web.servlet.config.annotation.InterceptorRegistry;
+import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
 
 import java.util.List;
 
@@ -17,14 +21,30 @@ import java.util.List;
  * for it, so no service has to remember to set them.
  */
 @Configuration
-@EnableConfigurationProperties(CorsProperties.class)
+@EnableConfigurationProperties({CorsProperties.class, RateLimitProperties.class})
 @EnableJpaAuditing
-public class WebConfig {
+public class WebConfig implements WebMvcConfigurer {
 
     private final CorsProperties corsProperties;
+    private final RateLimitInterceptor rateLimitInterceptor;
 
-    public WebConfig(CorsProperties corsProperties) {
+    public WebConfig(CorsProperties corsProperties, RateLimitInterceptor rateLimitInterceptor) {
         this.corsProperties = corsProperties;
+        this.rateLimitInterceptor = rateLimitInterceptor;
+    }
+
+    /**
+     * Rate limiting is registered across the whole API and decides per handler.
+     *
+     * <p>A broad path pattern with per-handler opt-in, rather than a list of protected
+     * paths. The interceptor does nothing at all to a handler without a
+     * {@link com.codearena.ratelimit.RateLimited} annotation, so the mapping costs a single
+     * annotation lookup on unprotected routes -- and, crucially, a protected handler cannot
+     * be reached by a spelling of its path that somebody forgot to add here.
+     */
+    @Override
+    public void addInterceptors(InterceptorRegistry registry) {
+        registry.addInterceptor(rateLimitInterceptor).addPathPatterns("/**");
     }
 
     /**

@@ -9,6 +9,12 @@ import com.codearena.audit.AuditService;
 import com.codearena.auth.dto.LoginRequest;
 import com.codearena.auth.dto.RegistrationRequest;
 import com.codearena.auth.dto.UserProfileResponse;
+import com.codearena.ratelimit.CallerIdentity;
+import com.codearena.ratelimit.RateLimitDecision;
+import com.codearena.ratelimit.RateLimitExceededException;
+import com.codearena.ratelimit.RateLimitPolicy;
+import com.codearena.ratelimit.RateLimitService;
+import com.codearena.ratelimit.RateLimited;
 import com.codearena.user.User;
 import com.codearena.user.UserRegistrationService;
 import com.codearena.user.UserRepository;
@@ -61,17 +67,20 @@ public class AuthController {
     private final SecurityContextRepository securityContextRepository;
     private final UserRepository userRepository;
     private final AuditService auditService;
+    private final RateLimitService rateLimitService;
 
     public AuthController(UserRegistrationService registrationService,
                           AuthenticationManager authenticationManager,
                           SecurityContextRepository securityContextRepository,
                           UserRepository userRepository,
-                          AuditService auditService) {
+                          AuditService auditService,
+                          RateLimitService rateLimitService) {
         this.registrationService = registrationService;
         this.authenticationManager = authenticationManager;
         this.securityContextRepository = securityContextRepository;
         this.userRepository = userRepository;
         this.auditService = auditService;
+        this.rateLimitService = rateLimitService;
     }
 
     @PostMapping("/register")
@@ -86,8 +95,10 @@ public class AuthController {
     @ApiResponses({
             @ApiResponse(responseCode = "201", description = "Account created"),
             @ApiResponse(responseCode = "400", description = "Validation failed", content = @io.swagger.v3.oas.annotations.media.Content),
-            @ApiResponse(responseCode = "409", description = "Username or email already in use", content = @io.swagger.v3.oas.annotations.media.Content)
+            @ApiResponse(responseCode = "409", description = "Username or email already in use", content = @io.swagger.v3.oas.annotations.media.Content),
+            @ApiResponse(responseCode = "429", description = "Too many registrations from this client", content = @io.swagger.v3.oas.annotations.media.Content)
     })
+    @RateLimited(RateLimitPolicy.REGISTRATION)
     public ResponseEntity<UserProfileResponse> register(@Valid @RequestBody RegistrationRequest request) {
         User created = registrationService.register(request);
         return ResponseEntity.status(HttpStatus.CREATED).body(UserProfileResponse.from(created));
@@ -103,14 +114,24 @@ public class AuthController {
     @ApiResponses({
             @ApiResponse(responseCode = "200", description = "Authenticated"),
             @ApiResponse(responseCode = "401", description = "Invalid credentials", content = @io.swagger.v3.oas.annotations.media.Content),
-            @ApiResponse(responseCode = "403", description = "Account disabled", content = @io.swagger.v3.oas.annotations.media.Content)
+            @ApiResponse(responseCode = "403", description = "Account disabled", content = @io.swagger.v3.oas.annotations.media.Content),
+            @ApiResponse(responseCode = "429", description = "Too many login attempts", content = @io.swagger.v3.oas.annotations.media.Content)
     })
+    @RateLimited(RateLimitPolicy.LOGIN_ORIGIN)
     public ResponseEntity<UserProfileResponse> login(@Valid @RequestBody LoginRequest request,
                                                      HttpServletRequest httpRequest,
                                                      HttpServletResponse httpResponse) {
 
+        CallerIdentity account = CallerIdentity.ofAccount(request.identifier());
+        throttleGuessingAt(account);
+
         Authentication authentication = authenticate(request);
         AuthenticatedUser principal = (AuthenticatedUser) authentication.getPrincipal();
+
+        // The password was right, so nothing that came before it was an attack on this
+        // account. Clearing the record keeps a legitimate user from accumulating against
+        // themselves, and means the throttle only ever reflects unsuccessful guessing.
+        rateLimitService.reset(RateLimitPolicy.LOGIN_ACCOUNT, account);
 
         // Session fixation defence: discard any session the caller arrived holding, so the
         // authenticated session is always one this server has just issued. An attacker who
@@ -159,6 +180,45 @@ public class AuthController {
             log.info("Login failed: bad credentials");
             throw new AuthenticationFailedException(
                     INVALID_CREDENTIALS, HttpStatus.UNAUTHORIZED, "Invalid username or password");
+        }
+    }
+
+    /**
+     * The second dimension of login protection: a limit on guessing at <em>one account</em>,
+     * however many places the guesses come from.
+     *
+     * <p>{@link RateLimitPolicy#LOGIN_ORIGIN} already caps how fast one caller can try, but
+     * it is keyed on a network identity that this deployment cannot always tell apart, and
+     * credential stuffing is distributed by nature. This one holds regardless: the bucket
+     * belongs to the account being attacked, so spreading the attempts across a thousand
+     * sources does not multiply the allowance.
+     *
+     * <h2>A throttle, deliberately not a lockout</h2>
+     * The obvious version of this control — "N failures and the account is locked" — hands
+     * an attacker a denial of service against any user whose name they can guess, which is
+     * a worse bug than the one being fixed. A token bucket cannot lock anything: it refills
+     * continuously, so the account owner is never more than one refill interval away from
+     * an attempt, and the correct password empties the bucket outright. The worst an
+     * attacker achieves is to make the real user wait, briefly, and try again.
+     *
+     * <p>The residual weakness is stated rather than papered over: while a sustained
+     * distributed attack is running against one account, its owner is competing for each
+     * newly regenerated token and may need more than one attempt to get in. They are
+     * delayed, not locked out, and the delay ends when the attack does. See
+     * {@code docs/rate-limiting.md}.
+     *
+     * <p>The check happens before authentication, which is the point — the expensive part of
+     * a login is the BCrypt verification at cost 12, and a control that ran afterwards would
+     * have already paid for the attack it was meant to prevent.
+     */
+    private void throttleGuessingAt(CallerIdentity account) {
+        RateLimitDecision decision = rateLimitService.check(RateLimitPolicy.LOGIN_ACCOUNT, account);
+        if (!decision.allowed()) {
+            // Not audited: the identity is derived from caller-supplied text, so an event
+            // per rejection would let anybody write unbounded rows into an append-only
+            // table by inventing usernames. See RateLimitViolationAuditor.
+            log.info("Login throttled for an account under repeated failed attempts");
+            throw new RateLimitExceededException(RateLimitPolicy.LOGIN_ACCOUNT, decision);
         }
     }
 

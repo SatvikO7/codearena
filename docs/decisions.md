@@ -1278,3 +1278,104 @@ belongs with queue observability rather than here.
 
 **Trade-off.** The endpoint must be extended by hand as the system grows, and will lag behind
 what Actuator would have offered automatically. That lag is the feature.
+
+---
+
+## ADR-039 — Rate limiting: a Redis token bucket, and what happens when Redis is gone
+
+**Problem.** Nothing bounded what one caller could make the system do. Login was
+unprotected against guessing — and login is deliberately expensive, because BCrypt at cost
+12 is roughly a quarter-second of CPU per attempt. Submissions were unbounded, and a
+submission is the cheapest request in the system to make and the most expensive to serve:
+it compiles and runs untrusted code in a container against every test case. One scripted
+user could fill the judging queue faster than the workers drain it and delay everybody
+else's verdicts, with no exploit involved at all.
+
+**Options.** A servlet filter with per-instance counters; a library (Bucket4j, Resilience4j)
+over Redis; a hand-written Redis token bucket; an API gateway or nginx `limit_req`.
+
+**Chosen.** A token bucket evaluated as one Lua script inside Redis, applied by a Spring MVC
+interceptor driven by a `@RateLimited` annotation on handler methods.
+
+**Why not in-memory.** It is the tempting answer and it is wrong for a system that is meant
+to scale horizontally: the enforced limit silently becomes *N* times the configured one, and
+the documentation goes on claiming a single number. A control that is wrong in an unstated
+direction is worse than one that is absent, because it is believed. There is deliberately
+no local fallback either, for the same reason — a fallback would make the limit correct
+until the moment it mattered.
+
+**Why not nginx.** The limits that matter here are per *user* and per *account*, which are
+application concepts; nginx can count addresses, and addresses are the one identity this
+deployment cannot see clearly. It also could not refund a bucket on a successful login, or
+share one allowance between the practice and contest submission endpoints.
+
+**Why not a library.** Bucket4j over Redis would do the arithmetic competently. It would
+also add a dependency and an abstraction for roughly forty lines of Lua, and the interesting
+decisions here are not the arithmetic — they are which identity to key on, which policy
+fails open, and how to avoid turning rejections into an attack on the audit log. None of
+those are in a library.
+
+**Why the script is one script.** A read-then-write from Java — `GET` the count, compare,
+`INCR` — lets every concurrent caller read the same remaining count and all be admitted.
+That bypass appears precisely under load, which is the condition a limiter exists for. The
+clock is Redis's own `TIME` rather than the application's, so several instances with drifting
+clocks still agree; and the key's TTL is exactly the time the bucket needs to refill, so an
+expired bucket and a full bucket are the same thing and memory tracks recent activity rather
+than every identity ever seen.
+
+**Why a bucket rather than a window.** A fixed window admits twice its allowance across a
+boundary. A sliding-window log stores one entry per request, which is unbounded state chosen
+by the attacker. A bucket also makes `Retry-After` arithmetic instead of a guess, which is
+what lets the header be honest — and a `Retry-After` that clients learn to distrust is worse
+than none.
+
+**Why the annotation rather than path patterns.** Every classic bypass is drift between a
+route and a rule written about it: a trailing slash, an encoded path segment, a second route
+reaching the same handler, a method that falls through. Spring has already resolved the
+request to a handler by the time the interceptor runs, so whatever spelling got the caller
+there, the same allowance is spent. Contest and practice submissions share a bucket for the
+same reason — two allowances would have made each endpoint the other's loophole.
+
+**Ordering.** The interceptor runs after the entire security filter chain. An unauthenticated
+caller is answered 401 and an unauthorised one 403, in both cases without reaching the
+limiter. Running earlier would let anonymous traffic exhaust the allowance of endpoints it
+was never permitted to call, and would answer 429 where 401 was the truth.
+
+**Login is limited in two dimensions, and locks nothing.** A per-caller cap does nothing
+about credential stuffing, which is distributed by nature; a per-account cap does. But the
+obvious per-account control — N failures and the account is locked — hands an attacker a
+denial of service against any user whose name they can guess, which is worse than the bug it
+fixes. A bucket cannot lock: it refills continuously, and a correct password empties it, so
+the worst an attacker achieves is to make the owner wait. The residual weakness is real and
+is written down rather than glossed: during a sustained attack the owner competes for each
+regenerated token. They are delayed, not locked out.
+
+**Fail closed for login, registration and submissions; open for reads.** The reasoning turns
+on something already true of this architecture: **Redis holds every session.** For
+authenticated traffic, "Redis is down" and "the API is down" are nearly the same sentence, so
+closing the security-critical policies costs very little that was still working. Registration
+is the one genuine availability cost — it needs no session, so failing closed really does
+stop account creation during an outage — and it is taken deliberately, because every
+registration writes a permanent row to the authoritative database and an outage is exactly
+the moment an attacker would choose. Reads fail open: the limiter there is a comfort against
+wasted database work, and an unavailable comfort must not become a second outage.
+
+**Rejections are audited once per burst, not once per request.** The audit table is
+append-only and has no retention tooling, so a row per rejection would let every rate-limited
+caller grow a table nobody can prune — using the very requests the limiter refused. A Redis
+marker claimed with `SET NX EX` collapses a burst into one event and one log line. Policies
+keyed on caller-supplied text are excluded from auditing altogether, because their identity
+space is whatever an attacker can type.
+
+**Trade-offs.**
+
+- Registration stops working while Redis is down. Intended, and stated.
+- Anonymous per-caller limits are weaker than they appear in the shipped deployment, because
+  there is no reverse proxy in front of the API and Docker's published port hides the real
+  peer. Documented rather than papered over with a forwarded header this system cannot
+  verify; the per-account throttle is what carries the protection meanwhile.
+- Every limited request costs one Redis round trip. Measured against the alternative — a
+  submission costing a container start — this is not a cost worth optimising.
+- Key cardinality is bounded by TTL rather than by a hard cap, so a flood of invented
+  identities creates buckets that expire rather than buckets that accumulate. There is no
+  ceiling on key count, only on how long each key survives.

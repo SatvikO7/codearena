@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { getStandings } from '../services/contestService';
-import { describeApiError } from '../services/apiClient';
+import { describeApiError, isRateLimited, retryAfterSeconds } from '../services/apiClient';
 import type { Standings } from '../types/contest';
 
 /**
@@ -20,6 +20,21 @@ import type { Standings } from '../types/contest';
 const REFRESH_MS = 15_000;
 
 /**
+ * How long to stop refreshing for if the server ever does say "too many requests".
+ *
+ * <p>The refresh above consumes a small fraction of the standings allowance, so a browser
+ * should never reach it — but "should never" is not a reason to leave a poller that keeps
+ * its rhythm through a refusal. A client that is told to slow down and carries on at the
+ * same rate is the exact shape of load the limit exists to shed, and it would be arriving
+ * from every open scoreboard at once.
+ *
+ * <p>Used only when the server declines to say how long; its own `Retry-After` is preferred,
+ * because it is computed from the state of the bucket and is therefore the number that is
+ * actually right.
+ */
+const BACKOFF_MS = 60_000;
+
+/**
  * The scoreboard.
  *
  * <p>Always rendered from the server's response. There is no local score arithmetic here at
@@ -31,8 +46,18 @@ export function ContestStandings({ contestId, live }: { contestId: string; live:
   const [standings, setStandings] = useState<Standings | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  /**
+   * When the next refresh may happen. A ref rather than state: it changes on a failure that
+   * should not itself re-render, and putting it in the interval's dependencies would tear
+   * the timer down and rebuild it.
+   */
+  const nextAllowedAt = useRef(0);
+
   const load = useCallback(
     async (signal?: AbortSignal) => {
+      if (Date.now() < nextAllowedAt.current) {
+        return;   // still backing off from a refusal
+      }
       try {
         const fetched = await getStandings(contestId, signal);
         if (signal?.aborted) return;
@@ -40,6 +65,11 @@ export function ContestStandings({ contestId, live }: { contestId: string; live:
         setError(null);
       } catch (caught) {
         if (signal?.aborted) return;
+        if (isRateLimited(caught)) {
+          const seconds = retryAfterSeconds(caught);
+          nextAllowedAt.current =
+            Date.now() + (seconds === undefined ? BACKOFF_MS : seconds * 1000);
+        }
         setError(describeApiError(caught));
       }
     },

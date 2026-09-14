@@ -239,7 +239,7 @@ snapshot on connect, a convergent client reducer that ignores anything not stric
 and a bounded fallback poll armed only when the stream fails. See
 [submission-lifecycle.md](submission-lifecycle.md) and ADR-023/ADR-024.
 
-## Current state (Phase 8 — complete and verified)
+## Current state (Phase 9 — complete and verified)
 
 Implemented:
 
@@ -326,6 +326,24 @@ Added in Phase 7:
 - Contest, contest-solve, standings and admin contest pages, with a server-corrected
   countdown
 
+Added in Phase 9:
+
+- A Redis token bucket, evaluated as one Lua script, as the single rate-limit mechanism:
+  atomic, bounded, self-expiring, and shared by every API instance (ADR-039)
+- Limits on login (per caller and per account), registration, submissions, standings,
+  catalogue search and administrative reads — applied per handler rather than per path,
+  so no spelling of a URL and no second route to the same code is a way round one
+- A login throttle that is a delay rather than a lockout, so protecting an account cannot
+  be used to take it away from its owner
+- One shared submission allowance across practice and contests, because the resource being
+  protected is one judging queue
+- 429 with `Retry-After` computed from the bucket rather than guessed, and one fixed
+  message that reveals neither the policy nor whether an account exists
+- Declared fail-open/fail-closed behaviour per policy, tested by genuinely severing the
+  connection to Redis
+- Rate-limit rejections collapsed into one audit event and one log line per identity per
+  cooldown, so a refused caller cannot flood an append-only table
+
 Added in Phase 8:
 
 - `audit_events` (`V7`): an append-only record of security-sensitive and administrative
@@ -351,6 +369,17 @@ reaches `healthy` with zero restarts; Flyway records `V1` through `V6` as applie
 asserted to contain neither a hidden test case's input nor its expected output; a `status`
 field added to an update payload is ignored; and every admin mutation returns 403 to a USER
 and 401 to an anonymous caller.
+
+Phase 9 adds to that: exactly the configured number of concurrent requests is admitted and
+no more; an unauthenticated caller is answered 401 and an unauthorised one 403, never 429;
+a refused submission becomes neither a row nor a queued job; the contest endpoint cannot be
+used to escape the practice limit, nor the reverse; a throttled contest submission is never
+scored; one user's allowance is never another's, and one policy's is never another's; the
+account throttle cannot be escaped by changing capitalisation and never disables an account;
+a forged forwarding header buys nothing; no attempted username or address is readable from
+the keyspace and every bucket expires; administrators are limited too; closed policies refuse
+and open ones serve when Redis is unreachable; and enforcement resumes by itself once it
+returns.
 
 Phase 8 adds to that: an audit event cannot be updated or deleted, including by a blanket
 DELETE; a success event written in a transaction that rolls back does not survive;
@@ -383,7 +412,15 @@ and the one that ran less often would be the one nobody noticed was broken.
 audit events describe changes and never define them. Nothing is reconstructed from the
 log, and CodeArena is not an event-sourced system (ADR-036).
 
-**Not implemented, and not claimed:** there is no client IP in audit records, no worker
+**Rate limiting is not authorisation.** It runs after the security filter chain has already
+decided, and it can only ever refuse a request that was otherwise permitted. No
+authorisation check was relaxed, moved or replaced (ADR-039).
+
+**Not implemented, and not claimed:** there is no trustworthy client IP in the shipped
+deployment, so anonymous per-caller limits are weaker than they appear and the per-account
+throttle carries the protection; there are no lifetime quotas, no adaptive or reputational
+limiting, no CAPTCHA and no abuse scoring; no alerting on rejections; no client IP in audit
+records, no worker
 heartbeat, no user administration, no audit retention tooling and no tamper-evidence
 beyond access control; no alerting on suspicious patterns; and **no plagiarism detection
 and no anti-cheat

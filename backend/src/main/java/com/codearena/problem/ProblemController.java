@@ -13,6 +13,8 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
+import com.codearena.ratelimit.RateLimitPolicy;
+import com.codearena.ratelimit.RateLimited;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
@@ -47,6 +49,20 @@ public class ProblemController {
                        Paging is zero-based. `size` defaults to 20 and is clamped to 100.
                        Ordering always ends with a unique tiebreaker, so paging is stable.
                        """)
+    @io.swagger.v3.oas.annotations.responses.ApiResponses({
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "200", description = "A page of published problems"),
+            @io.swagger.v3.oas.annotations.responses.ApiResponse(
+                    responseCode = "429",
+                    description = "Searching too often. Applies only when `search` is supplied; "
+                                + "listing without a search term is not rate limited.",
+                    content = @io.swagger.v3.oas.annotations.media.Content)
+    })
+    // Limited only when a search term is supplied: a plain page of the catalogue is an
+    // indexed read, while a term runs a trigram match across every problem. Charging the
+    // cheap case the same allowance as the expensive one would throttle ordinary browsing
+    // to protect against something ordinary browsing does not do.
+    @RateLimited(value = RateLimitPolicy.PROBLEM_SEARCH, onlyWhenParameterPresent = "search")
     public PageResponse<ProblemSummaryResponse> list(
             @Parameter(description = "Zero-based page index") @RequestParam(required = false) Integer page,
             @Parameter(description = "Items per page; clamped to 100") @RequestParam(required = false) Integer size,

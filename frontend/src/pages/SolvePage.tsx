@@ -4,6 +4,7 @@ import { getProblem } from '../services/problemService';
 import { submitSolution } from '../services/submissionService';
 import { apiErrorCode, describeApiError } from '../services/apiClient';
 import { useSubmissionStream } from '../hooks/useSubmissionStream';
+import { useRateLimitCooldown } from '../hooks/useRateLimitCooldown';
 import { SubmissionVerdict } from '../components/SubmissionVerdict';
 import { DifficultyBadge } from '../components/DifficultyBadge';
 import { LANGUAGES, STARTER_CODE } from '../types/submission';
@@ -52,6 +53,7 @@ function SolveView({ slug }: { slug: string }) {
   const [submissionId, setSubmissionId] = useState<string | null>(null);
 
   const { status, pending, timedOut, transport } = useSubmissionStream(submissionId);
+  const { remainingSeconds, cooling, startIfRateLimited } = useRateLimitCooldown();
 
   useEffect(() => {
     const controller = new AbortController();
@@ -88,8 +90,10 @@ function SolveView({ slug }: { slug: string }) {
   }
 
   async function handleSubmit() {
-    if (!problem || submitting || pending) {
-      return;   // guards the double-click: a submission in flight blocks another
+    if (!problem || submitting || pending || cooling) {
+      // Guards the double-click -- a submission in flight blocks another -- and the
+      // re-press after a refusal, which would only earn another refusal.
+      return;
     }
     setSubmitting(true);
     setSubmitError(null);
@@ -98,6 +102,9 @@ function SolveView({ slug }: { slug: string }) {
       const accepted = await submitSolution(problem.id, language, source);
       setSubmissionId(accepted.submissionId);
     } catch (caught) {
+      // Holds the button closed for as long as the server asked. Nothing is resent when
+      // the countdown ends: the next attempt is the user's to make.
+      startIfRateLimited(caught);
       setSubmitError(describeApiError(caught));
     } finally {
       setSubmitting(false);
@@ -244,9 +251,15 @@ function SolveView({ slug }: { slug: string }) {
                 type="button"
                 className="button"
                 onClick={handleSubmit}
-                disabled={submitting || pending || source.trim() === ''}
+                disabled={submitting || pending || cooling || source.trim() === ''}
               >
-                {submitting ? 'Submitting…' : pending ? 'Judging…' : 'Submit'}
+                {submitting
+                  ? 'Submitting…'
+                  : pending
+                    ? 'Judging…'
+                    : cooling
+                      ? `Wait ${remainingSeconds}s`
+                      : 'Submit'}
               </button>
               <span className="field-hint">
                 {source.length.toLocaleString()} characters

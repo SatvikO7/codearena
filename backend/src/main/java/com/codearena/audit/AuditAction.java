@@ -98,5 +98,19 @@ public enum AuditAction {
      * <p>Always {@link AuditOutcome#DENIED}. One of these is a misclick; a pattern of them
      * is somebody probing the admin surface, and that is exactly what an audit log is for.
      */
-    ADMIN_ACCESS_DENIED
+    ADMIN_ACCESS_DENIED,
+
+    /**
+     * A rate limit was reached, and the caller kept going.
+     *
+     * <p>Always {@link AuditOutcome#DENIED}, and deliberately <b>not</b> written once per
+     * rejected request. A single event stands for a burst of rejections by one identity
+     * under one policy, over a configured cooldown. Recording each rejection would let
+     * anybody who can be rate limited write unbounded rows into a table that cannot be
+     * deleted -- a rejected request would become a way to attack the audit log itself.
+     *
+     * <p>Only policies keyed on something bounded produce these. See
+     * {@link com.codearena.ratelimit.RateLimitViolationAuditor}.
+     */
+    RATE_LIMIT_EXCEEDED
 }

@@ -5,6 +5,8 @@ import com.codearena.queue.SubmissionQueue;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.media.Content;
 import io.swagger.v3.oas.annotations.media.Schema;
+import com.codearena.ratelimit.RateLimitPolicy;
+import com.codearena.ratelimit.RateLimited;
 import io.swagger.v3.oas.annotations.responses.ApiResponse;
 import io.swagger.v3.oas.annotations.responses.ApiResponses;
 import io.swagger.v3.oas.annotations.tags.Tag;
@@ -105,7 +107,13 @@ public class AdminSystemController {
                        what the container health checks poll, and they stay unauthenticated so
                        an orchestrator can reach them.
                        """)
-    @ApiResponses(@ApiResponse(responseCode = "200", description = "The current status"))
+    @ApiResponses({
+            @ApiResponse(responseCode = "200", description = "The current status"),
+            @ApiResponse(responseCode = "429", description = "Polling the status too often", content = @Content)
+    })
+    // Shares the administrative allowance with the audit search: the dashboard polls this
+    // every ten seconds, which is a small fraction of it.
+    @RateLimited(RateLimitPolicy.ADMIN_READ)
     public SystemStatus status() {
         return new SystemStatus(
                 version,

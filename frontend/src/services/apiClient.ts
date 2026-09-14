@@ -32,6 +32,47 @@ export function apiErrorCode(error: unknown): string | undefined {
   return apiErrorBody(error)?.error;
 }
 
+/**
+ * Whether the server refused this request for going too fast.
+ *
+ * Worth distinguishing from every other failure: a 429 is not a bug, not a lost session and
+ * not something the user did wrong. It is temporary, and the only correct response is to
+ * wait — which is a different thing to tell somebody than "request failed with status 429".
+ */
+export function isRateLimited(error: unknown): boolean {
+  return axios.isAxiosError(error) && error.response?.status === 429;
+}
+
+/**
+ * How long the server asked the client to wait, in seconds.
+ *
+ * Read from `Retry-After` rather than guessed. The server computes it from the state of the
+ * bucket, so it is the one number that is actually right; inventing a delay locally would
+ * either retry too early — and be refused again — or make the user wait longer than they
+ * need to. Returns undefined when the header is missing or not a number, in which case the
+ * UI says "in a moment" rather than making something up.
+ */
+export function retryAfterSeconds(error: unknown): number | undefined {
+  if (!axios.isAxiosError(error)) {
+    return undefined;
+  }
+  const header = error.response?.headers?.['retry-after'] as string | number | undefined;
+  if (header === undefined || header === null || header === '') {
+    return undefined;
+  }
+  const seconds = Number(header);
+  return Number.isFinite(seconds) && seconds >= 0 ? Math.ceil(seconds) : undefined;
+}
+
+/** "17 seconds", "1 minute" — a wait a person can act on. */
+export function describeWait(seconds: number): string {
+  if (seconds < 60) {
+    return `${seconds} second${seconds === 1 ? '' : 's'}`;
+  }
+  const minutes = Math.ceil(seconds / 60);
+  return `${minutes} minute${minutes === 1 ? '' : 's'}`;
+}
+
 /** Field-level validation failures, ready to attach to form inputs. */
 export function apiFieldErrors(error: unknown): FieldViolation[] {
   return apiErrorBody(error)?.fieldErrors ?? [];
@@ -47,6 +88,15 @@ export function apiFieldErrors(error: unknown): FieldViolation[] {
 export function describeApiError(error: unknown): string {
   if (axios.isAxiosError(error)) {
     const axiosError = error as AxiosError<ApiError>;
+    // Answered before the generic body message, because the server's sentence is
+    // deliberately identical for every policy -- it must not reveal which control was
+    // tripped -- and the concrete wait is the part that is actually useful here.
+    if (isRateLimited(error)) {
+      const wait = retryAfterSeconds(error);
+      return wait === undefined
+        ? 'Too many requests. Please wait a moment and try again.'
+        : `Too many requests. Please try again in ${describeWait(wait)}.`;
+    }
     if (axiosError.response?.data?.message) {
       return axiosError.response.data.message;
     }

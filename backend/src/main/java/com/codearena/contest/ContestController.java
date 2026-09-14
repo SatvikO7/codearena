@@ -23,6 +23,8 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
+import com.codearena.ratelimit.RateLimitPolicy;
+import com.codearena.ratelimit.RateLimited;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestParam;
@@ -192,8 +194,19 @@ public class ContestController {
             @ApiResponse(responseCode = "404",
                          description = "No such contest, or the problem is not in it", content = @Content),
             @ApiResponse(responseCode = "409",
-                         description = "Not registered, or the contest is not LIVE", content = @Content)
+                         description = "Not registered, or the contest is not LIVE", content = @Content),
+            @ApiResponse(responseCode = "429",
+                         description = "Submitting faster than the judge can be asked to work", content = @Content)
     })
+    // The same bucket as a practice submission, and deliberately so. The resource under
+    // protection is one shared judging queue, so two allowances would let a contestant
+    // apply twice the pressure to it -- and would make this endpoint a way around the
+    // other. The allowance is sized for contest use rather than for idle browsing: a
+    // competitor fixing a bug and resubmitting stays comfortably inside it, while a script
+    // does not. Nothing here touches the deadline: the contest window is still evaluated
+    // server-side inside the service, so a throttled submission is one that was never
+    // accepted, never queued and never scored.
+    @RateLimited(RateLimitPolicy.SUBMISSION)
     public ResponseEntity<SubmissionAcceptedResponse> submit(
             @PathVariable UUID contestId,
             @PathVariable UUID problemId,
@@ -238,8 +251,14 @@ public class ContestController {
             @ApiResponse(responseCode = "200", description = "The standings"),
             @ApiResponse(responseCode = "401", description = "Not authenticated", content = @Content),
             @ApiResponse(responseCode = "404",
-                         description = "No such contest, or it is a draft", content = @Content)
+                         description = "No such contest, or it is a draft", content = @Content),
+            @ApiResponse(responseCode = "429", description = "Reading standings too often", content = @Content)
     })
+    // The most expensive read in the system: recomputed from the submission table on every
+    // request, and more expensive the fuller the contest gets -- which is exactly when the
+    // most people are watching. The allowance is several times what the page's own refresh
+    // consumes, so a browser never reaches it.
+    @RateLimited(RateLimitPolicy.STANDINGS)
     public StandingsResponse standings(@PathVariable UUID contestId) {
         return standingsService.standings(contestId);
     }
