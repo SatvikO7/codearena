@@ -78,12 +78,17 @@ public class DockerSandboxService implements SandboxService {
 
     @Override
     public Workspace prepare(String submissionId, Language language, String source) {
+        long preparingSince = System.nanoTime();
         LanguageSpec spec = LanguageSpec.forLanguage(language);
         // The volume name is generated here, never derived from a caller's input.
         String volume = "codearena-ws-" + UUID.randomUUID();
         DockerWorkspace workspace = new DockerWorkspace(submissionId, spec, volume);
         try {
             workspace.create(source);
+            // Pure overhead: the gap between deciding to run a program and being able to.
+            // Worth its own timer because a whole judgement's duration cannot say whether
+            // it grew because programs got slower or because starting them did.
+            metrics.recordStartup(java.time.Duration.ofNanos(System.nanoTime() - preparingSince));
             return workspace;
         } catch (RuntimeException e) {
             // A half-built workspace still owns a volume; do not leak it.
@@ -268,6 +273,11 @@ public class DockerSandboxService implements SandboxService {
 
         boolean exited = process.waitFor(limits.wallClockMillis(), TimeUnit.MILLISECONDS);
         long durationMs = (System.nanoTime() - startedAt) / 1_000_000;
+        // Timed here rather than per outcome: every path below returns after this point, so
+        // one call covers the clean exits, the timeouts and the kills alike. A timer that
+        // only recorded successful runs would report the sandbox as fastest precisely when
+        // it is spending all its time killing things.
+        metrics.recordExecution(java.time.Duration.ofMillis(durationMs));
 
         if (!exited) {
             // The wall-clock budget is the outer bound. Kill the container itself, not just

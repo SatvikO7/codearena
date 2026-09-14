@@ -44,7 +44,7 @@ class JudgeFailureClassificationTest {
 
     private static ClaimedSubmission submission() {
         return new ClaimedSubmission(1L, UUID.randomUUID(), Language.PYTHON,
-                "print(1)", 1, 1L, 1_000, 128);
+                "print(1)", 1, java.time.Instant.now(), 1L, 1_000, 128);
     }
 
     /**

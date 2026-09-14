@@ -17,7 +17,9 @@ spring:
       # A worker only needs a connection while recording progress and results, so its
       # pool is sized from judging concurrency rather than from request concurrency.
       maximum-pool-size: ${DB_POOL_SIZE:5}
-      connection-timeout: 10000
+      # A worker may wait longer than the API does: nobody is holding a browser open on
+      # the other end, and abandoning a judgement costs a container's worth of work.
+      connection-timeout: ${DB_CONNECTION_TIMEOUT_MS:10000}
 
 
   data:
@@ -40,14 +42,39 @@ management:
   endpoints:
     web:
       exposure:
-        include: health
+        # Health and Prometheus. The worker publishes no ports and lives on internal
+        # compose networks, so this surface is reachable only from inside the
+        # deployment -- which is the boundary being relied on, and it is worth naming
+        # rather than assuming.
+        include: health,prometheus
   endpoint:
     health:
-      show-details: always
+      # `always` was returning the database engine, the Redis version and the
+      # container's disk figures to anything that could reach this port. Nothing here
+      # authenticates, and there is no admin UI on this service for the detail to
+      # serve, so there is nobody to show it to. The probes read only the status.
+      show-details: never
       probes:
         enabled: true
+      group:
+        # A worker with no database or Redis cannot judge anything, so it should be
+        # taken out of rotation rather than left to turn every submission into a
+        # system error. Liveness stays bare: restarting will not fix either of them.
+        liveness:
+          include: livenessState
+        readiness:
+          include: readinessState,db,redis
+  metrics:
+    tags:
+      application: ${spring.application.name}
+      version: ${codearena.version:development}
 
 codearena:
+  # Filtered in at build time. Reported in the heartbeat and tagged onto every metric,
+  # so a rollout that has only reached some of the replicas is visible rather than
+  # something to be deduced from container ages.
+  version: @project.version@
+
   worker:
     # Defaults to the container hostname, which docker compose makes unique per replica.
     id: ${WORKER_ID:${HOSTNAME:worker-local}}
@@ -83,11 +110,19 @@ codearena:
     # Writable scratch inside each sandbox; the rest of its filesystem is read-only.
     workspace-tmpfs-mb: ${EXECUTION_TMPFS_MB:64}
 
+# See the backend's application.yml for the level policy and the list of things that
+# are never logged. The submission id is the correlation key on this side: it is what
+# ties a queue job to a judgement to a verdict, and it is in the MDC for every line a
+# judgement produces, including ones from libraries that know nothing about it.
 logging:
   level:
+    root: ${LOG_LEVEL_ROOT:INFO}
     com.codearena: ${LOG_LEVEL_APP:INFO}
   pattern:
-    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n"
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] sub=%X{submissionId:-none} %logger{36} - %msg%n"
+  structured:
+    format:
+      console: ${LOG_STRUCTURED_FORMAT:}
 
 ---
 spring:

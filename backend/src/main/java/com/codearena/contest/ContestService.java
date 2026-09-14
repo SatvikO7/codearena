@@ -5,6 +5,7 @@ import com.codearena.audit.AuditEntityType;
 import com.codearena.audit.AuditMetadata;
 import com.codearena.audit.AuditOutcome;
 import com.codearena.audit.AuditService;
+import com.codearena.system.BusinessMetrics;
 import com.codearena.common.ConflictException;
 import com.codearena.common.PageResponse;
 import com.codearena.common.ResourceNotFoundException;
@@ -64,6 +65,7 @@ public class ContestService {
     private final SubmissionRepository submissionRepository;
     private final UserRepository userRepository;
     private final AuditService auditService;
+    private final BusinessMetrics metrics;
     private final Clock clock;
 
     public ContestService(ContestRepository contestRepository,
@@ -71,10 +73,12 @@ public class ContestService {
                           SubmissionRepository submissionRepository,
                           UserRepository userRepository,
                           AuditService auditService,
+                          com.codearena.system.BusinessMetrics metrics,
                           Clock clock) {
         this.contestRepository = contestRepository;
         this.participantRepository = participantRepository;
         this.submissionRepository = submissionRepository;
+        this.metrics = metrics;
         this.userRepository = userRepository;
         this.auditService = auditService;
         this.clock = clock;
@@ -235,6 +239,7 @@ public class ContestService {
                     AuditEntityType.CONTEST, contestId.toString(),
                     AuditMetadata.of().put("contestSlug", contest.getSlug()).build());
 
+            metrics.contestRegistration();
             log.info("event=CONTEST_REGISTERED contest={} user={}", contestId, userId);
             return new ContestRegistrationResponse(contestId, status, participant.getRegisteredAt(), false);
         } catch (DataIntegrityViolationException e) {

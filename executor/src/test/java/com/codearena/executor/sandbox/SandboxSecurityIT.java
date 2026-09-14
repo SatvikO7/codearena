@@ -41,7 +41,8 @@ class SandboxSecurityIT {
 
     private final DockerSandboxService sandbox = new DockerSandboxService(
             new SandboxPolicy(64, 67_108_864L, 256, SandboxIsolationIT.seccompProfilePath(), ""),
-            new SandboxMetrics(),
+            // A throwaway registry: these suites are about isolation, not metrics.
+            new SandboxMetrics(new io.micrometer.core.instrument.simple.SimpleMeterRegistry()),
             "docker");
 
     private static final ExecutionLimits LIMITS = new ExecutionLimits(15_000, 256, 1.0, 64, 65_536);

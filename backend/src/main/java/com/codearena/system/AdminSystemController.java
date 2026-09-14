@@ -1,7 +1,7 @@
 package com.codearena.system;
 
 import com.codearena.audit.AuditEventRepository;
-import com.codearena.queue.SubmissionQueue;
+import com.codearena.shared.WorkerHeartbeat;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.media.Content;
 import io.swagger.v3.oas.annotations.media.Schema;
@@ -20,7 +20,9 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
+import java.util.List;
 
 /**
  * Operational status, for an administrator. ADMIN only.
@@ -72,22 +74,41 @@ public class AdminSystemController {
 
     private static final Logger log = LoggerFactory.getLogger(AdminSystemController.class);
 
+    /**
+     * How long the oldest waiting submission may wait before the system calls itself
+     * degraded.
+     *
+     * <p>Five minutes is far longer than any single judgement: the slowest legitimate one
+     * is a compile timeout plus every test running to its limit, which is under two.
+     * Anything waiting longer than this is not waiting for a slow problem, it is waiting
+     * for a worker that is not coming.
+     */
+    private static final long STUCK_QUEUE_SECONDS = 300;
+
     private final JdbcTemplate jdbc;
     private final StringRedisTemplate redis;
     private final AuditEventRepository auditEvents;
+    private final WorkerDirectory workers;
+    private final QueueHealth queueHealth;
     private final Clock clock;
     private final String version;
+    private final Instant startedAt;
 
     public AdminSystemController(JdbcTemplate jdbc,
                                  StringRedisTemplate redis,
                                  AuditEventRepository auditEvents,
+                                 WorkerDirectory workers,
+                                 QueueHealth queueHealth,
                                  Clock clock,
                                  @Value("${codearena.version:development}") String version) {
         this.jdbc = jdbc;
         this.redis = redis;
         this.auditEvents = auditEvents;
+        this.workers = workers;
+        this.queueHealth = queueHealth;
         this.clock = clock;
         this.version = version;
+        this.startedAt = clock.instant();
     }
 
     @GetMapping("/status")
@@ -115,13 +136,87 @@ public class AdminSystemController {
     // every ten seconds, which is a small fraction of it.
     @RateLimited(RateLimitPolicy.ADMIN_READ)
     public SystemStatus status() {
+        Instant now = clock.instant();
+        Dependency database = checkDatabase();
+        Dependency redisStatus = checkRedis();
+        QueueHealth.Depth queue = queueHealth.measure();
+        List<WorkerHeartbeat.Snapshot> judges = workers.workers();
+
+        List<Worker> workerViews = judges.stream().map(Worker::from).toList();
         return new SystemStatus(
                 version,
-                clock.instant(),
-                checkDatabase(),
-                checkRedis(),
-                queueDepth(),
+                now,
+                Duration.between(startedAt, now).toSeconds(),
+                serviceState(database, redisStatus, judges, queue),
+                database,
+                redisStatus,
+                new QueueDepth(queue.pending(), queue.processing(), queue.oldestPendingAgeSeconds(),
+                        queue.retrying(), queue.systemErrorsLastHour()),
+                workerViews,
+                auditHealth(),
                 auditEvents.count());
+    }
+
+    /**
+     * The three-state answer an operator actually wants.
+     *
+     * <p>Kept firmly separate from liveness and readiness, which are for an
+     * orchestrator and mean different things (see docs/operations.md):
+     *
+     * <ul>
+     *   <li><b>LIVE</b> -- the process is running. Never fails for a dependency, because
+     *       restarting a healthy API server does not repair a database.</li>
+     *   <li><b>READY</b> -- it can serve traffic: PostgreSQL and Redis both answer.
+     *       Failing this takes the instance out of rotation, which is the correct
+     *       response and a reversible one.</li>
+     *   <li><b>DEGRADED</b> -- it is serving, and something is wrong anyway. Judging has
+     *       stopped, or the queue is not draining. This is the state that existed
+     *       before and could not be seen: every HTTP request succeeds, every dependency
+     *       answers, and no submission gets judged.</li>
+     * </ul>
+     *
+     * <p>DEGRADED deliberately does not affect readiness. An API server whose workers
+     * have died can still serve the catalogue, the contests and the history; removing
+     * it from rotation would turn a judging outage into a total one.
+     */
+    private String serviceState(Dependency database, Dependency redisStatus,
+                                List<WorkerHeartbeat.Snapshot> judges, QueueHealth.Depth queue) {
+        if (!database.up() || !redisStatus.up()) {
+            return "UNAVAILABLE";
+        }
+        boolean noHealthyWorker = judges.stream().noneMatch(WorkerHeartbeat.Snapshot::healthy);
+        boolean workWaiting = queue.pending() != null && queue.pending() > 0;
+        // Work waiting with nobody to do it. Not "no workers" on its own: a quiet system
+        // with no workers and no queue is idle, and paging somebody for an idle system
+        // is how a status field gets ignored.
+        if (workWaiting && noHealthyWorker) {
+            return "DEGRADED";
+        }
+        if (queue.oldestPendingAgeSeconds() != null
+                && queue.oldestPendingAgeSeconds() > STUCK_QUEUE_SECONDS) {
+            return "DEGRADED";
+        }
+        return "READY";
+    }
+
+    /**
+     * Whether the audit log can still be written.
+     *
+     * <p>A read, not a write: this endpoint must not add a row to an append-only table
+     * every time somebody refreshes a dashboard. Reachability of the table is what can
+     * honestly be checked from here, and the write path reports its own failures as
+     * metrics and ERROR logs (ADR-037).
+     */
+    private AuditHealth auditHealth() {
+        try {
+            Long recent = jdbc.queryForObject("""
+                    SELECT count(*) FROM audit_events WHERE occurred_at > now() - interval '1 hour'
+                    """, Long.class);
+            return new AuditHealth(true, recent == null ? 0 : recent);
+        } catch (RuntimeException e) {
+            log.error("event=ADMIN_STATUS_AUDIT_UNAVAILABLE reason={}", e.getClass().getSimpleName());
+            return new AuditHealth(false, 0);
+        }
     }
 
     /**
@@ -156,26 +251,6 @@ public class AdminSystemController {
         }
     }
 
-    /**
-     * How many submissions are waiting, and how many are being judged.
-     *
-     * <p>The single most useful operational number here: a pending depth that climbs while
-     * the processing depth stays flat means the workers have stopped consuming.
-     *
-     * <p>A Redis failure yields nulls rather than zeros. Zero is a claim — "nothing is
-     * queued" — and the wrong one to make when the truth is "we could not ask".
-     */
-    private QueueDepth queueDepth() {
-        try {
-            Long pending = redis.opsForList().size(SubmissionQueue.PENDING);
-            Long processing = redis.opsForList().size(SubmissionQueue.PROCESSING);
-            return new QueueDepth(pending, processing);
-        } catch (RuntimeException e) {
-            log.warn("event=ADMIN_STATUS_QUEUE_UNAVAILABLE reason={}", e.getClass().getSimpleName());
-            return new QueueDepth(null, null);
-        }
-    }
-
     private static long elapsedMs(long startedAtNanos) {
         return (System.nanoTime() - startedAtNanos) / 1_000_000;
     }
@@ -187,9 +262,19 @@ public class AdminSystemController {
             @Schema(description = "Build identifier, or 'development' when unset.")
             String version,
             Instant serverTime,
+            @Schema(description = "Seconds since this API instance started.")
+            long uptimeSeconds,
+            @Schema(description = "READY, DEGRADED or UNAVAILABLE. Not a health probe: "
+                                + "see docs/operations.md for how this differs from "
+                                + "liveness and readiness.")
+            String state,
             Dependency database,
             Dependency redis,
             QueueDepth queue,
+            @Schema(description = "Judge workers that have reported recently. Empty means "
+                                + "none are registered, which during a backlog is an incident.")
+            List<Worker> workers,
+            AuditHealth audit,
             @Schema(description = "How many audit events exist. The log is append-only.")
             long auditEventCount) {
     }
@@ -206,8 +291,58 @@ public class AdminSystemController {
         }
     }
 
-    @Schema(description = "Judging queue depth. Null when Redis could not be reached — "
-                        + "which is different from zero.")
-    public record QueueDepth(Long pending, Long processing) {
+    @Schema(description = "Judging queue depth and age. Nulls mean the store could not be "
+                        + "reached, which is different from zero.")
+    public record QueueDepth(
+            Long pending,
+            Long processing,
+            @Schema(description = "How long the longest-waiting submission has waited. The "
+                                + "field that separates a busy queue from a stuck one.")
+            Long oldestPendingAgeSeconds,
+            @Schema(description = "Submissions claimed more than once: judgements that were "
+                                + "interrupted and recovered.")
+            long retrying,
+            @Schema(description = "Judgements that gave up in the last hour. The pipeline's "
+                                + "own error rate, never the submitter's fault.")
+            long systemErrorsLastHour) {
+    }
+
+    /**
+     * One judge worker.
+     *
+     * <p>Counts, timestamps and an identity -- nothing else. No executor token, no
+     * database URL, no filesystem path, no Docker detail, no submission content. An
+     * operator needs to know that a worker exists, whether it is still speaking, what
+     * build it is running and how much it has done; everything beyond that would be
+     * turning a status page into a disclosure channel.
+     */
+    @Schema(description = "A judge worker, as it last reported itself.")
+    public record Worker(
+            String id,
+            String version,
+            Instant startedAt,
+            Instant lastSeenAt,
+            @Schema(description = "True while it is still reporting. False means the process "
+                                + "may exist and has stopped saying so, which a container "
+                                + "health check cannot tell you.")
+            boolean healthy,
+            @Schema(description = "True once it has been asked to stop and is finishing its "
+                                + "work. A planned departure, not a fault.")
+            boolean draining,
+            int concurrency,
+            int activeJobs,
+            long judged,
+            long infrastructureFailures) {
+
+        static Worker from(WorkerHeartbeat.Snapshot snapshot) {
+            return new Worker(
+                    snapshot.id(), snapshot.version(), snapshot.startedAt(), snapshot.lastSeenAt(),
+                    snapshot.healthy(), snapshot.draining(), snapshot.concurrency(),
+                    snapshot.active(), snapshot.judged(), snapshot.failed());
+        }
+    }
+
+    @Schema(description = "Whether the audit log is readable, and how much was written recently.")
+    public record AuditHealth(boolean readable, long eventsLastHour) {
     }
 }

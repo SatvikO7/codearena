@@ -8,16 +8,21 @@ import com.codearena.worker.judge.JudgeRepository.ClaimedSubmission;
 import com.codearena.worker.judge.JudgeRepository.JudgeResult;
 import com.codearena.worker.judge.JudgeRepository.JudgeTestCase;
 import com.codearena.worker.judge.JudgeService;
-import jakarta.annotation.PreDestroy;
+import com.codearena.worker.observability.JudgeMetrics;
+import com.codearena.worker.observability.WorkerHeartbeatPublisher;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
+import org.springframework.context.event.ContextClosedEvent;
+import org.springframework.context.event.EventListener;
+import org.springframework.core.annotation.Order;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
 
 import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
@@ -74,6 +79,8 @@ public class SubmissionConsumer implements ApplicationRunner {
     private final JudgeRepository judgeRepository;
     private final JudgeService judgeService;
     private final WorkerProperties properties;
+    private final JudgeMetrics metrics;
+    private final WorkerHeartbeatPublisher heartbeat;
 
     private final AtomicBoolean running = new AtomicBoolean(true);
     private ExecutorService consumers;
@@ -82,12 +89,16 @@ public class SubmissionConsumer implements ApplicationRunner {
                               WorkerEventPublisher events,
                               JudgeRepository judgeRepository,
                               JudgeService judgeService,
-                              WorkerProperties properties) {
+                              WorkerProperties properties,
+                              JudgeMetrics metrics,
+                              WorkerHeartbeatPublisher heartbeat) {
         this.redis = redis;
         this.events = events;
         this.judgeRepository = judgeRepository;
         this.judgeService = judgeService;
         this.properties = properties;
+        this.metrics = metrics;
+        this.heartbeat = heartbeat;
     }
 
     @Override
@@ -107,9 +118,48 @@ public class SubmissionConsumer implements ApplicationRunner {
         log.info("event=CONSUMERS_STARTED worker={} concurrency={}", properties.id(), concurrency);
     }
 
-    @PreDestroy
+    /**
+     * Drains rather than stops.
+     *
+     * <p>Three things happen in order, and the order is the whole design:
+     *
+     * <ol>
+     *   <li><b>Stop claiming.</b> {@code running} goes false, so every consumer thread
+     *       finishes the blocking pop it is in and takes nothing new. A worker that
+     *       kept accepting work while shutting down would guarantee abandoned jobs.</li>
+     *   <li><b>Say so.</b> The heartbeat is marked draining, so an operator watching a
+     *       rollout sees a worker leaving deliberately rather than one going quiet.</li>
+     *   <li><b>Finish what is in hand.</b> Up to thirty seconds for in-flight
+     *       judgements, so their sandboxes are torn down by the code that created them
+     *       rather than left for the reaper.</li>
+     * </ol>
+     *
+     * <p>The wait is bounded, deliberately. An unbounded drain turns one stuck
+     * judgement into a deployment that never finishes, and there is already a correct
+     * answer for work that outlives its worker: the claim lease expires and the
+     * recovery sweeper returns the submission to the queue. Waiting forever to avoid
+     * using a mechanism that exists, is tested, and is bounded by {@code attempts}
+     * would be the worse trade.
+     *
+     * <p>It is bounded on the outside too, and that part is easy to get wrong: Docker sends
+     * SIGKILL ten seconds after SIGTERM by default, so a thirty-second drain declared here
+     * and nowhere else is a drain that never once ran to completion. The worker's
+     * {@code stop_grace_period} in docker-compose.yml is set to cover it.
+     *
+     * <p>Hung off {@link ContextClosedEvent} rather than {@code @PreDestroy} because the
+     * Redis connection this loop uses is itself a lifecycle bean, and lifecycle beans are
+     * stopped before anything is destroyed. See {@link WorkerHeartbeatPublisher} for what
+     * that cost before it was noticed.
+     *
+     * <p>So nothing is lost by cutting the drain short -- a submission whose worker
+     * vanished mid-judgement is recovered exactly as if the process had been killed,
+     * which is the case this pipeline was built around from Phase 4.
+     */
+    @EventListener(ContextClosedEvent.class)
+    @Order(0)
     public void stop() {
         running.set(false);
+        heartbeat.beginDraining();
         if (consumers != null) {
             consumers.shutdown();
             try {
@@ -123,7 +173,7 @@ public class SubmissionConsumer implements ApplicationRunner {
                 consumers.shutdownNow();
             }
         }
-        log.info("event=CONSUMERS_STOPPED worker={}", properties.id());
+        log.info("event=CONSUMERS_STOPPED worker={} inFlight={}", properties.id(), metrics.active());
     }
 
     private void consumeLoop() {
@@ -162,6 +212,7 @@ public class SubmissionConsumer implements ApplicationRunner {
         try {
             submissionId = UUID.fromString(job);
         } catch (IllegalArgumentException e) {
+            metrics.malformedJob();
             log.error("event=MALFORMED_JOB payload_length={}", job.length());
             return;     // discarding is correct; no retry can make this parse
         }
@@ -180,12 +231,22 @@ public class SubmissionConsumer implements ApplicationRunner {
         if (claimed == null) {
             // Somebody else has it, or it is already finished. Both mean there is nothing
             // to do, and both are expected under at-least-once delivery.
+            metrics.claimSkipped();
             log.info("event=CLAIM_SKIPPED submission={} reason=not_queued", submissionId);
             return;
         }
 
-        log.info("event=SUBMISSION_CLAIMED submission={} worker={} attempt={} language={}",
-                submissionId, properties.id(), claimed.attempts(), claimed.language());
+        // How long this submission sat between being accepted and being picked up. The
+        // single most useful number for deciding whether the judge pool is big enough:
+        // a long wait with short judgements is a capacity problem, a short wait with
+        // long judgements is not.
+        Duration queueWait = Duration.between(claimed.createdAt(), Instant.now());
+        metrics.recordQueueWait(queueWait);
+        metrics.judgementStarted();
+
+        log.info("event=SUBMISSION_CLAIMED submission={} worker={} attempt={} language={} queueWaitMs={}",
+                submissionId, properties.id(), claimed.attempts(), claimed.language(),
+                queueWait.toMillis());
 
         // The claim is already committed, so announcing RUNNING now cannot show a browser a
         // state the database does not hold.
@@ -202,11 +263,14 @@ public class SubmissionConsumer implements ApplicationRunner {
             // recovery sweeper returns it to the queue. This is the same path a worker that
             // died mid-execution takes, and it is bounded by `attempts` in exactly the same
             // way -- after the last one the sweeper records SYSTEM_ERROR.
+            metrics.judgementDeferred();
             log.warn("event=JUDGE_DEFERRED submission={} worker={} attempt={} reason={}",
                     submissionId, properties.id(), claimed.attempts(), e.getMessage());
             return;
         }
-        long durationMs = (System.nanoTime() - startedAt) / 1_000_000;
+        Duration took = Duration.ofNanos(System.nanoTime() - startedAt);
+        long durationMs = took.toMillis();
+        metrics.judgementFinished(result.status(), claimed.language(), took);
 
         boolean recorded = judgeRepository.recordResult(claimed.id(), properties.id(), result);
 

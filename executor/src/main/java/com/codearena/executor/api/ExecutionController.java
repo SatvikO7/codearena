@@ -15,6 +15,7 @@ import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
+import org.slf4j.MDC;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -51,6 +52,9 @@ import java.util.Map;
 @RequestMapping("/internal/executions")
 public class ExecutionController {
 
+    /** The correlation key this service logs by. Matches the worker's, deliberately. */
+    static final String SUBMISSION_MDC = "submissionId";
+
     private static final Logger log = LoggerFactory.getLogger(ExecutionController.class);
 
     private final SandboxService sandboxService;
@@ -86,30 +90,48 @@ public class ExecutionController {
         if (request.source().length() > maxSourceBytes) {
             throw new BadExecutionRequestException("source exceeds the maximum size");
         }
-        // The submission id is a label for operators. It is never interpreted, never placed
-        // on a command line, and never used to name a resource.
-        String submissionId = request.submissionId() == null ? "unknown" : request.submissionId();
+        // The submission id is a label for operators. It is never interpreted, never
+        // placed on a command line, and never used to name a resource -- and now that
+        // it also reaches a log line, it is sanitised first. This service is one hop
+        // from untrusted code; a caller that could put a newline in a log line could
+        // forge log entries in the one component whose logs matter most.
+        String submissionId = correlationLabel(request.submissionId());
 
-        SandboxService.Workspace workspace =
-                sandboxService.prepare(submissionId, request.language(), request.source());
-        String workspaceId = registry.register(workspace);
-        log.info("event=WORKSPACE_PREPARED workspace={} language={} open={}",
-                workspaceId, request.language(), registry.openCount());
-        return new ExecutionApi.PrepareResponse(workspaceId);
+        MDC.put(SUBMISSION_MDC, submissionId);
+        try {
+            SandboxService.Workspace workspace =
+                    sandboxService.prepare(submissionId, request.language(), request.source());
+            String workspaceId = registry.register(workspace, submissionId);
+            log.info("event=WORKSPACE_PREPARED workspace={} language={} open={}",
+                    workspaceId, request.language(), registry.openCount());
+            return new ExecutionApi.PrepareResponse(workspaceId);
+        } finally {
+            MDC.remove(SUBMISSION_MDC);
+        }
     }
 
     @PostMapping("/{workspaceId}/compile")
     public ExecutionResult compile(@PathVariable String workspaceId,
                                    @RequestBody ExecutionApi.CompileRequest request) {
-        metrics.executionStarted();
-        return registry.get(workspaceId).compile(clamp(request.limits()));
+        MDC.put(SUBMISSION_MDC, registry.submissionFor(workspaceId));
+        try {
+            metrics.executionStarted();
+            return registry.get(workspaceId).compile(clamp(request.limits()));
+        } finally {
+            MDC.remove(SUBMISSION_MDC);
+        }
     }
 
     @PostMapping("/{workspaceId}/run")
     public ExecutionResult run(@PathVariable String workspaceId,
                                @RequestBody ExecutionApi.RunRequest request) {
-        metrics.executionStarted();
-        return registry.get(workspaceId).run(request.stdin(), clamp(request.limits()));
+        MDC.put(SUBMISSION_MDC, registry.submissionFor(workspaceId));
+        try {
+            metrics.executionStarted();
+            return registry.get(workspaceId).run(request.stdin(), clamp(request.limits()));
+        } finally {
+            MDC.remove(SUBMISSION_MDC);
+        }
     }
 
     @DeleteMapping("/{workspaceId}")
@@ -180,6 +202,32 @@ public class ExecutionController {
     }
 
     /** The request could not be honoured as written. */
+    /**
+     * Reduces a caller's label to something safe to write into a log.
+     *
+     * <p>Letters, digits and hyphens, bounded at the length of a UUID. That excludes
+     * newlines -- which would let a caller forge log lines -- and everything else that
+     * would break a structured log format. Anything unacceptable becomes
+     * {@code unknown} rather than failing the request: a correlation label is a
+     * convenience for operators and must never be able to stop a judgement.
+     */
+    static String correlationLabel(String candidate) {
+        if (candidate == null || candidate.isBlank() || candidate.length() > 36) {
+            return "unknown";
+        }
+        for (int i = 0; i < candidate.length(); i++) {
+            char c = candidate.charAt(i);
+            boolean allowed = (c >= '0' && c <= '9')
+                    || (c >= 'a' && c <= 'z')
+                    || (c >= 'A' && c <= 'Z')
+                    || c == '-';
+            if (!allowed) {
+                return "unknown";
+            }
+        }
+        return candidate;
+    }
+
     public static class BadExecutionRequestException extends RuntimeException {
         public BadExecutionRequestException(String message) {
             super(message);

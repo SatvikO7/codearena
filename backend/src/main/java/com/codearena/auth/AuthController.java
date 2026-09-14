@@ -15,6 +15,7 @@ import com.codearena.ratelimit.RateLimitExceededException;
 import com.codearena.ratelimit.RateLimitPolicy;
 import com.codearena.ratelimit.RateLimitService;
 import com.codearena.ratelimit.RateLimited;
+import com.codearena.system.BusinessMetrics;
 import com.codearena.user.User;
 import com.codearena.user.UserRegistrationService;
 import com.codearena.user.UserRepository;
@@ -68,19 +69,22 @@ public class AuthController {
     private final UserRepository userRepository;
     private final AuditService auditService;
     private final RateLimitService rateLimitService;
+    private final BusinessMetrics metrics;
 
     public AuthController(UserRegistrationService registrationService,
                           AuthenticationManager authenticationManager,
                           SecurityContextRepository securityContextRepository,
                           UserRepository userRepository,
                           AuditService auditService,
-                          RateLimitService rateLimitService) {
+                          RateLimitService rateLimitService,
+                          BusinessMetrics metrics) {
         this.registrationService = registrationService;
         this.authenticationManager = authenticationManager;
         this.securityContextRepository = securityContextRepository;
         this.userRepository = userRepository;
         this.auditService = auditService;
         this.rateLimitService = rateLimitService;
+        this.metrics = metrics;
     }
 
     @PostMapping("/register")
@@ -155,6 +159,7 @@ public class AuthController {
                 AuditEntityType.USER, principal.getPublicId().toString(),
                 AuditMetadata.of().put("role", principal.getRole()).build());
 
+        metrics.authAttempt("login", "success");
         log.info("Login succeeded for publicId={}", principal.getPublicId());
 
         return ResponseEntity.ok(loadProfile(principal));
@@ -245,6 +250,9 @@ public class AuthController {
      * account is worth more than a uniform field.
      */
     private void auditLoginFailure(String identifier, String reason) {
+        // Counted with a coarse reason, never the identifier: a metric label per attempted
+        // username would be one time series per thing an attacker can type.
+        metrics.authAttempt("login", "failure");
         auditService.recordIndependently(AuditAction.AUTH_LOGIN_FAILURE, AuditOutcome.FAILURE,
                 null, null,
                 AuditMetadata.of()

@@ -29,8 +29,23 @@ spring:
     password: ${DATABASE_PASSWORD:codearena}
     hikari:
       pool-name: codearena-api-pool
+      # The binding constraint under concurrent submissions, measured rather than
+      # assumed: a load test at fifteen concurrent submitters saturated this pool, and
+      # hikaricp_connections_timeout_total rose in step with the tail latency. Size it
+      # against expected concurrent writers, and remember PostgreSQL's own max
+      # connections has to cover every API replica plus every worker.
       maximum-pool-size: ${DB_POOL_SIZE:10}
-      connection-timeout: 10000
+      # Five seconds, not ten, and the reason is a collision rather than impatience.
+      #
+      # The browser's HTTP client gives up at ten seconds. With a ten-second pool
+      # timeout, a saturated pool produced requests that succeeded at 10.2s -- just
+      # after the client had abandoned them. The submission existed, the user was shown
+      # a failure, and the natural response was to submit again. A duplicate submission
+      # caused by a timeout race is a worse outcome than a clear refusal.
+      #
+      # Failing first means the client always receives an answer it can act on. A pool
+      # that cannot produce a connection within five seconds is not about to produce one.
+      connection-timeout: ${DB_CONNECTION_TIMEOUT_MS:5000}
 
   jpa:
     open-in-view: false          # avoid lazy loading in the view layer / long-lived sessions
@@ -90,11 +105,18 @@ management:
   endpoints:
     web:
       exposure:
-        # Health and info only. Everything else -- env, configprops, heapdump, loggers --
-        # stays unexposed: the security rules restrict /actuator/** to ADMIN, but an
-        # endpoint that can print the database password should not be reachable at all.
+        # Health, info and Prometheus. Everything else -- env, configprops, heapdump,
+        # loggers, mappings, beans, threaddump -- stays unexposed. The security rules
+        # restrict /actuator/** to ADMIN, but an endpoint that can print the database
+        # password should not be reachable at all: an authorisation rule is one
+        # mistake away from being wrong, and an endpoint that does not exist is not.
+        #
+        # `prometheus` carries counts, durations and levels, never identifiers -- every
+        # metric label in this system is a closed set (see BusinessMetrics). It is
+        # still behind the ADMIN rule, because a scrape reveals traffic shape and
+        # dependency versions and there is no reason for that to be public.
         # The curated admin view is /api/admin/system/status instead.
-        include: health,info
+        include: health,info,prometheus
   endpoint:
     health:
       # Details for administrators only.
@@ -112,11 +134,43 @@ management:
       roles: ADMIN
       probes:
         enabled: true
+      # The three kinds of health, kept apart on purpose. docs/operations.md has the
+      # full reasoning; the short version is that they answer different questions and
+      # doing the wrong thing about each is expensive.
+      #
+      #   liveness  -- is this process alive? Nothing about a dependency belongs here.
+      #                Restarting a healthy API server does not repair a database, and
+      #                a liveness probe that fails when PostgreSQL is slow turns one
+      #                outage into a restart loop that guarantees a second.
+      #
+      #   readiness -- can it serve traffic? It cannot without its database or its
+      #                session store, so both are included. Failing readiness takes an
+      #                instance out of rotation, which is correct AND reversible.
+      #
+      #   DEGRADED  -- serving fine, and something is still wrong: judging has stopped,
+      #                or the queue is not draining. Deliberately NOT a probe, because
+      #                removing the API from rotation would turn a judging outage into
+      #                a total one. It is reported by /api/admin/system/status.
+      group:
+        liveness:
+          include: livenessState
+        readiness:
+          include: readinessState,db,redis
   health:
     redis:
       enabled: true
     db:
       enabled: true
+  metrics:
+    tags:
+      # Attached to every metric, so one dashboard can separate the services without
+      # anything having to tag its own meters. Both are bounded values.
+      application: ${spring.application.name}
+      version: ${codearena.version:development}
+  prometheus:
+    metrics:
+      export:
+        enabled: true
 
 springdoc:
   swagger-ui:
@@ -228,12 +282,41 @@ codearena:
     # through the pool forever.
     max-attempts: ${QUEUE_MAX_ATTEMPTS:3}
 
+# =============================================================================
+# Logging
+#
+# Levels, and what each one means here:
+#   ERROR  a failed operation that needs investigating. Someone should look.
+#   WARN   a recoverable abnormality -- a retry, a degraded path, a rejected caller.
+#   INFO   meaningful lifecycle events: a login, a submission, a verdict, a startup.
+#   DEBUG  development diagnostics only. NEVER enabled by default, and never in a
+#          production deployment: Spring at DEBUG prints request bodies, and this
+#          application's request bodies contain passwords and source code.
+#
+# Never logged anywhere, at any level: passwords and hashes, session identifiers,
+# CSRF tokens, the executor token, submitted source code, hidden test inputs and
+# expected outputs, database and Redis credentials. Messages carry ids, never content.
+# =============================================================================
 logging:
   level:
+    root: ${LOG_LEVEL_ROOT:INFO}
     com.codearena: ${LOG_LEVEL_APP:INFO}
     org.springframework: INFO
   pattern:
-    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n"
+    # `req=` is the correlation id from RequestIdFilter, and it must be in the pattern
+    # for Phase 8's request correlation to mean anything: the filter has always put it
+    # in the MDC, but until now no pattern printed it, so the id existed in audit rows
+    # and in nothing an operator could grep. It is here now, and the log line for a
+    # failing request can be found from the audit event that recorded it.
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] req=%X{requestId:-none} %logger{36} - %msg%n"
+  structured:
+    format:
+      # Empty by default: a human reading `docker compose logs` wants the pattern
+      # above. Set LOG_STRUCTURED_FORMAT=ecs (or logstash, or gelf) in a deployment
+      # that ships logs somewhere, and every line becomes JSON with the MDC fields as
+      # first-class keys -- no extra dependency, and no second logging configuration
+      # to keep in step with this one.
+      console: ${LOG_STRUCTURED_FORMAT:}
 
 ---
 # Profile used when the service runs inside docker compose.

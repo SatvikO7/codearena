@@ -1,6 +1,7 @@
 package com.codearena.audit;
 
 import com.codearena.auth.AuthenticatedUser;
+import com.codearena.system.BusinessMetrics;
 import com.codearena.user.Role;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -58,8 +59,11 @@ public class AuditService {
 
     private final AuditEventRepository repository;
 
-    public AuditService(AuditEventRepository repository) {
+    private final BusinessMetrics metrics;
+
+    public AuditService(AuditEventRepository repository, BusinessMetrics metrics) {
         this.repository = repository;
+        this.metrics = metrics;
     }
 
     /**
@@ -97,9 +101,16 @@ public class AuditService {
                                     Map<String, Object> metadata) {
         try {
             repository.save(build(action, outcome, entityType, entityId, metadata));
+            metrics.auditWrite("success");
         } catch (RuntimeException e) {
             // Never silent: an audit log that is quietly failing to record denials is worse
             // than one that is obviously broken, so this is ERROR and names the action.
+            //
+            // Counted as well as logged. A swallowed failure is invisible by
+            // construction -- the request it belonged to succeeded -- so the only way to
+            // discover that the log has been recording less than it claims is a number
+            // somebody can alert on, rather than a line somebody has to happen to read.
+            metrics.auditWrite("failure");
             log.error("event=AUDIT_WRITE_FAILED action={} outcome={} reason={}",
                     action, outcome, e.toString());
         }
@@ -121,7 +132,9 @@ public class AuditService {
         try {
             repository.save(new AuditEvent(actorUserId, actorUsername, actorType, action, outcome,
                     entityType, entityId, RequestContext.requestId(), metadata));
+            metrics.auditWrite("success");
         } catch (RuntimeException e) {
+            metrics.auditWrite("failure");
             log.error("event=AUDIT_WRITE_FAILED action={} outcome={} reason={}",
                     action, outcome, e.toString());
         }

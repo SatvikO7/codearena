@@ -8,7 +8,7 @@ The interesting part of this project is not the CRUD. It is everything around it
 asynchronous job processing, sandboxed execution of untrusted code, queue reliability,
 idempotency and concurrency control.
 
-> **Project status: Phase 9 of 16 complete and verified.** The judge works end to end: a
+> **Project status: Phase 10 of 16 complete and verified.** The judge works end to end: a
 > submission is queued, claimed by a worker, compiled and run inside a hardened sandbox,
 > given a verdict, and the result appears on the page without a reload — in practice and in
 > timed contests, on a live scoreboard. C++, Java and Python. This README describes what
@@ -96,7 +96,8 @@ codearena/
 ├── sandbox/            Sandbox image definitions, the seccomp profile, and the
 │                       script that builds the images
 ├── frontend/           React + TypeScript client
-├── docs/               Architecture, threat model, contests, auditing, limits, decisions
+├── docs/               Architecture, operations, observability, threat model, decisions
+├── scripts/            Reproducible load test
 ├── pom.xml             Maven aggregator
 ├── docker-compose.yml  Full local stack
 └── .env.example        Configuration template
@@ -980,6 +981,150 @@ Full detail is in [docs/rate-limiting.md](docs/rate-limiting.md).
 
 ---
 
+## Observability, reliability and operations
+
+Phase 9 left a system whose most important failure mode was invisible: every HTTP metric
+green — 202 on every submission, 200 on every read, no errors anywhere — while the judge
+was completely stopped. A submission that is accepted, queued and never judged is a
+stream of perfectly successful responses.
+
+### The pair that makes that visible
+
+```
+codearena_submissions_accepted     ← the API accepted work
+codearena_judge_submissions        ← the judge finished work
+```
+
+When the first climbs and the second does not, judging has stopped. No amount of HTTP
+metrics would have said so, because every one of those requests succeeded.
+
+### Three kinds of health, kept apart
+
+| | Includes | Failing it means |
+|---|---|---|
+| `/actuator/health/liveness` | process only | **restart it** |
+| `/actuator/health/readiness` | + PostgreSQL, Redis | **take it out of rotation** |
+| `/api/admin/system/status` | everything | **a human should look** |
+
+Liveness never depends on a dependency: restarting a healthy API server has never repaired
+a database, and a probe that fails when PostgreSQL is slow turns one outage into a restart
+loop that guarantees a second. `DEGRADED` — serving fine, nothing being judged — is
+deliberately *not* a probe, because removing the API from rotation would turn a judging
+outage into a total one. ADR-042.
+
+### Worker heartbeat
+
+Phase 8 left this out and said why: the API sits on a different network from the worker.
+Workers now publish a small record to Redis every ten seconds — the one dependency both
+already have — and it reads back in three states:
+
+**Healthy** (beat within 35s) · **Stale** (record present, nobody touched it) · **Gone**
+(expired after 5 minutes, or removed by a clean stop).
+
+> A worker container that exists is not a worker that works. `docker compose ps` reports
+> "Up" while consumer threads are wedged or the Redis connection is gone. A heartbeat
+> written by the same process that does the work cannot be green while the work is not.
+
+### Correlation, end to end
+
+```
+browser ──request id──▶ API ──submission id──▶ queue ──▶ worker ──▶ executor
+```
+
+Phase 8 added a request id and documented correlation as a feature. **No log pattern in
+any service printed the MDC**, so the id reached the audit table and nothing anyone could
+grep. Both identifiers are now in every log line, and the end-to-end suite proves it by
+grepping all three services for one submission id.
+
+`LOG_STRUCTURED_FORMAT=ecs` switches every line to JSON with the correlation fields as
+keys — Spring Boot's built-in structured logging, so no extra dependency.
+
+**No distributed tracing**, deliberately (ADR-040). One API call, one queue hop, two
+services, already followable by an identifier that appears everywhere. The cost is stated:
+no span timings across the queue boundary.
+
+### Metrics are bounded by construction
+
+Every label is a closed set — a language, a verdict, an outcome. **No user, submission,
+problem, contest, address or username appears in a metric label anywhere**, because a
+metric tagged with an identifier creates a time series per value and turns a busy evening
+into a monitoring outage at exactly the wrong moment. Tests assert the absence.
+
+`env`, `configprops`, `heapdump`, `threaddump`, `loggers`, `mappings` and `beans` are **not
+enabled at all** rather than enabled and restricted: an authorisation rule is one mistake
+away from being wrong, and an endpoint that does not exist is not.
+
+### Three bugs this found, all previously shipped
+
+This is the argument for the phase, so it is worth being specific.
+
+**1. A connection-pool timeout racing the browser.** A load test showed p95 of 10.3
+seconds on submissions and ten outright failures. `hikaricp_connections_timeout_total`
+named it in one line: the pool was saturating and its 10-second timeout set the tail
+latency — *the same 10 seconds as the browser's own HTTP timeout*. Requests were
+succeeding just after the client gave up, so a submission existed that the user was told
+had failed, and the natural response was to submit it again. Now 5 seconds, so the server
+always answers before the client stops listening.
+
+**2. Worker deregistration had never once worked.** It ran in `@PreDestroy`, which Spring
+runs *after* stopping `LettuceConnectionFactory` — so every attempt failed with
+`LettuceConnectionFactory has been STOPPED`. Every deployment left a worker looking stale
+for five minutes. Both the drain and the deregistration now hang off `ContextClosedEvent`.
+
+**3. The graceful drain was killed on every stop.** The worker allows 30 seconds to finish
+in-flight judgements; Docker sends SIGKILL 10 seconds after SIGTERM by default.
+`stop_grace_period` now covers each service's declared window.
+
+### Measured, not asserted
+
+`scripts/loadtest.py`, 15 concurrent clients, workers judging a live backlog throughout:
+
+| Scenario | Throughput | p50 | p95 | p99 | Failures |
+|---|---|---|---|---|---|
+| Browse problems | 106.8/s | 36.7 ms | 82.4 ms | 136.3 ms | 0 |
+| Search problems | 136.2/s | 18.7 ms | 46.3 ms | 71.5 ms | 0 |
+| Submission history | 127.1/s | 24.6 ms | 53.6 ms | 78.2 ms | 0 |
+| Failed logins | 147.0/s | 25.1 ms | 46.8 ms | 79.1 ms | 0 |
+| Submissions | 174.5/s | 29.9 ms | 72.9 ms | 176.8 ms | 0 |
+
+429 is reported separately, never as an error: under load it is the limiter shedding work
+before the queue fills, which is the system working.
+
+Two database indexes were added from measured plans rather than instinct (V8): cost
+18,679 → 8.4 and 16,596 → 56.5 at one million rows, for 40 kB and 48 kB of partial index.
+
+### Fault injection
+
+Every recovery claim is made by breaking something and watching. The end-to-end suite
+restarts the **worker**, the **executor**, **Redis** and the **API** — under load, with
+work queued — and asserts that no submission is lost, none is left stuck, and the system
+returns to `READY` on its own. Stopping the worker entirely is asserted to produce
+`DEGRADED` while readiness stays `UP`.
+
+### Resource ceilings
+
+Every service now has a memory and CPU limit, and the reason is specific: each JVM runs
+with `-XX:MaxRAMPercentage=75`, which is a percentage **of the container's limit**. With
+none declared, the JVM reads the *host's* memory and sizes its heap at 75% of the whole
+machine — three services doing that at once.
+
+Sandboxes are not covered by those, being sibling containers on the host. Their total is
+bounded by arithmetic instead: `replicas × WORKER_CONCURRENCY × per-execution memory`.
+
+### Operations
+
+[docs/operations.md](docs/operations.md) is a runbook written for somebody who did not
+build this: starting and stopping, reading the status, a symptom-indexed troubleshooting
+section, ten alerts with their metric and threshold, resource and storage boundaries,
+backup and restore, and disaster recovery — including a blunt statement of what is *not*
+guaranteed (no PITR, no replication, no failover, no off-site backups).
+
+[docs/observability.md](docs/observability.md) covers the metrics, logging and correlation
+design. [docs/production-readiness.md](docs/production-readiness.md) is a nine-area
+checklist where nothing is marked PASS because it was not tested.
+
+---
+
 ## Configuration
 
 No secret is committed and none is hardcoded. Every environment-specific value is read
@@ -1118,8 +1263,8 @@ as it lands, never before.
 | 7 | Contests, participation and contest scoring | **Complete** |
 | 8 | Admin operations, audit logging and system governance | **Complete** |
 | 9 | Rate limiting, quotas and abuse controls | **Complete** |
-| 10 | Observability, reliability and production readiness | Next |
-| 11 | Full frontend | Planned |
+| 10 | Observability, reliability and production readiness | **Complete** |
+| 11 | Full frontend | Next |
 | 12 | Kernel-level sandbox isolation (gVisor / rootless daemon) | Planned |
 | 13–16 | Testing, CI/CD, docs, deployment | Planned |
 

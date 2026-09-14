@@ -40,6 +40,22 @@ public class BrowserClient {
         return exchange(HttpMethod.GET, path, null, responseType);
     }
 
+    /**
+     * GET something that is not JSON, carrying the session.
+     *
+     * <p>The metrics endpoint serves Prometheus text. Asking it for JSON is a 406, so a
+     * client that always says {@code Accept: application/json} cannot read it -- which is
+     * correct behaviour and simply not what these calls want.
+     */
+    public ResponseEntity<String> getAnyType(String path) {
+        HttpHeaders headers = headers();
+        headers.setAccept(List.of(MediaType.ALL));
+        ResponseEntity<String> response = restTemplate.exchange(
+                path, HttpMethod.GET, new HttpEntity<>(null, headers), String.class);
+        captureCookies(response.getHeaders());
+        return response;
+    }
+
     public <T> ResponseEntity<T> post(String path, Object body, Class<T> responseType) {
         return exchange(HttpMethod.POST, path, body, responseType);
     }

@@ -10,6 +10,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.web.HttpMediaTypeNotAcceptableException;
 import org.springframework.web.HttpRequestMethodNotSupportedException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
@@ -156,6 +157,24 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ApiErrorResponse> handleNoResource(HttpServletRequest request) {
         return ResponseEntity.status(HttpStatus.NOT_FOUND).body(ApiErrorResponse.of(
                 404, "RESOURCE_NOT_FOUND", "No handler found for the requested path",
+                request.getRequestURI()));
+    }
+
+    /**
+     * The caller asked for a representation this endpoint cannot produce.
+     *
+     * <p>Found while adding the metrics endpoint, which serves Prometheus text rather than
+     * JSON: a client sending {@code Accept: application/json} to it was answered <b>500</b>,
+     * with a stack trace logged at ERROR. That is wrong twice over — the request was
+     * malformed, not the server, and a caller could fill the error log with stack traces by
+     * sending a header. 406 says what actually happened and is logged as the ordinary
+     * client error it is.
+     */
+    @ExceptionHandler(HttpMediaTypeNotAcceptableException.class)
+    public ResponseEntity<ApiErrorResponse> handleNotAcceptable(HttpServletRequest request) {
+        return ResponseEntity.status(HttpStatus.NOT_ACCEPTABLE).body(ApiErrorResponse.of(
+                406, "NOT_ACCEPTABLE",
+                "This endpoint cannot produce any of the requested media types",
                 request.getRequestURI()));
     }
 

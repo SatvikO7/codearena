@@ -57,8 +57,16 @@ public class WorkspaceRegistry implements SmartLifecycle {
         this.idleTimeout = idleTimeout;
     }
 
-    /** @throws CapacityExceededException when the service is already at its ceiling */
-    public String register(SandboxService.Workspace workspace) {
+    /**
+     * @param submissionId the caller's label for this work, already sanitised. Kept so
+     *                     that the compile and run calls that follow -- which carry only
+     *                     a workspace id -- can be logged against the same submission as
+     *                     the prepare that created it. Without it the chain from a
+     *                     verdict back to the container that produced it breaks at this
+     *                     service, which is the one place it matters most
+     * @throws CapacityExceededException when the service is already at its ceiling
+     */
+    public String register(SandboxService.Workspace workspace, String submissionId) {
         if (open.get() >= capacity) {
             // Closed immediately: the caller never learns of it, so nobody will close it.
             workspace.close();
@@ -66,7 +74,7 @@ public class WorkspaceRegistry implements SmartLifecycle {
         }
         open.incrementAndGet();
         String id = UUID.randomUUID().toString();
-        workspaces.put(id, new Entry(workspace));
+        workspaces.put(id, new Entry(workspace, submissionId));
         return id;
     }
 
@@ -134,12 +142,25 @@ public class WorkspaceRegistry implements SmartLifecycle {
         return running;
     }
 
+    /**
+     * The submission this workspace belongs to, for logging only.
+     *
+     * <p>Returns "unknown" rather than throwing for an id that is gone. A correlation
+     * label must never be the reason a request fails.
+     */
+    public String submissionFor(String id) {
+        Entry entry = workspaces.get(id);
+        return entry == null ? "unknown" : entry.submissionId;
+    }
+
     private static final class Entry {
         private final SandboxService.Workspace workspace;
+        private final String submissionId;
         private volatile Instant lastUsed = Instant.now();
 
-        private Entry(SandboxService.Workspace workspace) {
+        private Entry(SandboxService.Workspace workspace, String submissionId) {
             this.workspace = workspace;
+            this.submissionId = submissionId;
         }
 
         private void touch() {

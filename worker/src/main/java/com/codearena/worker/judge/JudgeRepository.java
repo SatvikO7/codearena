@@ -68,7 +68,7 @@ public class JudgeRepository {
                   AND s.public_id = ?
                   AND s.status = 'QUEUED'
                 RETURNING s.id, s.public_id, s.language, s.source_code,
-                          s.attempts, p.id AS problem_id,
+                          s.attempts, s.created_at, p.id AS problem_id,
                           p.time_limit_ms, p.memory_limit_mb
                 """,
                 (rs, rowNum) -> new ClaimedSubmission(
@@ -77,6 +77,7 @@ public class JudgeRepository {
                         Language.valueOf(rs.getString("language")),
                         rs.getString("source_code"),
                         rs.getInt("attempts"),
+                        rs.getTimestamp("created_at").toInstant(),
                         rs.getLong("problem_id"),
                         rs.getInt("time_limit_ms"),
                         rs.getInt("memory_limit_mb")),
@@ -190,6 +191,14 @@ public class JudgeRepository {
             Language language,
             String sourceCode,
             int attempts,
+            /**
+             * When the API accepted this submission.
+             *
+             * <p>Carried purely so the worker can measure how long it waited to be picked
+             * up. Taken from the database rather than from either process's clock, so the
+             * measurement does not quietly depend on two machines agreeing about the time.
+             */
+            java.time.Instant createdAt,
             long problemId,
             int timeLimitMs,
             int memoryLimitMb) {

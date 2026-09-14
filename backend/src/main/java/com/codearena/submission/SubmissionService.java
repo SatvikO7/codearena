@@ -8,6 +8,7 @@ import com.codearena.audit.AuditService;
 import com.codearena.common.ConflictException;
 import com.codearena.common.PageResponse;
 import com.codearena.common.ResourceNotFoundException;
+import com.codearena.system.BusinessMetrics;
 import com.codearena.common.ValidationException;
 import com.codearena.contest.Contest;
 import com.codearena.contest.ContestParticipantRepository;
@@ -66,6 +67,7 @@ public class SubmissionService {
     private final ContestProblemRepository contestProblemRepository;
     private final ContestRepository contestRepository;
     private final AuditService auditService;
+    private final BusinessMetrics metrics;
     private final Clock clock;
     private final int maxSourceBytes;
 
@@ -78,6 +80,7 @@ public class SubmissionService {
                              ContestProblemRepository contestProblemRepository,
                              ContestRepository contestRepository,
                              AuditService auditService,
+                             BusinessMetrics metrics,
                              Clock clock,
                              @Value("${codearena.submission.max-source-bytes:65536}") int maxSourceBytes) {
         this.submissionRepository = submissionRepository;
@@ -89,6 +92,7 @@ public class SubmissionService {
         this.contestProblemRepository = contestProblemRepository;
         this.contestRepository = contestRepository;
         this.auditService = auditService;
+        this.metrics = metrics;
         this.clock = clock;
         this.maxSourceBytes = maxSourceBytes;
     }
@@ -241,6 +245,12 @@ public class SubmissionService {
                         .put("sourceBytes", sourceBytes)
                         .put("contestId", contest == null ? null : contest.getPublicId())
                         .build());
+
+        // Counted at acceptance, where the worker counts verdicts. The gap between the
+        // two is the most diagnostic number the system produces: a judge that has
+        // stopped shows up as accepted climbing while judged does not, which no amount
+        // of HTTP metrics would reveal -- every one of those requests succeeded.
+        metrics.submissionAccepted(request.language(), contest == null ? "practice" : "contest");
 
         return submission;
     }

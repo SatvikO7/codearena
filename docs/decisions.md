@@ -1379,3 +1379,168 @@ space is whatever an attacker can type.
 - Key cardinality is bounded by TTL rather than by a hard cap, so a flood of invented
   identities creates buckets that expire rather than buckets that accumulate. There is no
   ceiling on key count, only on how long each key survives.
+
+---
+
+## ADR-040 — Observability: Prometheus and structured logs, no distributed tracing
+
+**Problem.** Phase 9 shipped a system whose most important failure mode was invisible. Every
+HTTP metric could be green — 202 on every submission, 200 on every read, no errors anywhere —
+while the judge was completely stopped. A submission that is accepted, queued and never
+judged is a stream of successful responses.
+
+**Options.** Micrometer with a Prometheus endpoint; OpenTelemetry with a collector, spans and
+an exporter in every service; a hosted APM agent; or nothing beyond the curated status view
+Phase 8 already had.
+
+**Chosen.** Micrometer metrics exposed in Prometheus format, structured logs with two
+correlation identifiers, and an operational status endpoint. **No distributed tracing.**
+
+**Why business metrics are separate from HTTP metrics.** `http_server_requests` answers "is
+the API healthy" and structurally cannot answer "is work getting done" — the two go wrong
+independently, and the second is the one that matters here. The diagnostic pair is
+`submissions_accepted` against `judge_submissions`: when the first climbs and the second does
+not, the judge has stopped, and nothing in the HTTP metrics would have said so.
+
+**Why no OpenTelemetry.** It is the modern answer and it is the wrong size for this system.
+The chain is one API call, one queue hop and two services, and it is already followable end
+to end by a submission id that appears in every log line on every service and in the audit
+table. Tracing would add a collector to run, a sampling policy to tune, and an exporter in
+three services — to answer questions grep already answers at four components.
+
+The cost is stated rather than hidden: **there are no span-level timings across the queue
+boundary.** "Where did these 900ms go" is answered by comparing the queue-wait timer with the
+judging timer instead of by reading a waterfall. That is a real loss. What would change the
+decision is more services, more hops, or fan-out — at which point the identifiers stop being
+enough and a trace is the only thing that reconstructs the path.
+
+**Why no identifier may ever be a metric label.** A metric tagged with a user or a submission
+creates one time series per value. The failure is not untidiness: a busy evening turns the
+monitoring backend into the outage, at precisely the moment somebody needs to look at it.
+Identifiers cost one log line each and are searchable; labels are a closed set or they are a
+liability. A test asserts no username and no public id appears in a scrape.
+
+**Why the dangerous Actuator endpoints are absent rather than restricted.** `env` and
+`configprops` print the database password and the executor token; `heapdump` hands over
+process memory. All of `/actuator/**` is ADMIN-only, and that is necessary but not
+sufficient: an authorisation rule is one mistake away from being wrong, and an endpoint that
+does not exist is not. They are not enabled, and a test asserts each returns 404 even for an
+administrator.
+
+**What this found immediately.** A load test produced a p95 of 10.3 seconds on submissions
+and ten outright failures. `hikaricp_connections_timeout_total` named the cause in one line:
+the API's connection pool was saturating, and its ten-second timeout was setting the tail
+latency — the same ten seconds as the browser's own HTTP timeout. Requests were succeeding
+just after the client had abandoned them, so a submission existed that the user had been told
+had failed, and the natural response was to submit it again. The pool timeout is now five
+seconds, so the server always answers before the client stops listening.
+
+That bug was present in Phase 9 and nothing could see it. It is the clearest possible
+argument for the phase.
+
+**Trade-offs.** Metrics are per instance and in memory, so a restart resets every counter —
+rates survive because Prometheus handles counter resets, absolute totals do not. There is no
+log aggregation and no alert evaluation here; the alerts are documented with their metric and
+threshold so that wiring them up is mechanical.
+
+---
+
+## ADR-041 — Worker liveness through Redis, in three states
+
+**Problem.** Phase 8 said plainly that there was no worker heartbeat and explained why: the
+API server sits on a different compose network from the worker and has no route to it. Worker
+liveness was inferred from queue depth, which cannot tell a stopped worker from a hard problem.
+
+**Options.** An HTTP health check from the API to the worker; a shared database table; a
+heartbeat record in Redis; or a service-discovery component.
+
+**Chosen.** A small hash per worker in Redis, rewritten every ten seconds, read by the API.
+
+**Why Redis.** Both processes already depend on it. An HTTP check would mean opening a route
+between two networks that are separate on purpose — paying in attack surface for a fact that
+can be published instead. A database table would put a write every ten seconds per worker
+into the store that holds every verdict, to record something that is worthless the moment it
+is stale.
+
+**Why a register the workers write, rather than a check the API performs.** A check can only
+prove a process answers HTTP. A heartbeat written by the same process that does the work
+cannot be green while the work is not happening — and that is exactly the failure this
+exists for. `docker compose ps` will report a worker as "Up" while its consumer threads are
+wedged, its Redis connection is gone, or it is looping on an error.
+
+**Why three states.** "No heartbeat" has two very different causes and they need different
+responses:
+
+- **Healthy** — beat within 35 seconds. Three intervals, so one slow scheduler tick is not a
+  fault; a status page that cries wolf is one people stop reading.
+- **Stale** — the record is there and nobody has touched it. The interesting case.
+- **Gone** — expired after five minutes, or removed by a worker that stopped cleanly.
+
+The TTL is deliberately far longer than the staleness threshold. Were they equal, a worker
+that died would *vanish* rather than appear stale, and "no workers are registered" is a much
+weaker signal than "this worker stopped reporting four minutes ago". A clean stop removes the
+record, so a planned departure is never reported as a fault.
+
+**Two bugs this design surfaced, both invisible without it.**
+
+*Deregistration never worked.* The first version removed the record in `@PreDestroy`. Spring
+closes a context in three steps — publish `ContextClosedEvent`, stop lifecycle beans, destroy
+beans — and `LettuceConnectionFactory` is a lifecycle bean, so `@PreDestroy` ran after the
+Redis connection was already shut. Every deployment left a worker looking stale for five
+minutes, and the only evidence was a single WARN line during shutdown. Both the drain and the
+deregistration now hang off `ContextClosedEvent`, which is the last point at which a component
+can still use its dependencies to say goodbye.
+
+*The drain never completed.* The worker allows thirty seconds to finish in-flight judgements;
+Docker sends SIGKILL ten seconds after SIGTERM by default. The drain was being cut short on
+every stop, and nothing said so. `stop_grace_period` now covers each service's declared
+window.
+
+**Trade-off.** The record is self-reported, so a worker that lies — or one whose heartbeat
+thread survives while its consumers do not — would appear healthy. Mitigated by publishing
+`active` and `judged` from the same counters the judging path increments, so a worker that is
+reporting but not working shows a flat `judged` next to a rising queue. A heartbeat is
+evidence, not proof.
+
+---
+
+## ADR-042 — Three kinds of health, kept apart
+
+**Problem.** "Is it healthy" is three different questions with three different audiences, and
+answering them with one endpoint gets at least two of them wrong.
+
+**Chosen.** Liveness, readiness and an operational state, with different contents and
+different consequences.
+
+**Liveness — `/actuator/health/liveness`, `livenessState` only.** Nothing about a dependency
+belongs here. Failing liveness means *restart the process*, and restarting a healthy API
+server has never repaired a database. A liveness probe that fails when PostgreSQL is slow
+turns one outage into a restart loop that guarantees a second, and destroys the evidence on
+the way.
+
+**Readiness — `readinessState`, `db`, `redis`.** Failing readiness means *take this instance
+out of rotation*, which is correct and, crucially, reversible. An instance that cannot reach
+its database genuinely cannot serve, and Spring Boot's default readiness group would have
+reported it ready.
+
+**DEGRADED — `/api/admin/system/status`, and deliberately not a probe.** It means the API is
+serving perfectly and something is still wrong: work is waiting with no healthy worker, or
+the oldest queued item has been waiting more than five minutes.
+
+Making it a probe would be the obvious mistake. An API server whose workers have died can
+still serve the catalogue, the contests, the standings and every submission's history —
+removing it from rotation would turn a judging outage into a total one. It is a state for a
+human to read, and the one this system could not previously express.
+
+**Why five minutes for "stuck".** The slowest legitimate judgement is a compile timeout plus
+every test running to its limit, which is under two. Anything waiting longer is not waiting
+for a slow problem; it is waiting for a worker that is not coming.
+
+**Why an idle system with no workers is not degraded.** No workers and no queue is idle, and
+paging somebody for an idle system is how a status field gets ignored. Degradation requires
+work that is waiting.
+
+**Trade-off.** Readiness now depends on two external systems, so a brief Redis blip can take
+an instance out of rotation when it could have served some read-only traffic. That is the
+right way to be wrong: the alternative is routing to an instance that will fail every
+authenticated request, since sessions live in Redis.

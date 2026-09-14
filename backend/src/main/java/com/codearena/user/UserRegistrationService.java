@@ -9,6 +9,7 @@ import com.codearena.audit.AuditService;
 import com.codearena.auth.PasswordPolicy;
 import com.codearena.auth.dto.RegistrationRequest;
 import com.codearena.common.ConflictException;
+import com.codearena.system.BusinessMetrics;
 import com.codearena.common.ValidationException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -41,15 +42,18 @@ public class UserRegistrationService {
     private final PasswordEncoder passwordEncoder;
     private final PasswordPolicy passwordPolicy;
     private final AuditService auditService;
+    private final BusinessMetrics metrics;
 
     public UserRegistrationService(UserRepository userRepository,
                                    PasswordEncoder passwordEncoder,
                                    PasswordPolicy passwordPolicy,
-                                   AuditService auditService) {
+                                   AuditService auditService,
+                                   BusinessMetrics metrics) {
         this.userRepository = userRepository;
         this.passwordEncoder = passwordEncoder;
         this.passwordPolicy = passwordPolicy;
         this.auditService = auditService;
+        this.metrics = metrics;
     }
 
     @Transactional
@@ -89,6 +93,7 @@ public class UserRegistrationService {
                     AuditEntityType.USER, saved.getPublicId().toString(),
                     AuditMetadata.of().put("role", saved.getRole()).build());
 
+            metrics.authAttempt("register", "success");
             log.info("Registered user publicId={} role={}", saved.getPublicId(), saved.getRole());
             return saved;
         } catch (DataIntegrityViolationException e) {

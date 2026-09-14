@@ -14,10 +14,30 @@
 
 name: codearena
 
+# =============================================================================
+# Resource ceilings
+#
+# Every service carries one, and the reason is specific rather than tidy-mindedness:
+# each JVM here runs with -XX:MaxRAMPercentage=75, which is a percentage OF THE
+# CONTAINER'S LIMIT. With no limit declared, the JVM reads the host's memory instead,
+# so three services each sized their heap at 75% of the whole machine and the first
+# real load decided which of them the kernel killed.
+#
+# These are ceilings, not reservations: a service that stays well under its limit costs
+# nothing. Raise them with environment variables rather than by editing this file.
+#
+# What these numbers do NOT bound is the sandboxes. Those are sibling containers created
+# by the executor through the host daemon, so they are charged to the host and not to
+# the executor's limit. Their aggregate is bounded elsewhere, by arithmetic rather than
+# by a single setting -- see docs/operations.md, 'Resource boundaries'.
+# =============================================================================
 services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
+    # The authoritative store. Give it the most headroom of anything here.
+    mem_limit: ${POSTGRES_MEM_LIMIT:-1g}
+    cpus: ${POSTGRES_CPUS:-2}
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-codearena}
       POSTGRES_USER: ${POSTGRES_USER:-codearena}
@@ -38,6 +58,9 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    # Sessions, the queue and rate-limit buckets. No eviction policy is set: evicting would silently drop sessions and queued jobs, and being restarted from the append-only file loses neither.
+    mem_limit: ${REDIS_MEM_LIMIT:-512m}
+    cpus: ${REDIS_CPUS:-1}
     # `appendonly yes` keeps queued submissions durable across a Redis restart.
     command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
     volumes:
@@ -56,6 +79,11 @@ services:
       context: .
       dockerfile: backend/Dockerfile
     restart: unless-stopped
+    # Docker's default is 10s, and Spring waits 5s for in-flight requests. Comfortable.
+    stop_grace_period: 20s
+    # Serves every request. MaxRAMPercentage=75 means a ~750m heap.
+    mem_limit: ${BACKEND_MEM_LIMIT:-1g}
+    cpus: ${BACKEND_CPUS:-2}
     depends_on:
       postgres:
         condition: service_healthy
@@ -117,6 +145,11 @@ services:
       context: .
       dockerfile: worker/Dockerfile
     restart: unless-stopped
+    # MUST exceed the worker's own 30s drain. On the default 10s, SIGKILL arrived while the worker was still finishing a judgement -- so it never deregistered, and every deploy left a worker that looked stale for five minutes. A status page that reports a fault after every routine release is one people learn to ignore.
+    stop_grace_period: 45s
+    # Judges, but never runs submitted code in this process -- that happens in sandbox containers charged to the host, not to this limit.
+    mem_limit: ${WORKER_MEM_LIMIT:-1g}
+    cpus: ${WORKER_CPUS:-2}
     depends_on:
       postgres:
         condition: service_healthy
@@ -189,6 +222,11 @@ services:
       context: .
       dockerfile: executor/Dockerfile
     restart: unless-stopped
+    # Same arithmetic: its drain window is 30s, so 10s would cut every shutdown short and orphan sandbox containers for the reaper to find.
+    stop_grace_period: 45s
+    # Starts containers and streams their output; it runs nothing itself.
+    mem_limit: ${EXECUTOR_MEM_LIMIT:-512m}
+    cpus: ${EXECUTOR_CPUS:-1}
     environment:
       EXECUTOR_TOKEN: ${EXECUTOR_TOKEN:?EXECUTOR_TOKEN must be set in .env}
       SANDBOX_MAX_OPEN_WORKSPACES: ${SANDBOX_MAX_OPEN_WORKSPACES:-16}
@@ -218,15 +256,20 @@ services:
       args:
         VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8080}
     restart: unless-stopped
+    # nginx serving static files.
+    mem_limit: ${FRONTEND_MEM_LIMIT:-128m}
+    cpus: ${FRONTEND_CPUS:-0.5}
     depends_on:
       backend:
         condition: service_healthy
     ports:
-      - "${FRONTEND_PORT:-5173}:80"
+      # 8080 inside the container: nginx runs unprivileged there and cannot bind 80.
+      # The published port is unchanged.
+      - "${FRONTEND_PORT:-5173}:8080"
     healthcheck:
       # 127.0.0.1, not `localhost`: in the container `localhost` resolves to ::1 first
       # and nginx binds IPv4 only, so a localhost probe reports a false failure.
-      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1/"]
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8080/"]
       interval: 15s
       timeout: 3s
       retries: 5

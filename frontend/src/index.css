@@ -434,6 +434,35 @@ button.button {
   color: var(--text-muted);
 }
 
+/* ---- Status banner ----
+   One panel that states the operational verdict before any of the numbers. The tint is a
+   reinforcement, never the message: every banner carries a glyph and a word, because a
+   status page read at speed on a bad monitor must not depend on distinguishing shades. */
+
+.panel--ok {
+  border-left: 3px solid var(--ok);
+}
+
+.panel--pending {
+  border-left: 3px solid var(--pending);
+}
+
+.panel--error {
+  border-left: 3px solid var(--error);
+}
+
+.panel--ok h2 {
+  color: var(--ok);
+}
+
+.panel--pending h2 {
+  color: var(--pending);
+}
+
+.panel--error h2 {
+  color: var(--error);
+}
+
 /* ---- Tables ---- */
 
 .table-panel {

@@ -43,6 +43,19 @@
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-actuator</artifactId>
     </dependency>
+    <!--
+      Prometheus exposition for the metrics Micrometer already collects.
+
+      The registry is the only addition: Spring Boot's actuator brings Micrometer's core,
+      and the application code talks to MeterRegistry rather than to anything
+      Prometheus-shaped, so the exposition format is a deployment choice rather than a
+      dependency of the code. See ADR-040.
+    -->
+    <dependency>
+      <groupId>io.micrometer</groupId>
+      <artifactId>micrometer-registry-prometheus</artifactId>
+    </dependency>
+
     <dependency>
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-validation</artifactId>

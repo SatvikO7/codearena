@@ -40,6 +40,11 @@ server:
     include-message: never
 
 codearena:
+  # Filtered in at build time. Reported in the heartbeat and tagged onto every metric,
+  # so a rollout that has only reached some of the replicas is visible rather than
+  # something to be deduced from container ages.
+  version: @project.version@
+
   executor:
     # No default, deliberately. The service refuses to start without it rather than
     # coming up unauthenticated.
@@ -88,17 +93,33 @@ management:
   endpoints:
     web:
       exposure:
-        # Health only. This process is not a place to expose env, heapdump or loggers.
-        include: health
+        # Health and Prometheus, and nothing else. This process is not a place to
+        # expose env, heapdump, loggers or mappings: it is the only component holding
+        # Docker control, so its configuration is the most sensitive in the system.
+        #
+        # Only /actuator/health is exempt from the token filter, so a scrape of
+        # /actuator/prometheus must present the executor token like any other caller.
+        # The metrics carry counts and durations with no tags at all.
+        include: health,prometheus
   endpoint:
     health:
       probes:
         enabled: true
       show-details: never
+  metrics:
+    tags:
+      application: ${spring.application.name}
+      version: ${codearena.version:development}
 
+# See the backend's application.yml for the level policy. This service in particular
+# must never log at DEBUG in a deployment: it handles submitted source on its way into
+# a sandbox, and a debug-level HTTP log here would be a source-code disclosure.
 logging:
   level:
-    root: INFO
-    com.codearena: INFO
+    root: ${LOG_LEVEL_ROOT:INFO}
+    com.codearena: ${LOG_LEVEL_APP:INFO}
   pattern:
-    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n"
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] sub=%X{submissionId:-none} %logger{36} - %msg%n"
+  structured:
+    format:
+      console: ${LOG_STRUCTURED_FORMAT:}

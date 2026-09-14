@@ -34,8 +34,11 @@ class UserRegistrationServiceTest {
         // writes an audit row in the same transaction is asserted by AuditApiIT, where a
         // real transaction exists to make the claim meaningful.
         auditService = mock(com.codearena.audit.AuditService.class);
+        // Likewise mocked: the counter this service increments is exercised for real by
+        // ObservabilityIT, which reads it back off the metrics endpoint.
         service = new UserRegistrationService(userRepository, passwordEncoder,
-                new PasswordPolicy(), auditService);
+                new PasswordPolicy(), auditService,
+                mock(com.codearena.system.BusinessMetrics.class));
         when(userRepository.saveAndFlush(any(User.class)))
                 .thenAnswer(invocation -> invocation.getArgument(0));
     }

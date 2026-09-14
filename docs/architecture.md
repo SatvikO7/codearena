@@ -239,7 +239,7 @@ snapshot on connect, a convergent client reducer that ignores anything not stric
 and a bounded fallback poll armed only when the stream fails. See
 [submission-lifecycle.md](submission-lifecycle.md) and ADR-023/ADR-024.
 
-## Current state (Phase 9 — complete and verified)
+## Current state (Phase 10 — complete and verified)
 
 Implemented:
 
@@ -326,6 +326,32 @@ Added in Phase 7:
 - Contest, contest-solve, standings and admin contest pages, with a server-corrected
   countdown
 
+Added in Phase 10:
+
+- Micrometer metrics on all three services, exposed in Prometheus format and restricted:
+  ADMIN on the API, token-protected on the executor, internal-network-only on the worker
+  (ADR-040)
+- Business metrics kept separate from HTTP metrics, because a judge that has stopped is a
+  stream of perfectly successful 202s
+- Every metric label a closed set: no user, submission, problem, contest, address or
+  username appears in one anywhere, and tests assert the absence
+- Actuator's disclosing endpoints not enabled at all rather than enabled and restricted
+- Log patterns that actually print the MDC, closing a gap that had made Phase 8's request
+  correlation invisible to anyone reading logs
+- A submission id carried from the API through the queue to the worker and into the
+  executor, so one identifier reconstructs the whole pipeline
+- Optional JSON logging through Spring Boot's built-in structured logging, no dependency
+- A worker heartbeat in Redis with three states — healthy, stale, gone — so a worker whose
+  process exists but has stopped working is visible (ADR-041)
+- Queue health that reports the oldest item's age, which is what separates a busy queue
+  from a stuck one, plus retry and system-error counts
+- Liveness, readiness and an operational DEGRADED state kept firmly apart (ADR-042)
+- An operational dashboard, a runbook, documented alerts, backup and disaster-recovery
+  procedures, and a production-readiness checklist
+- Memory and CPU ceilings on every service, without which each JVM sized its heap against
+  the host rather than its container
+- Two partial indexes (V8) added from measured query plans
+
 Added in Phase 9:
 
 - A Redis token bucket, evaluated as one Lua script, as the single rate-limit mechanism:
@@ -370,6 +396,16 @@ asserted to contain neither a hidden test case's input nor its expected output; 
 field added to an update payload is ignored; and every admin mutation returns 403 to a USER
 and 401 to an anonymous caller.
 
+Phase 10 adds to that, and most of it is fault injection rather than assertion: the
+worker, the executor, Redis and the API are each restarted under load with work queued,
+and no submission is lost, none is left stuck and the system returns to READY unaided;
+stopping the worker entirely reports DEGRADED while readiness stays UP; a clean stop
+deregisters rather than leaving a stale record; the metrics endpoint answers 401, 403 and
+200 to the right callers and carries no secret, no path and no identifier; nine Actuator
+endpoints are absent even for an administrator; one submission id appears in the logs of
+all three services; a request id appears in the response, the application log and the
+audit row; every service has a memory ceiling; and the web server does not run as root.
+
 Phase 9 adds to that: exactly the configured number of concurrent requests is admitted and
 no more; an unauthenticated caller is answered 401 and an unauthorised one 403, never 429;
 a refused submission becomes neither a row nor a queued job; the contest endpoint cannot be
@@ -412,11 +448,27 @@ and the one that ran less often would be the one nobody noticed was broken.
 audit events describe changes and never define them. Nothing is reconstructed from the
 log, and CodeArena is not an event-sourced system (ADR-036).
 
+**Observing must not become disclosing.** A metrics endpoint is a read of a process's
+internals and a log is a permanent record. Both are easy to build by exposing everything
+and filtering afterwards, and filtering afterwards is a rule somebody forgets to update —
+so the tests assert what is *absent*, which is the only form of that claim that keeps
+holding as the system grows.
+
+**Three bugs that had already shipped were found by looking**: a connection-pool timeout
+racing the browser's own timeout into duplicate submissions, a worker deregistration that
+had never once succeeded because it ran after Spring closed the Redis connection, and a
+graceful drain that Docker killed on every stop. None was visible before this phase.
+
 **Rate limiting is not authorisation.** It runs after the security filter chain has already
 decided, and it can only ever refuse a request that was otherwise permitted. No
 authorisation check was relaxed, moved or replaced (ADR-039).
 
-**Not implemented, and not claimed:** there is no trustworthy client IP in the shipped
+**Not implemented, and not claimed:** there is no distributed tracing and so no span
+timings across the queue boundary; no log aggregation, no alert evaluation and no
+Alertmanager; no high availability, failover or replication, so RPO is the age of the last
+backup and RTO is a manual restore; no automated or off-site backups; no global disk
+quota, so the append-only audit log can only grow; no CI/CD; no TLS in the shipped stack;
+no trustworthy client IP in the shipped
 deployment, so anonymous per-caller limits are weaker than they appear and the per-account
 throttle carries the protection; there are no lifetime quotas, no adaptive or reputational
 limiting, no CAPTCHA and no abuse scoring; no alerting on rejections; no client IP in audit

@@ -2,6 +2,18 @@
 **/node_modules
 **/dist
 .git
+# Every env file, at any depth.
+#
+# `.env` alone matches only the repository root. `frontend/.env` was NOT excluded, and
+# the frontend build stage does `COPY frontend/ ./` -- so a developer's local env file
+# was copied into the image, where Vite would read it and inline its values into the
+# bundle, silently overriding the VITE_API_BASE_URL that compose passed as a build arg.
+#
+# The direct consequence is a build that depends on whoever ran it. The worse one is
+# that nothing stopped somebody putting a non-VITE secret in that file and baking it
+# into an image layer, where it stays after the file is deleted.
 .env
+**/.env
+**/.env.*
 docs
 *.md

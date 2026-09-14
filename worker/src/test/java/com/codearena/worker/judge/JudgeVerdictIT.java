@@ -36,7 +36,9 @@ class JudgeVerdictIT {
             new SandboxBackedExecutionService(new DockerSandboxService(
                     new SandboxPolicy(64, 67_108_864L, 256,
                             SandboxBackedExecutionService.seccompProfilePath(), ""),
-                    new SandboxMetrics(),
+                    // A throwaway registry: this suite is about verdicts, not about
+                    // metrics, and a real one would need a Spring context to exist.
+                    new SandboxMetrics(new io.micrometer.core.instrument.simple.SimpleMeterRegistry()),
                     "docker")),
             new OutputComparator(),
             60_000,     // compile timeout: generous, so a cold g++ is not mistaken for a hang
@@ -266,7 +268,8 @@ class JudgeVerdictIT {
      */
     private ClaimedSubmission submission(Language language, String source, int timeLimitMs) {
         return new ClaimedSubmission(
-                1L, UUID.randomUUID(), language, source, 1, 1L, timeLimitMs, MEMORY_LIMIT_MB);
+                1L, UUID.randomUUID(), language, source, 1, java.time.Instant.now(),
+                1L, timeLimitMs, MEMORY_LIMIT_MB);
     }
 
     private static boolean dockerAvailable() {

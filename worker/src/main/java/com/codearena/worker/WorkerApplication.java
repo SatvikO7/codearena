@@ -4,6 +4,7 @@ import com.codearena.worker.config.WorkerProperties;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.scheduling.annotation.EnableScheduling;
 
 /**
  * Entry point for the CodeArena judge worker.
@@ -18,6 +19,9 @@ import org.springframework.boot.context.properties.EnableConfigurationProperties
  */
 @SpringBootApplication
 @EnableConfigurationProperties(WorkerProperties.class)
+// Scheduling exists for one job: the heartbeat that tells the API server this
+// worker is alive. Judging itself is driven by a blocking pop, not by a timer.
+@EnableScheduling
 public class WorkerApplication {
 
     public static void main(String[] args) {
