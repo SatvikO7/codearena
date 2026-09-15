@@ -48,6 +48,7 @@ public record RateLimitProperties(
         @NotNull @Valid Bucket standings,
         @NotNull @Valid Bucket problemSearch,
         @NotNull @Valid Bucket adminRead,
+        @NotNull @Valid Bucket adminWrite,
 
         @NotNull Duration violationAuditCooldown) {
 
@@ -111,6 +112,7 @@ public record RateLimitProperties(
             case STANDINGS -> standings;
             case PROBLEM_SEARCH -> problemSearch;
             case ADMIN_READ -> adminRead;
+            case ADMIN_WRITE -> adminWrite;
         };
     }
 }

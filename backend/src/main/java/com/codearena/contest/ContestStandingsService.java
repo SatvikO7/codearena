@@ -98,11 +98,31 @@ public class ContestStandingsService {
             byProblemId.put(entry.getProblem().getId(), entry);
         }
 
+        List<ContestScoring.Row> rows = computeRows(contest, points);
+
+        return new StandingsResponse(contestId, status, now, columns,
+                rows.stream().map(row -> toRow(row, byProblemId, contest.getStartAt())).toList());
+    }
+
+    /**
+     * The scored, ranked rows for one contest.
+     *
+     * <p>Extracted so that rating finalisation consumes exactly what the standings page
+     * shows. Two separate derivations of "who came where" would eventually disagree, and
+     * the disagreement would surface as a rating change that does not match the
+     * scoreboard somebody is looking at.
+     *
+     * <p>Takes the contest rather than its id because the caller has already loaded and
+     * authorised it -- finalisation runs for an ended contest that may no longer be
+     * visible in the ordinary sense, and re-checking visibility here would be the wrong
+     * question.
+     */
+    public List<ContestScoring.Row> computeRows(Contest contest, Map<Long, Integer> points) {
         List<String> penalised = ContestService.penalisedVerdictNames();
         long internalId = contest.getId();
 
         List<ContestScoring.Contestant> contestants =
-                participantRepository.findContestants(contestId);
+                participantRepository.findContestants(contest.getPublicId());
         List<ContestScoring.Solve> solves =
                 standingsRepository.findSolves(internalId, penalised).stream()
                         .map(row -> new ContestScoring.Solve(
@@ -117,14 +137,25 @@ public class ContestStandingsService {
                     row.getAttempts());
         }
 
-        List<ContestScoring.Row> rows = ContestScoring.standings(
-                contestants, solves, attempts, points, contest.getStartAt());
-
         log.debug("event=STANDINGS_COMPUTED contest={} contestants={} solves={}",
-                contestId, contestants.size(), solves.size());
+                contest.getPublicId(), contestants.size(), solves.size());
 
-        return new StandingsResponse(contestId, status, now, columns,
-                rows.stream().map(row -> toRow(row, byProblemId, contest.getStartAt())).toList());
+        return ContestScoring.standings(
+                contestants, solves, attempts, points, contest.getStartAt());
+    }
+
+    /**
+     * The problem points of one contest, in contest order.
+     *
+     * <p>Insertion-ordered so the scoring engine walks problems the way the columns are
+     * laid out.
+     */
+    public Map<Long, Integer> pointsOf(Contest contest) {
+        Map<Long, Integer> points = new LinkedHashMap<>();
+        contest.getProblems().stream()
+                .sorted(Comparator.comparingInt(ContestProblem::getDisplayOrder))
+                .forEach(entry -> points.put(entry.getProblem().getId(), entry.getPoints()));
+        return points;
     }
 
     private StandingsResponse.Row toRow(ContestScoring.Row row,

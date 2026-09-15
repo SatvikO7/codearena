@@ -1544,3 +1544,183 @@ work that is waiting.
 an instance out of rotation when it could have served some read-only traffic. That is the
 right way to be wrong: the alternative is routing to an instance that will fail every
 authenticated request, since sessions live in Redis.
+
+---
+
+## ADR-043 — A pairwise Elo rating, and why not a Codeforces-style seed
+
+**Problem.** A contest platform has to turn "who came where" into "what is that worth", and
+the choice is load-bearing in a way most choices are not: nobody can look at a rating change
+of −17 and tell whether it should have been −18. An error in the formula is invisible.
+
+**Chosen.** Treat the contest as a round robin. Every participant plays every other
+participant once, and each pairing is decided by their competition ranks. For a field of `n`,
+with `R` the rating going in:
+
+```
+E(i,j) = 1 / (1 + 10 ^ ((R_j − R_i) / 400))
+E_i    = ( Σ_{j≠i} E(i,j) ) / (n − 1)
+A_i    = ( wins_i + 0.5 × ties_i ) / (n − 1)
+Δ_i    = round( K_i × (A_i − E_i) )
+```
+
+Starting rating 1500. K is 40 for the first five rated contests, 10 at 2400 and above, and 20
+otherwise. Ties score a half each, exactly as a drawn game does in Elo. Rounding is
+`BigDecimal` HALF_UP — half *away from zero* — so +2.5 becomes +3 and −2.5 becomes −3, rather
+than `Math.round`, which computes `floor(x + 0.5)` and would quietly favour whoever is losing
+points.
+
+**Rejected: a Codeforces-style seed.** Codeforces computes the rank a contestant would be
+expected to achieve, derives a performance rating from it, and moves the rating toward that.
+It produces good numbers and it is the better-known approach. It is also considerably harder
+to state in one screen, harder to verify with a calculator, and harder to explain to somebody
+who disagrees with their change. The pairwise form above is the same idea normalised
+differently, and every step of it can be checked by hand — which is why the calculator's tests
+hand-calculate their expected values instead of asserting whatever the code currently returns.
+A test that captures the implementation's output would pass just as happily against a formula
+that was wrong from the first commit.
+
+**Why 400.** Elo's scale constant: 400 points is about a 10:1 expectation. Inherited from
+chess, and kept because changing it would change nothing except the numbers people quote.
+
+**Why 1500 and not 0.** It leaves room to fall. A scale starting at zero makes a first bad
+contest look like a catastrophe and pushes ratings negative immediately, which is
+arithmetically fine and reads as broken.
+
+**Why K varies by experience, not by contest.** A newcomer's rating is mostly a guess and
+should move fast; an established competitor's is an estimate built from evidence and should
+not swing on one result. Provisional is checked before elite, so a newcomer seeded high still
+moves quickly — otherwise the seeding would be self-confirming.
+
+**Rating is not conserved, and that is not a bug.** Before rounding the system is exactly
+zero-sum: Σ A = Σ E, because both count each unordered pair once. Two things break the sum
+afterwards, both deliberately. K varies per participant, so a newcomer's +30 is not paid for
+by three veterans' −10. And each change is rounded independently. Forcing conservation would
+mean taking points from somebody to pay for a rounding error.
+
+**No floor and no ceiling.** A floor would mean the system declining to record a result it had
+computed, and a competitor sitting on the floor could then lose indefinitely at no cost —
+precisely when their rating most needs to keep moving. Reaching zero from 1500 takes roughly
+150 consecutive defeats by an equal, because losing to somebody far above you rounds to
+nothing.
+
+**Determinism.** Floating-point addition is not associative, so the order of the summation
+changes the last bits — and with the right field, changes a rounded rating by one. The
+calculator sorts participants by public id before summing anything, and a test asserts the
+output is identical across twenty shuffles of the same input.
+
+**Cost.** The pairwise form is O(n²): a thousand competitors is a million expectations, which
+measures in tens of milliseconds. That is the documented limit of the approach, asserted by a
+test rather than assumed.
+
+**Trade-off.** The numbers will not match Codeforces for the same standings, so anybody
+arriving with an intuition calibrated there will find these ratings move differently —
+particularly in large fields, where the pairwise normalisation is gentler. Accepted in
+exchange for a formula that a competitor can check themselves.
+
+---
+
+## ADR-044 — Finalisation is claimed with a conditional UPDATE, and swept rather than scheduled
+
+**Problem.** Rating a contest must happen exactly once. Twice means every competitor's change
+applied twice, a history that no longer explains the rating, and no automatic way to work out
+which half to undo. It must also happen *without being asked*, because a contest that ends
+while nobody is watching still has to produce its ratings.
+
+**Chosen: a conditional UPDATE as the claim.**
+
+```sql
+UPDATE contests SET rating_finalized_at = :now
+ WHERE id = :id AND rating_finalized_at IS NULL
+```
+
+PostgreSQL serialises concurrent updates to a row, so of several callers running this exactly
+one updates a row and the rest update none. The return value *is* the decision: 1 means "you
+finalise it", 0 means "somebody else already did". The same mechanism the judge uses to claim
+a submission (ADR-018), for the same reason.
+
+**Rejected: deciding in Java.** Read, check, write — and two transactions can both read "not
+finalised". This is not a theoretical race: an administrator's retry, the sweeper, and a
+second application instance are three realistic ways to have two callers at once.
+
+**A unique constraint stands behind it.** `uq_rating_changes_contest_user` on
+`(contest_id, user_id)` means that even if the claim were somehow won twice, a double rating
+would be physically impossible rather than merely unlikely. An integration test asserts it
+directly.
+
+**All of it, or none of it.** The whole finalisation is one transaction: claim, compute,
+update every rating, insert every history row, record the count. A contest where forty of
+eighty competitors had been rated would be unrecoverable by any automatic means, because there
+would be no way to tell which forty. A rollback releases the claim along with everything else,
+so the next attempt starts from the same clean state.
+
+**Chosen: a sweeper that asks a question, not a timer that fires.** The obvious design is to
+schedule a job at the contest's end instant. It is also the design that loses contests: a
+scheduled callback lives in one process's memory, and a restart, a deploy or a lost instance
+means the contest ends with nobody listening. Nothing notices, and the first report is a
+competitor asking why their rating did not move.
+
+So the sweeper asks the database *which contests have ended, are rated, and have no
+finalisation*. That question cannot be wrong — after a restart, after a crash, after two weeks
+of downtime, on a brand-new instance. It runs every sixty seconds and once on
+`ApplicationReadyEvent`, so a deployment that comes up just after a contest ended does not
+leave the field waiting. There is no separate recovery path, because a recovery path that only
+runs after a crash is a path that is never tested. The partial index
+`ix_contests_awaiting_finalisation` covers exactly that predicate, so the usual answer — none —
+costs almost nothing.
+
+**Several instances are safe with no lock.** Every instance may see the same contest and every
+instance may try; the claim means one wins and the others are told the work is done. Duplicate
+effort is a few wasted queries, not a double rating.
+
+**Idempotent, and that is an interface decision.** A second call returns the outcome of the
+finalisation that already happened, with `alreadyFinalized: true`, and is a 200. The three
+ways in — an administrator, the sweeper, a retry after a timeout — will genuinely overlap, and
+a caller who receives an error for something that already succeeded is a caller who retries.
+
+**Attribution.** The sweeper runs with no security context, so resolving the audit actor the
+usual way would record every automatic finalisation as ANONYMOUS. An audit log saying an
+unauthenticated caller rated a contest is worse than no audit log, because it is wrong in a
+way somebody would act on. Automatic finalisations are recorded as SYSTEM with no username; an
+administrator's names them.
+
+**Trade-off.** A contest's ratings can lag its end by up to a minute. Finalising the instant
+the clock struck would need the scheduled-job design this ADR rejects, and a minute is
+invisible next to the judging queue a contest's last submissions are already sitting in.
+
+---
+
+## ADR-045 — Who gets rated: competing, not registering
+
+**Problem.** The standings list every registered contestant, including those who never opened
+the problems. Rating that list would take points from people for a contest they did not enter.
+
+**Chosen.** A participant is rated if they made **at least one submission** in the contest,
+whatever its verdict. Registering is an intention; competing is an act, and only the second is
+evidence of anything.
+
+**Every status counts, not only accepted ones.** A contestant whose every submission was wrong
+competed. So did one who only managed a compile error. The question is whether they turned up.
+
+**Why not rate registrations.** Registration is free and reversible up to the start. If it
+were enough, a competitor could damage their rating by signing up and forgetting, and anybody
+could pad a field with registrations to move other people's ratings.
+
+**Ranks are not renumbered after the filter.** A rating change has to be explained by the
+standings somebody can look at, and a rank that existed only inside the rating calculation
+would explain nothing. This is safe rather than merely convenient: a no-show scores zero, and
+since penalty is only charged on solved problems, carries no penalty either — so a no-show is
+strictly better than nobody, and removing one cannot change any other contestant's rank.
+
+**A field of one produces nothing.** Not an error: a contest one person entered is a real
+contest. It simply says nothing about how they did, because there was nobody to measure
+against — and the expected score divides by `n − 1`.
+
+**A cancelled contest is never rated, whatever its standings show.** The submissions and the
+scoreboard remain readable as a record of what happened; what is withheld is the consequence.
+Checked before the claim is taken, so a cancelled contest is never even marked finalised.
+
+**Trade-off.** A contestant who opened the problems, thought about them and submitted nothing
+is treated as absent. They may feel they competed. The alternative — rating everyone who
+clicked "register" — is worse in a way that costs people rating points, and this way the
+remedy is entirely in their hands: submit something.

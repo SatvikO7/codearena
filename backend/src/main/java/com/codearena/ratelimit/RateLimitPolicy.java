@@ -93,7 +93,29 @@ public enum RateLimitPolicy {
      * so that a dashboard which refreshes and pages cannot reach it (see
      * {@code docs/rate-limiting.md}); it exists to bound a script, not to police a human.
      */
-    ADMIN_READ("admin-read", Scope.USER, FailureMode.OPEN, true);
+    ADMIN_READ("admin-read", Scope.USER, FailureMode.OPEN, true),
+
+    /**
+     * Administrative operations that change state, per administrator.
+     *
+     * <p>Separate from {@link #ADMIN_READ} because the two protect different things and
+     * therefore want different answers when Redis is unavailable. A read is a cost
+     * control, so it fails open — refusing an administrator a dashboard because the
+     * limiter is down helps nobody. A write is a blast-radius control, and the operations
+     * it covers are the ones that are expensive or irreversible: finalising a contest
+     * computes ratings across the whole field and writes a permanent, append-only history
+     * that no later call can undo.
+     *
+     * <p>So this one fails <b>closed</b>. If the limiter cannot answer, the honest
+     * response is to refuse the write and let the administrator retry, rather than to
+     * process an unbounded number of finalisation attempts with no control at all.
+     *
+     * <p>The allowance is small on purpose. These are operations a human performs a
+     * handful of times; a caller reaching this limit is a script, and a script hammering
+     * finalisation is the exact thing that turns a cheap idempotent no-op into a
+     * sustained load on the standings query.
+     */
+    ADMIN_WRITE("admin-write", Scope.USER, FailureMode.CLOSED, true);
 
     /** What the bucket is keyed on. */
     public enum Scope {

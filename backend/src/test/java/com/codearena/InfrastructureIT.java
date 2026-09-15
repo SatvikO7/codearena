@@ -7,7 +7,14 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.web.servlet.MockMvc;
 
+import java.io.IOException;
+import java.net.URISyntaxException;
+import java.net.URL;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Comparator;
 import java.util.List;
+import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -31,13 +38,29 @@ class InfrastructureIT extends AbstractIntegrationTest {
     @Autowired
     private JdbcTemplate jdbcTemplate;
 
+    /**
+     * Every migration on the classpath is applied, in order, and nothing else is.
+     *
+     * <p>The expectation is <b>derived from the migration directory</b> rather than written
+     * out. A hard-coded list turns every new migration into a failing test that has to be
+     * edited to pass, which teaches whoever is adding V10 that the right response to this
+     * test failing is to change the number — and the one time it was catching something
+     * real, they would change it then too. The same reasoning as stage 6 of
+     * {@code scripts/verify-all.sh}, which reads the directory for the same reason.
+     *
+     * <p>What it still catches: a migration that did not run, one that ran out of order, and
+     * a {@code flyway_schema_history} carrying a version with no file behind it.
+     */
     @Test
     void flywayAppliesEveryMigrationInOrder() {
+        List<String> expected = migrationVersionsOnClasspath();
+
         List<String> applied = jdbcTemplate.queryForList(
                 "SELECT version FROM flyway_schema_history WHERE success = true ORDER BY installed_rank",
                 String.class);
 
-        assertThat(applied).containsExactly("1", "2", "3", "4", "5", "6", "7", "8");
+        assertThat(expected).as("no migrations were found on the classpath").isNotEmpty();
+        assertThat(applied).containsExactlyElementsOf(expected);
 
         // V1 installs citext. V2 ended up not using it (see the note in that migration),
         // but V1 is already applied everywhere and migrations are immutable, so the
@@ -45,6 +68,24 @@ class InfrastructureIT extends AbstractIntegrationTest {
         Integer citext = jdbcTemplate.queryForObject(
                 "SELECT count(*) FROM pg_extension WHERE extname = 'citext'", Integer.class);
         assertThat(citext).isEqualTo(1);
+    }
+
+    /** The versions of {@code V<n>__*.sql} on the classpath, in numeric order. */
+    private static List<String> migrationVersionsOnClasspath() {
+        try {
+            URL location = InfrastructureIT.class.getResource("/db/migration");
+            assertThat(location).as("db/migration is not on the test classpath").isNotNull();
+
+            try (Stream<Path> files = Files.list(Path.of(location.toURI()))) {
+                return files.map(path -> path.getFileName().toString())
+                        .filter(name -> name.startsWith("V") && name.endsWith(".sql"))
+                        .map(name -> name.substring(1, name.indexOf("__")))
+                        .sorted(Comparator.comparingInt(Integer::parseInt))
+                        .toList();
+            }
+        } catch (IOException | URISyntaxException e) {
+            throw new IllegalStateException("could not read the migration directory", e);
+        }
     }
 
     /**

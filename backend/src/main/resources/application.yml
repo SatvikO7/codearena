@@ -266,6 +266,14 @@ codearena:
       capacity: ${RATE_LIMIT_ADMIN_READ_BURST:120}
       refill-interval: ${RATE_LIMIT_ADMIN_READ_INTERVAL:PT1S}        # 60/minute sustained
 
+    # Deliberately far tighter than admin-read, and fails closed rather than open. These
+    # are the operations that compute ratings for a whole field and write history that
+    # cannot be undone; a human does them a few times, so anything approaching this rate
+    # is a script.
+    admin-write:
+      capacity: ${RATE_LIMIT_ADMIN_WRITE_BURST:20}
+      refill-interval: ${RATE_LIMIT_ADMIN_WRITE_INTERVAL:PT3S}       # 20/minute sustained
+
   queue:
     # How often the recovery sweeper looks for lost or stranded submissions.
     sweep-interval-ms: ${QUEUE_SWEEP_INTERVAL_MS:30000}

@@ -271,7 +271,12 @@ lifecycle change; deletion is not a substitute for it. ADR-035.
 - **No plagiarism detection and no anti-cheat of any kind.** Nothing in CodeArena compares
   submissions between contestants, detects shared solutions, or watches for suspicious
   behaviour. A contest run on this platform is not protected against collusion.
-- **No team contests, divisions, or rated ratings.** One contestant, one score.
+- **No team contests and no divisions.** One contestant, one score.
+- **Ratings are a separate concern, added in Phase 11.** A contest is rated or unrated,
+  and that decides whether its final standings move anybody’s rating — but the scoring
+  itself is unchanged by it, and a rated contest is scored exactly like an unrated one.
+  The flag is fixed once the contest starts, and a cancelled contest is never rated.
+  See [ratings.md](ratings.md).
 - **No per-problem scoring variants** — no partial credit, no subtasks, no decay over time.
 - **Standings are recomputed per request.** At the scale this is built for that is the right
   trade; a contest with tens of thousands of participants would want a materialised

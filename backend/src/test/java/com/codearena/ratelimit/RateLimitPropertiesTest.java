@@ -47,7 +47,7 @@ class RateLimitPropertiesTest {
         RateLimitProperties.Bucket valid = bucket(10, Duration.ofSeconds(1));
 
         assertThatThrownBy(() -> new RateLimitProperties(true, false,
-                valid, valid, valid, valid, valid, valid, valid, Duration.ofMinutes(-1)))
+                valid, valid, valid, valid, valid, valid, valid, valid, Duration.ofMinutes(-1)))
                 .isInstanceOf(IllegalArgumentException.class);
     }
 
@@ -96,6 +96,7 @@ class RateLimitPropertiesTest {
                 bucket(RateLimitPolicy.STANDINGS.ordinal() + 1, second),
                 bucket(RateLimitPolicy.PROBLEM_SEARCH.ordinal() + 1, second),
                 bucket(RateLimitPolicy.ADMIN_READ.ordinal() + 1, second),
+                bucket(RateLimitPolicy.ADMIN_WRITE.ordinal() + 1, second),
                 Duration.ofMinutes(10));
     }
 }

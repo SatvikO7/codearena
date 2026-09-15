@@ -106,4 +106,29 @@ public interface ContestStandingsRepository extends JpaRepository<ContestPartici
             """, nativeQuery = true)
     List<AttemptRow> findAttemptCounts(@Param("contestId") long contestId,
                                        @Param("penalised") Collection<String> penalisedVerdicts);
+
+    /**
+     * Everybody who actually submitted something in this contest.
+     *
+     * <p>Used by rating finalisation to decide who is eligible, and by nothing else — the
+     * standings show every registered contestant, including those who submitted nothing,
+     * because a scoreboard reporting who signed up is accurate and harmless.
+     *
+     * <p>A rating is not harmless. Registering for a contest is an intention; competing in it
+     * is an act, and only the second is evidence of anything. Rating a no-show would take
+     * points from somebody for a contest they never opened — and since registration is free
+     * and reversible up to the start, it would also hand anybody a way to damage their own
+     * rating by accident, or somebody else's by filling a field with registrations.
+     *
+     * <p>Every status counts, not only the accepted ones. A contestant whose every submission
+     * was wrong competed; so did one who only managed a compile error. What is being asked is
+     * whether they turned up, not how well it went.
+     */
+    @Query(value = """
+            SELECT DISTINCT u.public_id
+            FROM submissions s
+            JOIN users u ON u.id = s.user_id
+            WHERE s.contest_id = :contestId
+            """, nativeQuery = true)
+    List<UUID> findParticipantsWhoSubmitted(@Param("contestId") long contestId);
 }

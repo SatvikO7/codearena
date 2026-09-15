@@ -25,13 +25,16 @@ public record ContestSummaryResponse(
         long participantCount,
         int problemCount,
         @Schema(description = "Whether the caller is registered. False for anonymous callers.")
-        boolean registered) {
+        boolean registered,
+        @Schema(description = "Whether this contest moves ratings. In the list because it is "
+                            + "what decides whether somebody enters it.")
+        boolean rated) {
 
     public static ContestSummaryResponse from(Contest contest, Instant now,
                                               long participants, int problems, boolean registered) {
         return new ContestSummaryResponse(
                 contest.getPublicId(), contest.getTitle(), contest.getSlug(),
                 contest.statusAt(now), contest.getStartAt(), contest.getEndAt(),
-                participants, problems, registered);
+                participants, problems, registered, contest.isRated());
     }
 }

@@ -729,9 +729,151 @@ cannot destroy submission history. ADR-035.
   compete over a shorter window while charged from the start, so their standing would not be
   comparable with anyone else's. ADR-033.
 - **No scoreboard freeze.** Standings are live throughout, including the final hour.
-- **No opt-out of standings, no team contests, no divisions, no ratings, no partial credit.**
+- **No opt-out of standings, no team contests, no divisions, no partial credit.**
+- **Ratings are a separate concern.** A contest is rated or unrated, and that decides
+  whether its standings move anybody’s rating — but the scoring itself is unchanged by it.
+  See [Ratings and rankings](#ratings-and-rankings).
 
 Full detail is in [docs/contests.md](docs/contests.md).
+
+---
+
+## Ratings and rankings
+
+A rated contest moves every competitor's rating when it ends. The rating is the one number in
+this system that people will argue about, so the whole design is built around being able to
+settle the argument with a calculator.
+
+```mermaid
+flowchart LR
+    A["Contest ends"] --> B{"rated?"}
+    B -- no --> C["Finalised.<br/>Nothing moves."]
+    B -- yes --> D["Claim the contest<br/>(conditional UPDATE)"]
+    D --> E["Final standings<br/>from the database"]
+    E --> F["RatingCalculator<br/>(pure)"]
+    F --> G["Ratings + append-only<br/>history, one transaction"]
+```
+
+### The formula, in full
+
+Every participant plays every other participant once; each pairing is decided by their
+competition ranks.
+
+```
+E(i,j) = 1 / (1 + 10 ^ ((R_j − R_i) / 400))
+E_i    = ( Σ_{j≠i} E(i,j) ) / (n − 1)
+A_i    = ( wins_i + 0.5 × ties_i ) / (n − 1)
+Δ_i    = round( K_i × (A_i − E_i) )
+```
+
+Start at **1500**. K is **40** for the first five rated contests, **10** at 2400 and above,
+**20** otherwise. Ties score a half each. Rounding is HALF_UP — half away from zero, so −2.5
+becomes −3 rather than −2, which `Math.round` would do and which would quietly favour whoever
+is losing points.
+
+Two evenly matched established competitors: **+10 / −10**. Two newcomers: **+20 / −20**. A
+1900 beating a 1500: **+2 / −2**. A 1500 beating a 1900: **+18 / −18**. Every one of those is
+a test with the arithmetic written out beside it.
+
+The tests hand-calculate their expected values rather than capturing what the code returns. A
+test that asserted the implementation's own output would pass just as happily against a
+formula that was wrong from the first commit — and nobody can look at −17 and tell whether it
+should have been −18.
+
+### Rated is decided before the contest, and frozen when it starts
+
+A contest defaults to **unrated**. The flag can be changed while it is a draft or upcoming,
+and is refused the moment it goes live — by the same check that protects the schedule and the
+points. There is no override. A contest that became rated halfway through would be asking
+people to compete for stakes they never agreed to.
+
+An unrated contest is still *finalised*; it simply produces no rating changes. "Finalised" and
+"changed somebody's rating" are different facts, and the schema keeps them apart.
+
+### Who gets rated
+
+Everybody who **submitted something**, whatever the verdict. Registering is an intention;
+competing is an act. Rating a no-show would take points from somebody for a contest they never
+opened — and would let anyone pad a field with registrations to move other people's ratings.
+
+A **cancelled contest is never rated**, whatever its standings show. The scoreboard stays
+readable as a record of what happened; what is withheld is the consequence.
+
+### Exactly once, or not at all
+
+Finalisation takes the contest with a conditional UPDATE:
+
+```sql
+UPDATE contests SET rating_finalized_at = :now
+ WHERE id = :id AND rating_finalized_at IS NULL
+```
+
+PostgreSQL serialises concurrent updates to a row, so of ten simultaneous callers exactly one
+updates a row and the other nine are told the work is already done. Behind it,
+`UNIQUE (contest_id, user_id)` on the history makes a double rating physically impossible
+rather than merely unlikely. A test fires ten concurrent finalisations and asserts one
+winner, nine no-ops, and one history row per competitor.
+
+The whole operation is one transaction. There is no path that rates half the field — a contest
+where forty of eighty competitors had been rated would be unrecoverable by any automatic
+means, because there would be no way to tell which forty.
+
+### Automatic, and discoverable rather than scheduled
+
+A sweeper asks the database *which contests have ended, are rated, and have no finalisation* —
+every sixty seconds, and once at startup. It does not schedule a job at the contest's end
+instant, because a scheduled callback lives in one process's memory: restart, deploy or lose
+the instance and the contest ends with nobody listening, and nobody notices until a competitor
+asks why their rating did not move. A query cannot be wrong that way. Running several
+instances needs no lock; the claim settles it.
+
+Automatic finalisations are audited as **SYSTEM**, not as a phantom anonymous caller.
+
+### The history is the truth
+
+`user_ratings` is a cache — an indexed row so the leaderboard is a scan rather than an
+aggregation. `contest_rating_changes` is the authority: **append-only**, enforced by a
+PostgreSQL trigger that raises on UPDATE and DELETE, storing the whole input and output of the
+calculation (`expected_score`, `actual_score`, `k_factor`, rank, score, penalty) so any change
+can be re-derived. An invariant test asserts every rating equals the `ratingAfter` of that
+competitor's most recent change.
+
+### The API
+
+| Endpoint | Who |
+|---|---|
+| `GET /api/rankings` | any signed-in user |
+| `GET /api/users/{id}/rating` | any signed-in user |
+| `GET /api/users/{id}/rating/history` | any signed-in user |
+| `GET /api/contests/{id}/rating` | the caller's own outcome |
+| `POST /api/admin/contests/{id}/finalize` | ADMIN, idempotent, no body |
+
+**There is no endpoint that accepts a rating** — not one that validates and rejects, one that
+does not exist. The administrative finalisation takes no request body at all, because every
+input comes from the database.
+
+`GET /api/contests/{id}/rating` reports four distinct states: `UNRATED`, `CANCELLED`,
+`PENDING` and `FINALIZED`. A pending contest deliberately does **not** report a change of zero
+— zero is a real rating change, "not yet" is not, and showing them the same way would misreport
+one of them.
+
+Ranking is `RANK() OVER (ORDER BY rating DESC)`: ties share a rank and the next rank skips
+(1, 2, 2, 4). An account that has never competed is **absent** from the leaderboard rather than
+listed at 1500 — having no rating and having a rating of 1500 are different facts.
+
+### What this deliberately does not do
+
+No manual rating adjustment (no endpoint, no admin screen, no service method). No
+recalculation of a finalised contest. No rating decay. No divisions, no team ratings, no
+cross-platform import. No predicted change during a live contest — a number labelled
+"unofficial" is still a number people will quote. Rating is **not conserved**, because K varies
+per competitor and each change is rounded independently; forcing conservation would mean taking
+points from somebody to pay for a rounding error. There is no floor: a rating can go negative,
+which takes roughly 150 consecutive defeats by an equal.
+
+Full detail, worked examples and the verification commands are in
+[docs/ratings.md](docs/ratings.md); the reasoning is ADR-043, ADR-044 and ADR-045 in
+[docs/decisions.md](docs/decisions.md).
 
 ---
 
@@ -1167,6 +1309,8 @@ from an environment variable with a development default; see
 | `WORKER_CONCURRENCY` | Submissions judged in parallel per worker process |
 | `CORS_ALLOWED_ORIGINS` | Explicit browser origin allow-list |
 | `VITE_API_BASE_URL` | API base URL baked into the frontend bundle |
+| `RATING_AUTO_FINALIZE` | Whether contests are finalised automatically (default `true`) |
+| `RATE_LIMIT_ADMIN_WRITE_BURST`, `RATE_LIMIT_ADMIN_WRITE_INTERVAL` | Administrative write limit, fails closed |
 
 `docker-compose.yml` uses `${VAR:?message}` for `POSTGRES_PASSWORD`, so the stack fails
 loudly rather than silently starting with a default credential. There is no token signing
@@ -1290,16 +1434,17 @@ as it lands, never before.
 | 8 | Admin operations, audit logging and system governance | **Complete** |
 | 9 | Rate limiting, quotas and abuse controls | **Complete** |
 | 10 | Observability, reliability and production readiness | **Complete** |
-| 11 | Full frontend | Next |
-| 12 | Kernel-level sandbox isolation (gVisor / rootless daemon) | Planned |
-| 13–16 | Testing, CI/CD, docs, deployment | Planned |
+| 11 | Ratings, global rankings and contest history | **Complete** |
+| 12 | Full frontend | Next |
+| 13 | Kernel-level sandbox isolation (gVisor / rootless daemon) | Planned |
+| 14–16 | Testing, CI/CD, docs, deployment | Planned |
 
 The Docker execution engine and the judging and verdict logic were originally sketched as
 separate later phases. They were delivered in Phase 4, because a submission pipeline that
 queues work nothing can execute is not testable and therefore not verifiable. The table
 above reflects what was actually built, not the original guess at the order.
 
-Phase 12 is deliberately still there. Phase 6 hardened the sandbox and moved Docker control
+Phase 13 is deliberately still there. Phase 6 hardened the sandbox and moved Docker control
 off the worker; it did not give containers their own kernel. That remains the one change
 that would turn a container escape into something other than a host escape.
 

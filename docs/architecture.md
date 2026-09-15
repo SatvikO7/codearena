@@ -239,7 +239,7 @@ snapshot on connect, a convergent client reducer that ignores anything not stric
 and a bounded fallback poll armed only when the stream fails. See
 [submission-lifecycle.md](submission-lifecycle.md) and ADR-023/ADR-024.
 
-## Current state (Phase 10 — complete and verified)
+## Current state (Phase 11 — complete and verified)
 
 Implemented:
 
@@ -325,6 +325,31 @@ Added in Phase 7:
   score to fall out of step (ADR-034)
 - Contest, contest-solve, standings and admin contest pages, with a server-corrected
   countdown
+
+Added in Phase 11:
+
+- `user_ratings` and `contest_rating_changes` (`V9`), plus three columns on `contests`
+  (`rated`, `rating_finalized_at`, `rated_participant_count`) with a check that the last two
+  move together and a partial index over exactly the sweeper's predicate
+- `RatingCalculator`: a pure, dependency-free pairwise Elo, stated in full in its own javadoc
+  and tested against hand-calculated values rather than its own output (ADR-043)
+- Finalisation claimed with a conditional UPDATE, the same mechanism the judge uses to claim a
+  submission, with `UNIQUE (contest_id, user_id)` behind it as a second line (ADR-044)
+- The whole finalisation in one transaction: there is no path that rates half a field
+- A sweeper that asks the database what is outstanding rather than scheduling a job at the
+  contest's end instant, running on a fixed delay and once on `ApplicationReadyEvent`
+- Rating history append-only, enforced by a PostgreSQL trigger, storing the whole input and
+  output of each calculation so any change can be re-derived
+- Eligibility defined as having submitted something: registering is an intention, competing is
+  an act (ADR-045)
+- Global ranking with `RANK()` and SQL pagination; competition ranking semantics, so ties share
+  a rank and the next rank skips
+- A `RateLimitPolicy.ADMIN_WRITE` that fails **closed**, distinguishing a cost control from a
+  blast-radius control; no new limiter was written
+- Automatic finalisations audited as SYSTEM rather than as a phantom anonymous caller
+- Frontend rankings page, rating profile with a hand-drawn SVG progression graph, a contest
+  rating panel that keeps UNRATED, CANCELLED, PENDING and FINALIZED distinct, and an admin
+  rated toggle and finalise action
 
 Added in Phase 10:
 
@@ -417,6 +442,21 @@ the keyspace and every bucket expires; administrators are limited too; closed po
 and open ones serve when Redis is unreachable; and enforcement resumes by itself once it
 returns.
 
+Phase 11 adds to that: a contest is unrated unless somebody says otherwise, and the flag is
+refused once the contest is LIVE or ENDED; ten simultaneous finalisations rate a contest
+exactly once and the other nine are told the work was already done; a finalisation that rolls
+back leaves no rating, no history and no claim, so the next attempt starts clean; a cancelled
+contest is never rated and the sweeper never picks one up; an unrated contest is finalised and
+moves nobody; a registered no-show is not rated and does not distort the ranks of those who
+competed; the rating history refuses UPDATE and DELETE; a history row whose three numbers
+disagree is refused by the database; a peak below the current rating is refused; every rating
+equals the `ratingAfter` of its most recent history row and every chain of rows is continuous;
+no request body, query parameter or overposted field can move a number; a user cannot read
+another user's contest result by naming them; the ranking and the profile carry no email, no
+role and no source code; the ranking is ordered, ranked and paged by the database at ten
+thousand competitors, with the last page costing what the first page costs; and no contest id,
+user id or username appears as a metric label.
+
 Phase 8 adds to that: an audit event cannot be updated or deleted, including by a blanket
 DELETE; a success event written in a transaction that rolls back does not survive;
 a failure event written independently does survive its caller's rollback; recording
@@ -477,7 +517,9 @@ heartbeat, no user administration, no audit retention tooling and no tamper-evid
 beyond access control; no alerting on suspicious patterns; and **no plagiarism detection
 and no anti-cheat
 of any kind** — nothing compares submissions between contestants; there is no scoreboard
-freeze, no late registration, no team contests and no ratings; there is no submission rate
+freeze, no late registration and no team contests; ratings exist but have no manual
+adjustment, no recalculation of a finalised contest, no decay, no divisions and no predicted
+change during a live contest; there is no submission rate
 limiting; the SSE connection cap is global rather than per user; memory is enforced but
 not measured; there is no dead-letter queue for inspection; and the sandbox, though
 hardened in Phase 6, still shares the host kernel and its execution service still holds a
@@ -485,10 +527,21 @@ Docker socket. Event delivery is at-least-once and best-effort, not exactly-once
 real-time delivery is not guaranteed. See docs/security.md, docs/threat-model.md and
 docs/contests.md.
 
-Planned, in phase order: worker scaling and queue observability (8), caching, profiles
-and statistics (8), rate limiting (9), contests and leaderboards (10), full frontend (11),
-sandbox hardening (12).
+**A rating changes in exactly one place.** Inside a contest finalisation, from standings the
+database computed, in one transaction, written to an append-only history. There is no
+endpoint, no admin screen and no service method that sets a rating — not one that validates
+and rejects, one that does not exist. A rating with two possible provenances is a rating whose
+history no longer explains it (ADR-043, ADR-044).
+
+**Contest scoring was not redesigned for ratings.** Finalisation consumes exactly the rows the
+standings page shows, through the same `ContestStandingsService`. Two separate derivations of
+"who came where" would eventually disagree, and the disagreement would surface as a rating
+change that does not match the scoreboard somebody is looking at.
+
+Planned, in phase order: full frontend (12), sandbox hardening (13), testing, CI/CD, docs and
+deployment (14–16).
 
 ## Related documents
 
 - [decisions.md](decisions.md) — engineering decisions and their trade-offs
+- [ratings.md](ratings.md) — the rating formula, worked examples, and what it deliberately does not do

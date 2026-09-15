@@ -6,6 +6,7 @@ import { useContestClock } from '../hooks/useContestClock';
 import { apiErrorCode, describeApiError } from '../services/apiClient';
 import { ContestStatusPill } from '../components/ContestStatusPill';
 import { ContestStandings } from '../components/ContestStandings';
+import { ContestRatingPanel } from '../components/ContestRatingPanel';
 import type { ContestDetail } from '../types/contest';
 
 export function ContestDetailPage() {
@@ -126,6 +127,11 @@ function ContestView({ contestId }: { contestId: string }) {
           <span>Starts {formatLocal(contest.startAt)}</span>
           <span>Ends {formatLocal(contest.endAt)}</span>
           <span>{contest.participantCount} registered</span>
+          {/* Said plainly and up front. Whether a contest counts is the thing somebody
+              decides on before entering, and it cannot change once it starts. */}
+          <span className={contest.rated ? 'badge badge--rated' : 'badge badge--unrated'}>
+            {contest.rated ? 'Rated' : 'Unrated'}
+          </span>
         </p>
       </section>
 
@@ -234,6 +240,13 @@ function ContestView({ contestId }: { contestId: string }) {
 
       {contest.status !== 'UPCOMING' && contest.status !== 'DRAFT' && (
         <ContestStandings contestId={contest.id} live={contest.status === 'LIVE'} />
+      )}
+
+      {/* Only once the contest is over. During a live contest there is deliberately no
+          predicted change to show: a provisional rating is still a number people would
+          quote, and it would be wrong as often as the standings moved. */}
+      {(contest.status === 'ENDED' || contest.status === 'CANCELLED') && (
+        <ContestRatingPanel contestId={contest.id} rated={contest.rated} />
       )}
     </div>
   );

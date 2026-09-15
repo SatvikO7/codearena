@@ -993,3 +993,177 @@ button.button {
   font-variant-numeric: tabular-nums;
   opacity: 0.75;
 }
+
+/* =========================================================================
+   Ratings.
+
+   The scale is conventionally carried by colour, and colour alone is not a
+   message: roughly one man in twelve cannot reliably separate the bands a
+   rating palette uses. So every badge prints its band as a word beside the
+   number, every change prints its sign, and the tint is a reinforcement.
+   ========================================================================= */
+
+.rating-badge {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.4rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.rating-badge__value {
+  font-weight: 700;
+  color: var(--rating-colour, var(--text));
+}
+
+.rating-badge__band {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+
+/* An unrated competitor has no rating. Deliberately the muted treatment rather than
+   a band colour, so it never reads as a low score. */
+.rating-badge--unrated .rating-badge__value {
+  font-weight: 500;
+  font-style: italic;
+  color: var(--text-muted);
+}
+
+.rating-band--grandmaster {
+  --rating-colour: #b8361f;
+}
+
+.rating-band--master {
+  --rating-colour: #a86000;
+}
+
+.rating-band--expert {
+  --rating-colour: #7b4bc4;
+}
+
+.rating-band--specialist {
+  --rating-colour: #1a7f8c;
+}
+
+.rating-band--apprentice {
+  --rating-colour: #2f6feb;
+}
+
+.rating-band--novice {
+  --rating-colour: var(--text-muted);
+}
+
+@media (prefers-color-scheme: dark) {
+  .rating-band--grandmaster {
+    --rating-colour: #ff8b73;
+  }
+
+  .rating-band--master {
+    --rating-colour: #e3b341;
+  }
+
+  .rating-band--expert {
+    --rating-colour: #b48cf2;
+  }
+
+  .rating-band--specialist {
+    --rating-colour: #58c9d6;
+  }
+
+  .rating-band--apprentice {
+    --rating-colour: #6ea0ff;
+  }
+}
+
+.rating-change {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.rating-change--up {
+  color: var(--ok);
+}
+
+.rating-change--down {
+  color: var(--error);
+}
+
+/* Zero is a real result — the contest went exactly as the ratings predicted — so it is
+   styled as its own thing rather than as a faded gain. */
+.rating-change--level {
+  color: var(--text-muted);
+}
+
+.badge--rated {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.badge--unrated {
+  border-style: dashed;
+}
+
+/* ---- Rating graph ---- */
+
+.rating-graph {
+  margin: 0;
+}
+
+.rating-graph__svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-width: 100%;
+}
+
+.rating-graph__axis {
+  stroke: var(--border);
+  stroke-width: 1;
+}
+
+.rating-graph__tick {
+  fill: var(--text-muted);
+  font-size: 11px;
+  font-family: var(--font-mono);
+}
+
+.rating-graph__line {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 2;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.rating-graph__point {
+  fill: var(--surface);
+  stroke: var(--accent);
+  stroke-width: 2;
+}
+
+.rating-graph__caption {
+  margin-top: 0.5rem;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+/* ---- Shared oddments these pages need ---- */
+
+.numeric {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.status--muted {
+  color: var(--text-muted);
+  border-left: 3px solid var(--border);
+}
+
+.checkbox-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-weight: 500;
+}

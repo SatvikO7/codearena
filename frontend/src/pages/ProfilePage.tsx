@@ -1,3 +1,4 @@
+import { Link } from 'react-router-dom';
 import { useAuth } from '../hooks/useAuth';
 
 /**
@@ -48,6 +49,17 @@ export function ProfilePage() {
             <dd>{user.id}</dd>
           </div>
         </dl>
+      </section>
+
+      <section className="panel">
+        <h2>Competitive record</h2>
+        <p className="field-hint">
+          Your rating, your rated contest history and the graph behind them. Ratings come
+          only from finalised rated contests &mdash; nothing on this page can change one.
+        </p>
+        <Link to={`/users/${user.id}/rating`} className="button button--quiet">
+          View your rating
+        </Link>
       </section>
     </div>
   );

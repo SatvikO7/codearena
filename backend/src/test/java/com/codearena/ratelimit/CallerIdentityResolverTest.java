@@ -39,7 +39,7 @@ class CallerIdentityResolverTest {
         RateLimitProperties.Bucket bucket =
                 new RateLimitProperties.Bucket(10, Duration.ofSeconds(1));
         return new RateLimitProperties(true, trustForwardedHeaders,
-                bucket, bucket, bucket, bucket, bucket, bucket, bucket, Duration.ofMinutes(10));
+                bucket, bucket, bucket, bucket, bucket, bucket, bucket, bucket, Duration.ofMinutes(10));
     }
 
     // ------------------------------------------------------------ forged headers

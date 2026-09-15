@@ -36,6 +36,11 @@ public record ContestDetailResponse(
         boolean registered,
         @Schema(description = "Whether the caller may submit right now: registered, and the contest is LIVE.")
         boolean canSubmit,
+        @Schema(description = "Whether this contest moves ratings. Fixed once it starts.")
+        boolean rated,
+        @Schema(description = """
+                When rating finalisation ran, or null if it has not. Set for unrated contests                 too — it answers "has the question been settled", while `rated` answers "did                 settling it change anything".""")
+        Instant ratingFinalizedAt,
         @Schema(description = "Empty until the contest starts, so a problem set is not disclosed early.")
         List<ContestProblemResponse> problems) {
 }

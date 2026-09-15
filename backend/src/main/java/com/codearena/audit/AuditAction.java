@@ -80,6 +80,28 @@ public enum AuditAction {
     /** A user entered a contest. Not an administrative act, but it decides eligibility. */
     CONTEST_REGISTER,
 
+    /**
+     * A contest's results were turned into rating changes.
+     *
+     * <p>Recorded once per contest, in the finalisation transaction -- so a rolled-back
+     * finalisation leaves no event claiming it happened, and a finalisation cannot commit
+     * unaudited.
+     *
+     * <p>The metadata is deliberately three numbers. The detailed record of who moved from
+     * what to what is contest_rating_changes, which is itself append-only; copying it into
+     * an audit payload would duplicate a permanent record into another permanent record.
+     */
+    CONTEST_FINALIZE,
+
+    /**
+     * A finalisation was attempted and failed.
+     *
+     * <p>Its own action because the failure is otherwise invisible: the contest simply stays
+     * unrated and the sweeper tries again later. Recorded independently of the transaction
+     * that rolled back, which is the only way to record something about a rollback.
+     */
+    CONTEST_FINALIZE_FAILED,
+
     // ------------------------------------------------------------------ submissions
 
     /**

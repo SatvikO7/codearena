@@ -48,6 +48,10 @@ export function AdminContestsPage() {
   const [description, setDescription] = useState('');
   const [startAt, setStartAt] = useState(schedule.startAt);
   const [endAt, setEndAt] = useState(schedule.endAt);
+  // Unrated by default, matching the server. A contest accidentally created unrated is
+  // fixed with an edit; one accidentally created rated has already put everybody's rating
+  // at stake by the time anyone notices, and cannot be changed once it starts.
+  const [rated, setRated] = useState(false);
 
   const load = useCallback(async (signal?: AbortSignal) => {
     setLoading(true);
@@ -82,10 +86,12 @@ export function AdminContestsPage() {
         description,
         startAt: toInstant(startAt),
         endAt: toInstant(endAt),
+        rated,
       });
       setTitle('');
       setSlug('');
       setDescription('');
+      setRated(false);
       await load();
     } catch (caught) {
       setFormError(describeApiError(caught));
@@ -177,6 +183,23 @@ export function AdminContestsPage() {
               rows={3}
               onChange={(event) => setDescription(event.target.value)}
             />
+          </div>
+
+          <div className="filter-field">
+            <label htmlFor="contest-rated" className="checkbox-label">
+              <input
+                id="contest-rated"
+                type="checkbox"
+                checked={rated}
+                onChange={(event) => setRated(event.target.checked)}
+              />
+              Rated contest
+            </label>
+            <p className="field-hint">
+              A rated contest changes every competitor&rsquo;s rating when it finishes. This
+              can still be changed while the contest is a draft or upcoming, and is{' '}
+              <strong>fixed the moment it starts</strong>.
+            </p>
           </div>
 
           <div className="form-actions">

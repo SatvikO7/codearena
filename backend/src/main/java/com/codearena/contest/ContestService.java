@@ -154,6 +154,7 @@ public class ContestService {
                 participantRepository.countByContestPublicId(contestId),
                 registered,
                 registered && status.acceptsSubmissions(),
+                contest.isRated(), contest.getRatingFinalizedAt(),
                 problems);
     }
 

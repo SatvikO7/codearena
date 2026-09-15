@@ -13,6 +13,8 @@ import { SubmissionsPage } from './pages/SubmissionsPage';
 import { ContestsPage } from './pages/ContestsPage';
 import { ContestDetailPage } from './pages/ContestDetailPage';
 import { ContestSolvePage } from './pages/ContestSolvePage';
+import { RankingsPage } from './pages/RankingsPage';
+import { RatingProfilePage } from './pages/RatingProfilePage';
 import { SubmissionDetailPage } from './pages/SubmissionDetailPage';
 import { AdminProblemsPage } from './pages/admin/AdminProblemsPage';
 import { AdminProblemFormPage } from './pages/admin/AdminProblemFormPage';
@@ -50,6 +52,10 @@ export default function App() {
                 path="contests/:contestId/problems/:problemId"
                 element={<ContestSolvePage />}
               />
+              <Route path="rankings" element={<RankingsPage />} />
+              {/* A competitor's rating is public among users, like the leaderboard that
+                  links to it. The server sends nothing private on either. */}
+              <Route path="users/:userId/rating" element={<RatingProfilePage />} />
             </Route>
 
             {/* Requires ADMIN. Again a convenience: every admin endpoint re-checks. */}

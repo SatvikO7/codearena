@@ -83,6 +83,7 @@ it is believed.
 | `standings` | user | 60 | 30/min | open |
 | `problem-search` | user | 60 | 30/min | open |
 | `admin-read` | administrator | 120 | 60/min | open |
+| `admin-write` | administrator | 20 | 20/min | **closed** |
 
 Every number is configuration (`codearena.rate-limit.*`), not a constant in code.
 
@@ -293,6 +294,7 @@ summary:
 | Registration | **closed** — 429 | Every registration writes a permanent row and consumes a username; unlimited account creation during an outage is the one outcome worth avoiding |
 | Submission | **closed** — 429 | The queue it protects is in Redis; without it there is nothing to submit into |
 | Public/authenticated GETs | **open** — served | The limiter is a comfort here, and an unavailable comfort must not become a second outage |
+| Administrative writes | **closed** — 429 | These are the expensive, irreversible ones: finalising a contest computes ratings across a whole field and writes permanent, append-only history that no later call can undo. Refusing and letting an administrator retry is the honest answer when the control is unavailable |
 
 > **The observation that makes this cheap:** Redis already holds every session. For
 > authenticated traffic, "Redis is down" and "the API is down" are close to the same

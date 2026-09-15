@@ -11,7 +11,7 @@ import java.time.Instant;
 /**
  * Creating or updating a contest.
  *
- * <p>A closed record with five fields. There is deliberately no {@code status},
+ * <p>A closed record with six fields. There is deliberately no {@code status},
  * {@code lifecycle}, {@code createdBy} or {@code id} — those are decided by the server, and a
  * field that does not exist on the type cannot be overposted into one that does.
  *
@@ -44,5 +44,25 @@ public record ContestRequest(
         @Schema(description = "End instant, exclusive: a contest is over at exactly this moment.",
                 example = "2026-03-01T12:00:00Z")
         @NotNull(message = "An end time is required")
-        Instant endAt) {
+        Instant endAt,
+
+        @Schema(description = """
+                Whether this contest moves competitors' ratings. Defaults to false when                 omitted, and **cannot be changed once the contest has started** — a contest                 that became rated halfway through would be asking people to compete for                 stakes they did not agree to.
+
+                This decides only whether ratings are produced. It never carries a rating                 value; there is no field anywhere in this API that does.""",
+                example = "false")
+        Boolean rated) {
+
+    /**
+     * Whether this contest should be rated, with the safe default for an omitted field.
+     *
+     * <p>False when unspecified, deliberately. The two possible defaults are not symmetric: a
+     * contest accidentally created unrated is a contest somebody edits before it starts, while
+     * a contest accidentally created rated silently puts everybody's rating at stake in what
+     * was meant to be a practice round — and by the time anybody notices, it has started and
+     * can no longer be changed.
+     */
+    public boolean ratedOrDefault() {
+        return Boolean.TRUE.equals(rated);
+    }
 }

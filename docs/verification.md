@@ -53,7 +53,7 @@ On Windows run it from Git Bash, not `cmd` or PowerShell:
 
 ## The stages
 
-Thirteen, in dependency order. A failure in one skips the rest — there is no value
+Fourteen, in dependency order. A failure in one skips the rest — there is no value
 in end-to-end results when the build did not compile.
 
 | # | Stage | Verifies |
@@ -67,12 +67,20 @@ in end-to-end results when the build did not compile.
 | 7 | **Redis** | Answers `PING`; append-only persistence is on |
 | 8 | **Core end-to-end flow** | `scripts/e2e/core-flow.sh` — the full user journey and the main rejections |
 | 9 | **Audit logging** | `scripts/e2e/audit.sh` |
-| 10 | **Rate limiting** | `scripts/e2e/rate-limiting.sh` *(skipped by `--quick`)* |
-| 11 | **Observability and fault recovery** | `scripts/e2e/observability.sh` *(skipped by `--quick`)* |
-| 12 | **Sandbox and repository hygiene** | No stray sandbox containers or volumes; no `.env` tracked |
-| 13 | **Final repository state** | Nothing was modified *by* the run. Compared against the working tree as it was at the start, so work in progress is not reported as a failure |
+| 10 | **Ratings and rankings** | `scripts/e2e/ratings.sh` — two real contests, judged for real, then rated; includes the ten-way concurrent finalisation |
+| 11 | **Rate limiting** | `scripts/e2e/rate-limiting.sh` *(skipped by `--quick`)* |
+| 12 | **Observability and fault recovery** | `scripts/e2e/observability.sh` *(skipped by `--quick`)* |
+| 13 | **Sandbox and repository hygiene** | No stray sandbox containers or volumes; no `.env` tracked |
+| 14 | **Final repository state** | Nothing was modified *by* the run. Compared against the working tree as it was at the start, so work in progress is not reported as a failure |
 
-### What stage 13 compares against
+### Why stage 10 runs in `--quick` too
+
+It restarts nothing and injects no faults, so it is not one of the destructive
+suites `--quick` exists to skip. Its one slow part is waiting for the background
+finalisation sweeper, and that is polled rather than slept through — a fast sweep
+is not waited out, and a slow one is not missed.
+
+### What stage 14 compares against
 
 The working tree as it was when the run **started**, not the last commit. The
 question it answers is "did verification change anything", and a developer running
@@ -201,7 +209,7 @@ or hidden test data.
 ## Reading the output
 
 ```
-[8/13] Core end-to-end flow
+[8/14] Core end-to-end flow
       PASS  PASS 63   FAIL 0
 ```
 
@@ -222,7 +230,7 @@ CODEARENA VERIFICATION: PASS
 A failing stage names the suite and the assertion:
 
 ```
-[10/13] Rate limiting
+[11/14] Rate limiting
       FAIL  rate-limiting suite failed
         FAIL  submissions refused after N attempts
            -> 40 submissions all accepted
@@ -251,7 +259,7 @@ run.
   contention.
 - `.env` must be provided by the CI environment, with real values.
 
-There is no CI configuration in the repository yet — that is Phases 13–16.
+There is no CI configuration in the repository yet — that is Phases 14–16.
 
 ---
 
@@ -266,7 +274,7 @@ There is no CI configuration in the repository yet — that is Phases 13–16.
 | Stage 5: a service never becomes healthy | Read the printed diagnostics, then `docker compose logs <service>` |
 | Stage 6: migrations mismatch | A migration failed. `SELECT * FROM flyway_schema_history WHERE success = false` |
 | Stage 8–11: 429s everywhere | Rate-limit buckets spent by an earlier run. The suites clear them; if you are running one by hand, clear them first |
-| Stage 13: tracked files modified | Something wrote into the working tree during verification. That is a bug worth chasing |
+| Stage 14: tracked files modified | Something wrote into the working tree during verification. That is a bug worth chasing |
 
 Related: [operations.md](operations.md) for the runbook,
 [observability.md](observability.md) for what the metrics mean.

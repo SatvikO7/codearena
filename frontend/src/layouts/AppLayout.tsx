@@ -9,6 +9,7 @@ const NAV_ITEMS: { to: string; label: string; end?: boolean }[] = [
   { to: '/', label: 'Home', end: true },
   { to: '/problems', label: 'Problems' },
   { to: '/contests', label: 'Contests' },
+  { to: '/rankings', label: 'Rankings' },
   { to: '/submissions', label: 'My submissions' },
 ];
 

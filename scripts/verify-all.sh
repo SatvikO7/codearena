@@ -69,8 +69,8 @@ STACK_WAS_UP=0
 TREE_BEFORE="$LOG_DIR/tree-before.txt"
 git status --porcelain 2>/dev/null | grep -v "^??" | sort > "$TREE_BEFORE" || true
 
-TOTAL_STAGES=13
-[ "$QUICK" -eq 1 ] && TOTAL_STAGES=10
+TOTAL_STAGES=14
+[ "$QUICK" -eq 1 ] && TOTAL_STAGES=11
 
 banner() {
   printf '\n%s========================================%s\n' "$BOLD" "$RESET"
@@ -392,6 +392,22 @@ else
 fi
 
 # --------------------------------------------------------------------------- 10
+stage "Ratings and rankings"
+if [ "$FAILED" -eq 1 ]; then
+  skipped "Ratings" "an earlier stage failed"
+else
+  # Runs in --quick as well. It restarts nothing and injects no faults; its only
+  # slow part is waiting for the background sweeper, and that is polled rather
+  # than slept through.
+  if bash scripts/e2e/ratings.sh > "$LOG_DIR/e2e-ratings.log" 2>&1; then
+    pass "Ratings" "$(grep -oE 'PASS [0-9]+ +FAIL [0-9]+' "$LOG_DIR/e2e-ratings.log" | tail -1)"
+  else
+    fail "Ratings" "ratings suite failed"
+    grep -B 1 -A 2 "^  FAIL" "$LOG_DIR/e2e-ratings.log" | head -n 40 | sed 's/^/      /'
+  fi
+fi
+
+# --------------------------------------------------------------------------- 11
 stage "Rate limiting"
 if [ "$FAILED" -eq 1 ]; then
   skipped "Rate limiting" "an earlier stage failed"
@@ -406,7 +422,7 @@ else
   fi
 fi
 
-# --------------------------------------------------------------------------- 11
+# --------------------------------------------------------------------------- 12
 stage "Observability and fault recovery"
 if [ "$FAILED" -eq 1 ]; then
   skipped "Observability" "an earlier stage failed"
@@ -422,7 +438,7 @@ else
   fi
 fi
 
-# --------------------------------------------------------------------------- 12
+# --------------------------------------------------------------------------- 13
 stage "Sandbox and repository hygiene"
 if [ "$FAILED" -eq 1 ]; then
   skipped "Cleanup" "an earlier stage failed"
@@ -441,7 +457,7 @@ else
   fi
 fi
 
-# --------------------------------------------------------------------------- 13
+# --------------------------------------------------------------------------- 14
 stage "Final repository state"
 if [ "$FAILED" -eq 1 ]; then
   skipped "Repository state" "an earlier stage failed"

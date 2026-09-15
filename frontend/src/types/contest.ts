@@ -41,6 +41,8 @@ export interface ContestSummary {
   participantCount: number;
   problemCount: number;
   registered: boolean;
+  /** Whether this contest moves ratings. In the list because it decides who enters. */
+  rated: boolean;
 }
 
 export interface ContestProblemEntry {
@@ -77,6 +79,20 @@ export interface ContestDetail {
   registered: boolean;
   /** Registered, and the contest is LIVE. Re-checked by the server on every submission. */
   canSubmit: boolean;
+  /**
+   * Whether this contest moves ratings.
+   *
+   * <p>Fixed once the contest starts. The server refuses to change it after that, so the
+   * value a contestant saw when they entered is the value that applies to them.
+   */
+  rated: boolean;
+  /**
+   * When rating finalisation ran, or null if it has not.
+   *
+   * <p>Set for unrated contests too: it answers "has the question been settled", while
+   * `rated` answers "did settling it change anything".
+   */
+  ratingFinalizedAt: string | null;
   /** Empty until the contest starts: the problem set is not disclosed in advance. */
   problems: ContestProblemEntry[];
 }
@@ -136,6 +152,13 @@ export interface ContestPayload {
   /** ISO-8601 with an offset. */
   startAt: string;
   endAt: string;
+  /**
+   * Whether the contest should move ratings.
+   *
+   * <p>Defaults to false on the server when omitted, and is refused outright once the
+   * contest has started.
+   */
+  rated: boolean;
 }
 
 /** True while a contest is accepting submissions, by the status the server reported. */

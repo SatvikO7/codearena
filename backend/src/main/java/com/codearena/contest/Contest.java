@@ -87,6 +87,43 @@ public class Contest {
     @Column(name = "lifecycle", nullable = false, length = 16)
     private ContestLifecycle lifecycle;
 
+    /**
+     * Whether this contest moves ratings.
+     *
+     * <p>Frozen once the contest starts, by {@link #requireEditable}. A contest that
+     * became rated halfway through would be asking people to compete for stakes they did
+     * not agree to, and one that became unrated would take away a result somebody had
+     * already earned.
+     */
+    @Column(name = "rated", nullable = false)
+    private boolean rated;
+
+    /**
+     * When rating finalisation was claimed. Null until it runs.
+     *
+     * <p>Not a report -- the concurrency control. Finalisation claims a contest with a
+     * conditional UPDATE that only one transaction can win, and this is the column it
+     * writes. See {@code ContestFinalizationRepository}.
+     *
+     * <p>An unrated contest is finalised too; it simply produces no rating changes. So
+     * this answers "has finalisation run" and {@link #rated} answers "did it change
+     * anything".
+     */
+    @Column(name = "rating_finalized_at")
+    private Instant ratingFinalizedAt;
+
+    /**
+     * How many competitors received a rating change. Null until finalised.
+     *
+     * <p>Mapped so Hibernate validates the column and does not overwrite it with a null on
+     * any other save of this entity, and written by the finalisation repository alongside
+     * the claim. There is no accessor: the API reports the count from the rating history,
+     * which is the authority, and a second source for the same number is a second thing to
+     * fall out of step.
+     */
+    @Column(name = "rated_participant_count")
+    private Integer ratedParticipantCount;
+
     @ManyToOne(fetch = FetchType.LAZY, optional = false)
     @JoinColumn(name = "created_by", nullable = false, updatable = false)
     private User createdBy;
@@ -210,6 +247,34 @@ public class Contest {
     }
 
     /**
+     * Sets whether this contest is rated.
+     *
+     * <p>Refused once the contest has started, for the reason on the field itself. The
+     * check is {@link #requireEditable}, the same one that protects the schedule, the
+     * problem set and the points -- all of them change what a contestant is competing
+     * for, and this one changes it most of all.
+     */
+    public void setRated(boolean rated, Instant now) {
+        requireEditable(now);
+        this.rated = rated;
+        this.updatedAt = now;
+    }
+
+    /**
+     * Whether rating finalisation has run, whatever it produced.
+     *
+     * <p>A read, and deliberately the only rating-related thing this aggregate does besides
+     * {@link #setRated}. There is no {@code recordFinalisation} here, because there cannot
+     * be: the claim has to be a conditional UPDATE, and an entity write would read, decide
+     * and write, which is exactly the race the claim exists to remove. Both fields are
+     * written by {@code ContestFinalizationRepository}. Offering a mutator here would
+     * advertise a second way to finalise a contest, and there is only one.
+     */
+    public boolean isRatingFinalized() {
+        return ratingFinalizedAt != null;
+    }
+
+    /**
      * Refuses any change once the contest has started.
      *
      * <p>Applies to the schedule, the problem set, the ordering and the points alike,
@@ -260,6 +325,14 @@ public class Contest {
     }
 
     // ------------------------------------------------------------------ accessors
+
+    public boolean isRated() {
+        return rated;
+    }
+
+    public Instant getRatingFinalizedAt() {
+        return ratingFinalizedAt;
+    }
 
     public Long getId() {
         return id;

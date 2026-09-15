@@ -6,10 +6,12 @@ import {
   listParticipants,
   publishContest,
   removeContestProblem,
+  updateContest,
   updateContestProblem,
 } from '../../services/contestService';
 import { listProblems } from '../../services/problemService';
 import { formatLocal } from '../../services/contestClock';
+import { finalizeContest } from '../../services/ratingService';
 import { describeApiError } from '../../services/apiClient';
 import { ContestStatusPill } from '../../components/ContestStatusPill';
 import type { ContestDetail, ContestParticipant } from '../../types/contest';
@@ -39,6 +41,7 @@ function AdminContestView({ contestId }: { contestId: string }) {
 
   const [chosenProblem, setChosenProblem] = useState('');
   const [points, setPoints] = useState(100);
+  const [finalizeNote, setFinalizeNote] = useState<string | null>(null);
 
   const load = useCallback(
     async (signal?: AbortSignal) => {
@@ -128,6 +131,9 @@ function AdminContestView({ contestId }: { contestId: string }) {
           <span>Starts {formatLocal(contest.startAt)}</span>
           <span>Ends {formatLocal(contest.endAt)}</span>
           <span>{contest.participantCount} registered</span>
+          <span className={contest.rated ? 'badge badge--rated' : 'badge badge--unrated'}>
+            {contest.rated ? 'Rated' : 'Unrated'}
+          </span>
         </p>
         <p className="form-aside">
           <Link to="/admin/contests">Back to contests</Link>
@@ -163,10 +169,111 @@ function AdminContestView({ contestId }: { contestId: string }) {
       {!editable && (
         <section className="panel">
           <p className="status">
-            This contest has started. Its problems, order and points are fixed.
+            This contest has started. Its problems, order, points and rated status are fixed.
           </p>
         </section>
       )}
+
+      <section className="panel">
+        <h2>Rating</h2>
+
+        {editable && (
+          <>
+            <label htmlFor="contest-rated" className="checkbox-label">
+              <input
+                id="contest-rated"
+                type="checkbox"
+                checked={contest.rated}
+                disabled={busy}
+                onChange={(event) =>
+                  void act(() =>
+                    updateContest(contest.id, {
+                      title: contest.title,
+                      slug: contest.slug,
+                      description: contest.description ?? '',
+                      startAt: contest.startAt,
+                      endAt: contest.endAt,
+                      rated: event.target.checked,
+                    }),
+                  )
+                }
+              />
+              Rated contest
+            </label>
+            <p className="field-hint">
+              Changeable only until the contest starts. After that the server refuses, and
+              there is no override: a contest that became rated halfway through would be
+              asking people to compete for stakes they never agreed to.
+            </p>
+          </>
+        )}
+
+        {!editable && (
+          <p className="field-hint">
+            This contest is <strong>{contest.rated ? 'rated' : 'unrated'}</strong>, fixed when
+            it started.
+          </p>
+        )}
+
+        {contest.ratingFinalizedAt && (
+          <p className="status status--ok">
+            Finalised {formatLocal(contest.ratingFinalizedAt)}. Rating changes are written
+            once and are permanent; there is no recalculation.
+          </p>
+        )}
+
+        {contest.status === 'ENDED' && !contest.ratingFinalizedAt && (
+          <>
+            <p className="field-hint">
+              Finalisation runs automatically within a minute of a contest ending. This
+              button asks for it now instead. It is safe to press twice &mdash; a second call
+              reports that the work was already done and changes nothing.
+            </p>
+            <button
+              type="button"
+              className="button"
+              disabled={busy}
+              onClick={() =>
+                void act(async () => {
+                  const result = await finalizeContest(contest.id);
+                  setFinalizeNote(
+                    result.alreadyFinalized
+                      ? 'Already finalised — nothing changed.'
+                      : result.rated
+                        ? `Finalised. ${result.ratedParticipants} competitor${
+                            result.ratedParticipants === 1 ? '' : 's'
+                          } rated.`
+                        : 'Finalised. This contest is unrated, so no ratings moved.',
+                  );
+                })
+              }
+            >
+              Finalise now
+            </button>
+          </>
+        )}
+
+        {contest.status === 'CANCELLED' && (
+          <p className="status status--muted">
+            A cancelled contest is never rated, whatever its standings show. The scoreboard
+            stays readable as a record of what happened.
+          </p>
+        )}
+
+        {(contest.status === 'DRAFT' || contest.status === 'UPCOMING' ||
+          contest.status === 'LIVE') && !contest.ratingFinalizedAt && (
+          <p className="field-hint">
+            Ratings are computed once, after the contest ends. There is nothing to finalise
+            until then.
+          </p>
+        )}
+
+        {finalizeNote && (
+          <p className="status status--ok" role="status">
+            {finalizeNote}
+          </p>
+        )}
+      </section>
 
       <section className="panel table-panel">
         <h2>Problems</h2>

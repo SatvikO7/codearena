@@ -46,9 +46,27 @@ jar() { echo "$E2E_TMP/$1.jar"; }
 hdr() { echo "$E2E_TMP/headers"; }
 out() { echo "$E2E_TMP/body"; }
 
+# Primes a jar with a CSRF token, the way opening a page in a browser does.
+#
+# Retried, and loud when it cannot. The naive version returns an empty string if
+# the priming request fails for any reason -- a stack that has just come up, a
+# connection reset, a moment of load -- and an empty token produces a POST with no
+# X-XSRF-TOKEN header, which the server answers 403 ACCESS_DENIED. The suite then
+# reports a security-shaped failure for what was actually a blip, and every
+# subsequent step fails because the account was never created. A helper that turns
+# an infrastructure problem into a misleading authorisation failure is worse than
+# one that stops.
 csrf() {
-  curl -s -c "$(jar "$1")" -b "$(jar "$1")" "$API/api/system/info" >/dev/null
-  awk '$6=="XSRF-TOKEN"{print $7}' "$(jar "$1")" | tail -1
+  local who=$1 attempt token
+  for attempt in 1 2 3 4 5; do
+    curl -s -c "$(jar "$who")" -b "$(jar "$who")" "$API/api/system/info" >/dev/null 2>&1
+    token=$(awk '$6=="XSRF-TOKEN"{print $7}' "$(jar "$who")" 2>/dev/null | tail -1)
+    if [ -n "$token" ]; then printf '%s' "$token"; return 0; fi
+    sleep 1
+  done
+  printf 'FATAL: could not obtain a CSRF token for %s after 5 attempts (is %s up?)
+'     "$who" "$API" >&2
+  return 1
 }
 
 # req <identity> <METHOD> <path> [json-body] [extra curl args...]
@@ -131,6 +149,21 @@ wait_for_backend() {
   done
   return 1
 }
+
+# Every suite here talks to a running stack, so none of them should begin until
+# there is one. Without this, a suite started a moment too early reports dozens of
+# confusing assertion failures instead of one clear sentence -- and the first of
+# them is usually a 401 or a 403, which reads like a security finding rather than
+# a stack that is not up yet.
+#
+# Costs nothing when the stack is already running: the first check succeeds.
+if ! wait_for_backend 120; then
+  printf 'FATAL: %s is not answering /actuator/health/readiness.
+' "$API" >&2
+  printf 'Start the stack first:  docker compose up -d
+' >&2
+  exit 1
+fi
 
 # -----------------------------------------------------------------------------
 # Test accounts.

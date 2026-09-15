@@ -93,9 +93,14 @@ public class ContestAdminService {
                 .orElseThrow(() -> new ResourceNotFoundException("Authenticated account no longer exists"));
 
         // The aggregate validates the schedule; a bad one throws before anything is written.
-        Contest contest = contestRepository.saveAndFlush(Contest.create(
+        Contest contest = Contest.create(
                 request.title(), request.slug(), request.description(),
-                request.startAt(), request.endAt(), admin));
+                request.startAt(), request.endAt(), admin);
+        // A draft has not started, so this is always permitted here. Set through the
+        // aggregate rather than a field so the one rule that governs it -- frozen once the
+        // contest starts -- lives in exactly one place.
+        contest.setRated(request.ratedOrDefault(), clock.instant());
+        contestRepository.saveAndFlush(contest);
 
         // In this transaction: a contest cannot exist without the record of who created it.
         auditService.record(AuditAction.CONTEST_CREATE, AuditOutcome.SUCCESS,
@@ -105,11 +110,12 @@ public class ContestAdminService {
                         .put("title", contest.getTitle())
                         .put("startAt", contest.getStartAt())
                         .put("endAt", contest.getEndAt())
+                        .put("rated", contest.isRated())
                         .build());
 
-        log.info("event=CONTEST_CREATED contest={} slug={} startAt={} endAt={} by={}",
+        log.info("event=CONTEST_CREATED contest={} slug={} startAt={} endAt={} rated={} by={}",
                 contest.getPublicId(), contest.getSlug(),
-                contest.getStartAt(), contest.getEndAt(), adminPublicId);
+                contest.getStartAt(), contest.getEndAt(), contest.isRated(), adminPublicId);
 
         return detail(contest.getPublicId());
     }
@@ -124,8 +130,15 @@ public class ContestAdminService {
                     "A contest with this slug already exists");
         }
 
+        boolean previouslyRated = contest.isRated();
+
         contest.updateDetails(request.title(), request.slug(), request.description(), now);
         contest.reschedule(request.startAt(), request.endAt(), now);
+        // Refused once the contest is LIVE or ENDED, by the same check that protects the
+        // schedule. Whether a contest counts is the single biggest thing a competitor
+        // decides on before entering, and changing it afterwards would change what they
+        // agreed to compete for.
+        contest.setRated(request.ratedOrDefault(), now);
 
         auditService.record(AuditAction.CONTEST_UPDATE, AuditOutcome.SUCCESS,
                 AuditEntityType.CONTEST, contestId.toString(),
@@ -133,10 +146,12 @@ public class ContestAdminService {
                         .put("slug", contest.getSlug())
                         .put("startAt", contest.getStartAt())
                         .put("endAt", contest.getEndAt())
+                        .put("previouslyRated", previouslyRated)
+                        .put("rated", contest.isRated())
                         .build());
 
-        log.info("event=CONTEST_UPDATED contest={} startAt={} endAt={}",
-                contestId, contest.getStartAt(), contest.getEndAt());
+        log.info("event=CONTEST_UPDATED contest={} startAt={} endAt={} rated={}",
+                contestId, contest.getStartAt(), contest.getEndAt(), contest.isRated());
         return detail(contestId);
     }
 
@@ -392,6 +407,7 @@ public class ContestAdminService {
                 contest.getStartAt(), contest.getEndAt(), now,
                 participantRepository.countByContestPublicId(contestId),
                 false, false,
+                contest.isRated(), contest.getRatingFinalizedAt(),
                 problems(contestId));
     }
 

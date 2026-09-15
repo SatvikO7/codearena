@@ -125,6 +125,15 @@ public abstract class AbstractIntegrationTest {
      * changes rather than five setups that fail one run at a time.
      *
      * <p>Order matters and is dependency-first: children before parents.
+     *
+     * <p><b>Two tables are deliberately absent.</b> {@code audit_events} and
+     * {@code contest_rating_changes} are append-only — a trigger refuses DELETE — so clearing
+     * them here would not merely fail, it would fail on every single suite. Neither leaks
+     * between tests: both are keyed on {@code BIGSERIAL} identifiers that PostgreSQL never
+     * reuses, so a fresh user or contest cannot inherit a previous suite's rows. Rows for
+     * deleted users and contests are left behind on purpose; that is what an append-only log
+     * is for. {@code user_ratings} is not listed either, because its foreign key to
+     * {@code users} is ON DELETE CASCADE and it goes with them.
      */
     protected static void resetDatabase(JdbcTemplate jdbc) {
         jdbc.update("DELETE FROM submission_test_results");
